@@ -54,7 +54,7 @@ async function candidateIdentity(version: string, includeNpm = true): Promise<{ 
   }
   const assets: Record<string, string> = {};
   for (const asset of release.assets) {
-    if (!isRecord(asset) || typeof asset.name !== "string" || !/^ompweb-(?:(?:linux|darwin)-(?:x64|arm64)\.tar\.gz|windows-x64\.zip)$/.test(asset.name)) continue;
+    if (!isRecord(asset) || typeof asset.name !== "string" || !/^ompweb-(?:(?:linux|darwin)-(?:x64|arm64)\.tar\.gz|windows-x64\.zip|omp-(?:(?:linux|darwin)-(?:x64|arm64)|windows-x64\.exe))$/.test(asset.name)) continue;
     if (typeof asset.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(asset.digest)) throw new UpgradePlanError("release_integrity", "A candidate release asset has no verified digest");
     if (Object.hasOwn(assets, asset.name)) throw new UpgradePlanError("release_integrity", "The candidate release has duplicate platform assets");
     assets[asset.name] = asset.digest.slice(7);

@@ -328,7 +328,7 @@ export function validateApprovedReleasePin(value: unknown, version?: string, rep
   const assets: Record<string, string> = {};
   for (const name of Object.keys(value.assets).sort()) {
     const digest = value.assets[name];
-    if (!/^ompweb-(?:(?:linux|darwin)-(?:x64|arm64)\.tar\.gz|windows-x64\.zip)$/.test(name) || typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) return invalid();
+    if (!/^ompweb-(?:(?:linux|darwin)-(?:x64|arm64)\.tar\.gz|windows-x64\.zip|omp-(?:(?:linux|darwin)-(?:x64|arm64)|windows-x64\.exe))$/.test(name) || typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) return invalid();
     assets[name] = digest;
   }
   if (value.npm === undefined) return { version: value.version, releaseRepo: value.releaseRepo, assets };
@@ -504,26 +504,58 @@ export interface HostReleasePreflightInput {
   runtime?: string;
   /** The release already runs here: a candidate that predates the preflight command is restarted unchecked instead of refused. */
   restartOnly?: boolean;
+  releasePin?: ApprovedReleasePin;
+  requireReleasePin?: boolean;
 }
-/** The candidate's `ompweb fetch-omp` (lib/omp/runner-fetch.ts: its omp runner from its own release, unless it has
- * one), then its `ompweb preflight` (lib/hosts/preflight.ts) in this host's environment: the session omp it resolves
- * must start and say hello before the switch. A new binary release without the preflight command is refused (it
- * would run a runner unchecked); a restart-only update of an install that predates the command restarts what already
- * runs. */
+/** Pinned updates stage their approved runner before any candidate command; ordinary updates keep the candidate's
+ * `fetch-omp` behavior. Then `preflight` must start the resolved session runner and receive its hello before cutover.
+ * A restart-only update without a pin may retain an installation that predates preflight. */
 export async function preflightHostRelease(d: HostReleasePreflightInput, release: string): Promise<void> {
+  if (d.requireReleasePin !== undefined && typeof d.requireReleasePin !== "boolean" || d.requireReleasePin && !d.releasePin) throw new Error("Missing approved release pin for runner preflight");
+  const pin = d.releasePin === undefined ? undefined : validateApprovedReleasePin(d.releasePin, d.version);
   const binary = d.installMethod === "binary";
   const entry = binary ? join(release, process.platform === "win32" ? "ompweb.exe" : "ompweb") : join(release, "bin", "omp-web.js");
   // Detected statically: an older ompweb takes `preflight` for a positional and starts the web server.
   if (!(binary ? readFileSync(entry).includes(Buffer.from(PREFLIGHT_MARKER_BASE64, "base64")) : existsSync(join(release, "lib", "hosts", "preflight.ts")))) {
-    if (binary && !d.restartOnly) throw new Error("The new host release has no preflight command to check its omp with");
+    if (pin || binary && !d.restartOnly) throw new Error("The new host release has no preflight command to check its omp with");
     console.warn(`ompweb ${d.version} has no preflight command; its omp was not checked`);
     return;
+  }
+  if (pin && !binary && !process.env.OMP_WEB_OMP_BIN) {
+    const resolver = join(release, "lib", "omp", "omp-cli.ts");
+    if (!existsSync(resolver) || !readFileSync(resolver).includes(Buffer.from("b21wd2ViLXBhY2thZ2VkLXJ1bm5lci12MQ==", "base64"))) throw new Error("The approved package does not support per-install pinned runner resolution; install a release with that capability or configure an explicit OMP_WEB_OMP_BIN");
+  }
+  const pinnedRunner = pin && !process.env.OMP_WEB_OMP_BIN ? join(release, process.platform === "win32" ? "ompweb-omp.exe" : "ompweb-omp") : undefined;
+  if (pin && pinnedRunner) {
+    hostReleaseName();
+    const runner = pinnedRunner;
+    const asset = `ompweb-omp-${process.platform === "win32" ? "windows" : process.platform}-${process.arch}${process.platform === "win32" ? ".exe" : ""}`;
+    const digest = pin.assets[asset];
+    if (existsSync(runner)) {
+      const info = lstatSync(runner);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > HOST_RELEASE_MAX_MEMBER) throw new Error("Unsafe approved runner file");
+      if (!digest && !binary) throw new Error("Missing approved external runner pin");
+      if (digest) {
+        const hash = createHash("sha256");
+        for await (const chunk of createReadStream(runner)) hash.update(chunk);
+        if (hash.digest("hex") !== digest) throw new Error("Approved runner digest mismatch");
+      }
+    } else {
+      if (!digest) throw new Error("Missing approved external runner pin");
+      const partial = `${runner}.${randomUUID()}.partial`;
+      try {
+        const actual = await downloadHostUpdateFile(`https://github.com/${pin.releaseRepo}/releases/download/v${pin.version}/${asset}`, partial, HOST_RELEASE_MAX_MEMBER);
+        if (actual !== `sha256:${digest}`) throw new Error("Approved runner digest mismatch");
+        chmodSync(partial, 0o755);
+        renameSync(partial, runner);
+      } finally { rmSync(partial, { force: true }); }
+    }
   }
   const command = (args: string[], timeout: number) => exec(binary ? entry : d.runtime!, binary ? args : [entry, ...args], { cwd: release, timeout, env: workerEnvironment(), maxBuffer: 1024 * 1024, windowsHide: true });
   const detail = (error: unknown) => (String((error as { stderr?: unknown }).stderr ?? "").trim() || (error instanceof Error ? error.message : String(error))).slice(-500);
   // A binary release with the preflight command and no runner beside it has `fetch-omp`; every npm one that has
   // runner-fetch.ts does (an npm package never carries the runner).
-  if (binary ? !existsSync(join(release, process.platform === "win32" ? "ompweb-omp.exe" : "ompweb-omp")) : existsSync(join(release, "lib", "omp", "runner-fetch.ts"))) {
+  if (!pin && (binary ? !existsSync(join(release, process.platform === "win32" ? "ompweb-omp.exe" : "ompweb-omp")) : existsSync(join(release, "lib", "omp", "runner-fetch.ts")))) {
     try { await command(["fetch-omp"], DOWNLOAD_TIMEOUT_MS); }
     catch (error) { throw new Error(`The new host release could not fetch its omp: ${detail(error)}`); }
   }

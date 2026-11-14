@@ -413,7 +413,7 @@ async function coordinate(job: CommitJob): Promise<void> {
         : await stagePackage({ version: targetVersion, installMethod: install.method, managerPath: resolveManager(install.method), releasePin: job.releasePin, requireReleasePin: true }, staging);
     }
     renewLease(attemptId);
-    await preflightHostRelease({ installMethod: install.method, version: targetVersion, runtime: install.runtime }, release);
+    await preflightHostRelease({ installMethod: install.method, version: targetVersion, runtime: install.runtime, releasePin: job.releasePin, requireReleasePin: true }, release);
     atomicWrite(join(attemptDir, "release.json"), JSON.stringify({ release, releasePin: job.releasePin }));
     renewLease(attemptId);
     hostsPhase = true;
