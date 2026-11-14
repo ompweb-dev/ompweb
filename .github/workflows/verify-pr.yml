@@ -26,10 +26,13 @@ jobs:
   verify:
     name: Verify (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - name: Checkout repository
@@ -56,6 +59,21 @@ jobs:
       - name: ESLint check
         run: npm run lint
 
+      # Hosted Linux runs in a service cgroup. Permit this runner to create scopes, not control services.
+      - name: Allow isolated native fixture scopes (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          rule="polkit.addRule(function(action, subject) { if (action.id === 'org.freedesktop.systemd1.manage-units' && subject.user === '$(id -un)' && /\\.scope$/.test(action.lookup('unit') || '')) { return polkit.Result.YES; } });"
+          printf '%s\n' "$rule" | sudo tee /etc/polkit-1/rules.d/49-ompweb-fixture-scopes.rules >/dev/null
+          systemd-run --scope --quiet --collect --no-ask-password true
+
+      # Do not pass pwsh's Core module search path to Windows PowerShell children used by the native tests.
+      - name: Select Windows PowerShell modules (Windows only)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          "PSModulePath=$env:PSModulePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Run unit & integration test suite
         run: npm test
 
@@ -77,6 +95,13 @@ jobs:
             npx bun scripts/build-binary.ts --target bun-windows-x64-baseline
             bin=release/ompweb-windows-x64/ompweb.exe
             archive=release/ompweb-windows-x64.zip
+          elif [ "$RUNNER_OS" = macOS ]; then
+            arch=$(node -p process.arch)
+            target="bun-darwin-$arch"
+            if [ "$arch" = x64 ]; then target="$target-baseline"; fi
+            npx bun scripts/build-binary.ts --target "$target"
+            bin="release/ompweb-darwin-$arch/ompweb"
+            archive="release/ompweb-darwin-$arch.tar.gz"
           else
             npx bun scripts/build-binary.ts --target bun-linux-x64-baseline
             bin=release/ompweb-linux-x64/ompweb
@@ -88,7 +113,16 @@ jobs:
           # What the host updater checks on a new release before it switches (lib/hosts/update-worker.ts): the marker
           # it finds the command by, then the command itself against the bundled ompweb-omp.
           grep -qa ompweb-preflight-scratch- "$bin"
-          timeout 120 "$bin" preflight
+          node -e 'require("node:child_process").execFileSync(process.argv[1], ["preflight"], {stdio:"inherit",timeout:120000})' "$bin"
+
+      # Required on every supported runner, including macOS foreground. A skip fails the job.
+      - name: Native compiled coordinated upgrade and rollback
+        shell: bash
+        env:
+          OMPWEB_COMPILED_UPGRADE_E2E: "1"
+        run: |
+          export OMPWEB_UPGRADE_E2E_RUNNER="$(node -p "require('node:path').resolve('runner', 'release', 'ompweb-omp-' + (process.platform === 'win32' ? 'windows' : process.platform) + '-' + process.arch + (process.platform === 'win32' ? '.exe' : ''))")"
+          npx bun test --parallel --timeout 900000 lib/compiled-upgrade.integration.test.mjs
 
       - name: Packed install smoke test
         shell: bash
