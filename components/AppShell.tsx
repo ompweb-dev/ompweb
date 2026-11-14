@@ -647,6 +647,7 @@ export function AppShell({ appName }: { appName: string }) {
     const prepared = appUpdatePlanAttemptRef.current;
     if (
       appUpdateStartInFlightRef.current
+      || appUpdateAttemptRef.current !== null
       || !prepared
       || appUpdatePlan === null
       || approval.planId !== appUpdatePlan.id
@@ -672,7 +673,7 @@ export function AppShell({ appName }: { appName: string }) {
 
   // Prepare a plan whenever the dialog is open and idle without one. Preparing never commits.
   useEffect(() => {
-    if (!appUpdateDialogOpen || appUpdatePhase !== "idle" || appUpdatePlanStatus !== "idle" || appUpdatePlanRequestRef.current !== null) return;
+    if (!appUpdateDialogOpen || appUpdatePhase !== "idle" || appUpdateStartInFlightRef.current || appUpdateAttemptRef.current !== null || appUpdatePlanStatus !== "idle" || appUpdatePlanRequestRef.current !== null) return;
     const request = ++appUpdatePlanSeqRef.current;
     appUpdatePlanRequestRef.current = request;
     setAppUpdatePlanStatus("loading");
@@ -696,6 +697,7 @@ export function AppShell({ appName }: { appName: string }) {
       toast.info(t("appUpdateDialog.settingsLater"));
     }
     setAppUpdateDialogOpen(false);
+    if (appUpdateStalledRef.current !== null) return;
     setAppUpdatePhase("idle");
     setAppUpdateError(null);
     appUpdateAttemptRef.current = null;
@@ -717,12 +719,17 @@ export function AppShell({ appName }: { appName: string }) {
 
   const requestAppUpdateFromSettings = useCallback(() => {
     setSettingsTab(null);
+    if (appUpdateStalledRef.current !== null) {
+      checkStalledAppUpdate();
+      window.requestAnimationFrame(() => setAppUpdateDialogOpen(true));
+      return;
+    }
     discardAppUpdatePlan();
     resetAppUpdateVisibleStage();
     setAppUpdateError(null);
     setAppUpdatePhase("idle");
     window.requestAnimationFrame(() => setAppUpdateDialogOpen(true));
-  }, [discardAppUpdatePlan, resetAppUpdateVisibleStage]);
+  }, [checkStalledAppUpdate, discardAppUpdatePlan, resetAppUpdateVisibleStage]);
   const chatInputRef = useRef<ChatInputHandle | null>(null);
   const topBarRef = useRef<HTMLDivElement>(null);
   const [sessionInfoContainer, setSessionInfoContainer] = useState<HTMLDivElement | null>(null);

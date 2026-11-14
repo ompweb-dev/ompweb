@@ -225,6 +225,9 @@ terminate sessions and subagents; it never bypasses release digests, installatio
 ownership, process identity, service permissions or the update-disable setting.
 An unreachable incompatible host blocks a server-only cutover instead of being
 silently left behind.
+Approval pins the release artifacts, not only their version. A changed release
+requires a new plan and approval. Required service stop/start permissions are
+checked before any incompatible host moves.
 
 **Settings → Hosts** retains per-host Update and offers **Force update** when a
 verified recovery path is available. For old daemons without the maintenance API,
@@ -234,10 +237,12 @@ APIs; Linux and macOS use their own supervisor controls. A broken legacy runner 
 an uncontrollable service is reported, not treated as an updated host.
 
 Downloads and runner preflight happen before the relevant process stops. Progress
-survives web-server restarts; completion requires the expected release and health
-receipt. A failed cutover restores the previous installation where possible and
-reports any participant still requiring recovery. Closing the dialog does not
-cancel a committed update.
+survives web-server restarts; completion requires the expected release, approved
+protocol receipt and connection to the specific server being upgraded. A failed
+cutover restores the previous installation where possible and reports any
+participant still requiring recovery. An uncertain shutdown or maintenance reply
+retains its update claim and displays the recovery error instead of permitting a
+second update. Closing the dialog does not cancel a committed update.
 
 ### Transparent host pools
 

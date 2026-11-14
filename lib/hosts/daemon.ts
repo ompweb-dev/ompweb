@@ -25,6 +25,7 @@ import { sessionOps } from "./session-ops";
 import packageJson from "../../package.json";
 import { acknowledgeHostUpdateReceipt, checkHostUpdates, configureHostUpdateSafety, getHostUpdateOperation, hostUpdateBlocksNewWork, HostUpdateError, startHostUpdate } from "./updates";
 import type { HostUpdateCompatibility, HostUpdateOperation, HostUpdateRequest } from "./update-types";
+import { validateApprovedReleasePin } from "./update-worker";
 import { UploadRetention } from "./upload-retention";
 import { StagedUploads, UPLOAD_SWEEP_INTERVAL_MS } from "./uploads";
 import { isWorkspaceOp, WORKSPACE_OP_PARAMS } from "../workspace-types";
@@ -72,7 +73,9 @@ function updateCompatibility(value: unknown): HostUpdateCompatibility {
 function updateRequest(args: Record<string, unknown>): HostUpdateRequest {
   if (args.force !== undefined && typeof args.force !== "boolean") throw new HostOpError(400, "invalid_request", "force must be a boolean");
   if (args.operationId !== undefined && typeof args.operationId !== "string") throw new HostOpError(400, "invalid_request", "operationId must be a string");
-  return { force: args.force === true, operationId: args.operationId, targetCompatibility: args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility) };
+  if (args.requireReleasePin !== undefined && typeof args.requireReleasePin !== "boolean" || args.requireReleasePin && !args.releasePin) throw new HostOpError(400, "invalid_request", "Missing approved release pin");
+  const releasePin = args.releasePin === undefined ? undefined : validateApprovedReleasePin(args.releasePin);
+  return { force: args.force === true, operationId: args.operationId, targetCompatibility: args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility), releasePin, requireReleasePin: args.requireReleasePin as boolean | undefined };
 }
 
 /** Whether `command` names an executable: a path as given, else a name on PATH (with PATHEXT's extensions on Windows). */
@@ -228,7 +231,9 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       recover();
     }
     return { pid: process.pid, version: packageJson.version, protocol: LINK_PROTOCOL_VERSION,
-      linked: !stopped && [...links.values()].some(link => link.isUp()), drained, executable, entrypoint };
+      linked: !stopped && [...links.values()].some(link => link.isUp()),
+      linkedServers: stopped ? [] : [...links.values()].filter(link => link.isUp()).map(link => link.login.url),
+      drained, executable, entrypoint };
   }
   function reportCapacity(): void {
     if (stopped) return;

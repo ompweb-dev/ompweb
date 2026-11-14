@@ -51,7 +51,7 @@ import type { SessionOps } from "./session-ops";
 import { confirmPooledChild, pooledStartForChild } from "./pool-starts";
 import { loadPools, type HostPool } from "./pools";
 import { validateHostTools } from "./shared-requests";
-import type { HostSoftwareUpdate, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "./update-types";
+import type { ApprovedReleasePin, HostSoftwareUpdate, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "./update-types";
 import { isUpdateDisabled } from "../update-policy";
 import { WORKSPACE_OP_PARAMS, type WorkspaceFileEvent, type WorkspaceOps } from "../workspace-types";
 import { validWorkspaceResult } from "./workspace-results";
@@ -61,6 +61,7 @@ import { observeLegacyUpgrade, rejectLegacyBootstrap, startLegacyUpgrade } from 
 import { recoveryHelperRelease } from "../recovery-release";
 import { checkHostRecovery, HostRecoveryRefusal, startHostRecovery } from "./recovery";
 import { getHostUpdateOperation } from "./updates";
+import { validateApprovedReleasePin } from "./update-worker";
 
 /** Old daemons keep their updater, never their session protocol. */
 const legacyUpgradeVersion = (version: number | null): boolean => version === 10 || version === 11;
@@ -1650,6 +1651,7 @@ function softwareUpdate(value: unknown): value is HostSoftwareUpdate & Record<st
   return isRecord(value) && nullableString(value.currentVersion) && nullableString(value.availableVersion)
     && typeof value.updateAvailable === "boolean" && typeof value.canUpdate === "boolean"
     && (value.canForceUpdate === undefined || typeof value.canForceUpdate === "boolean")
+    && (value.supportsReleasePin === undefined || typeof value.supportsReleasePin === "boolean")
     && (value.forceMethod === undefined || value.forceMethod === "native" || value.forceMethod === "recovery")
     && nullableString(value.blockedReason) && typeof value.updateCommand === "string";
 }
@@ -1696,8 +1698,9 @@ export async function getHostUpgradeInventory(): Promise<HostUpgradeInventory[]>
 }
 
 /** Every machine, including this one, checks on its daemon. Never fall back to the web server's installation. */
-export async function getHostSoftwareUpdates(id: string, force = false, compatibility: HostUpdateCompatibility = updateCompatibility()): Promise<HostUpdateInfo> {
+export async function getHostSoftwareUpdates(id: string, force = false, compatibility: HostUpdateCompatibility = updateCompatibility(), releasePin?: ApprovedReleasePin): Promise<HostUpdateInfo> {
   requireUpdateHost(id);
+  if (releasePin) releasePin = validateApprovedReleasePin(releasePin);
   const current = updateCompatibility();
   const targetCompatibility = compatibility.min === current.min && compatibility.max === current.max ? {} : { targetCompatibility: compatibility };
   const result = await requestHostUpdate(id, "checkUpdates", { compatibility: current, force, ...targetCompatibility });
@@ -1741,25 +1744,56 @@ export async function getHostSoftwareUpdates(id: string, force = false, compatib
       }
     }
   }
+  if (releasePin && info.ompweb.supportsReleasePin !== true && info.ompweb.updateAvailable && info.operation?.state !== "running") {
+    const candidate = info.ompweb;
+    const prohibited = candidate.blockers?.some((blocker) => !blocker.forceable);
+    const eligible = !prohibited && (candidate.canUpdate || candidate.canForceUpdate);
+    candidate.canUpdate = false;
+    candidate.canForceUpdate = false;
+    candidate.blockedReason ||= "This host cannot enforce approved release pins; explicit forced recovery is required";
+    if (eligible) {
+      if (id === LOCAL_HOST_ID) {
+        try {
+          await checkHostRecovery({ version: releasePin.version, compatibility });
+          candidate.canForceUpdate = true;
+        } catch (error) { candidate.blockedReason = error instanceof Error ? error.message : "Pinned recovery is unavailable"; }
+      } else {
+        const link = linkFor(id);
+        if (link.socket && link.recoveryHome && (link.platform === "win32" ? win32.isAbsolute(link.recoveryHome) : posix.isAbsolute(link.recoveryHome)) && ["linux", "darwin", "win32"].includes(link.platform || "")) {
+          try {
+            const helper = await recoveryHelperRelease();
+            candidate.canForceUpdate = helper.assets.some((asset) => asset.name.startsWith(`ompweb-${link.platform === "win32" ? "windows" : link.platform}-`));
+          } catch { /* No verified helper means no pinned recovery. */ }
+        }
+      }
+      if (candidate.canForceUpdate) candidate.forceMethod = "recovery";
+    }
+  }
   return info;
 }
 
-export async function updateHostSoftware(id: string, target: HostUpdateTarget, version: string, options: { force?: boolean; compatibility?: HostUpdateCompatibility; operationId?: string } = {}): Promise<{ accepted: true; operation: HostUpdateOperation }> {
+export async function updateHostSoftware(id: string, target: HostUpdateTarget, version: string, options: { force?: boolean; compatibility?: HostUpdateCompatibility; operationId?: string; releasePin?: ApprovedReleasePin; requireReleasePin?: boolean } = {}): Promise<{ accepted: true; operation: HostUpdateOperation }> {
   const compatibility = options.compatibility ?? updateCompatibility();
-  const checked = await getHostSoftwareUpdates(id, true, compatibility);
+  if (options.requireReleasePin && !options.releasePin) throw new HostOpError(400, "invalid_request", "Missing approved release pin");
+  if (options.releasePin) options.releasePin = validateApprovedReleasePin(options.releasePin, version);
+  const checked = await getHostSoftwareUpdates(id, true, compatibility, options.releasePin);
+  if (!options.releasePin && options.operationId && checked.operation?.id === options.operationId && checked.operation.target === target && checked.operation.version === version) {
+    return { accepted: true, operation: checked.operation };
+  }
   const candidate = checked[target];
   if (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version) {
     throw new HostOpError(409, "host_update_blocked", candidate.blockedReason ?? "The available version changed; check for updates again");
   }
   const link = linkFor(id);
   if (options.force && candidate.forceMethod === "recovery" && id === LOCAL_HOST_ID) {
-    try { return await startHostRecovery({ operationId: options.operationId ?? randomUUID(), version, compatibility, force: true }); }
+    try { return await startHostRecovery({ operationId: options.operationId ?? randomUUID(), version, compatibility, force: true, releasePin: options.releasePin, requireReleasePin: options.requireReleasePin }); }
     catch (error) { throw error instanceof HostRecoveryRefusal ? new HostOpError(error.httpStatus, error.code, error.message) : error; }
   }
   if (options.force && candidate.forceMethod === "recovery") {
     return startLegacyUpgrade({
       hostId: id, version, compatibility, platform: link.platform || "",
       operationId: options.operationId,
+      releasePin: options.releasePin, requireReleasePin: options.requireReleasePin,
       transport: {
         async open(operationId) {
           const home = link.recoveryHome;
@@ -1785,6 +1819,7 @@ export async function updateHostSoftware(id: string, target: HostUpdateTarget, v
     target, version, compatibility: current,
     ...(compatibility.min !== current.min || compatibility.max !== current.max ? { targetCompatibility: compatibility } : {}),
     ...(options.force ? { force: true } : {}), ...(options.operationId ? { operationId: options.operationId } : {}),
+    ...(options.releasePin ? { releasePin: options.releasePin, requireReleasePin: true } : {}),
   });
   if (!isRecord(result) || result.accepted !== true || !updateOperation(result.operation)
     || result.operation.target !== target || result.operation.version !== version) {

@@ -167,6 +167,22 @@ try {
     });
 
     await step("the server automatically starts and links this machine's host", async () => {
+      const controlDeadline = Date.now() + 60_000;
+      let result;
+      for (;;) {
+        result = Bun.spawnSync([...ompweb, "host", "status"], { env, stdout: "pipe", stderr: "pipe" });
+        if (result.exitCode === 0) break;
+        assert(launcher?.exitCode === null, `server exited with ${launcher?.exitCode}`);
+        assert(Date.now() < controlDeadline, `the automatic local host did not answer within 60 s: ${result.stderr.toString()}`);
+        await Bun.sleep(200);
+      }
+      const status: unknown = JSON.parse(result.stdout.toString());
+      assert(status && typeof status === "object" && "pid" in status && typeof status.pid === "number" && status.pid > 1
+        && "entrypoint" in status && typeof status.entrypoint === "string" && "executable" in status && typeof status.executable === "string");
+      const expected = binary ? [binary] : [path.join(dir, "bin", "omp-web-host.js"), path.join(dir, "bin", "omp-web.js")];
+      const actual = path.resolve(binary ? status.executable : status.entrypoint);
+      assert(expected.some((file) => process.platform === "win32" ? path.resolve(file).toLowerCase() === actual.toLowerCase() : path.resolve(file) === actual), "the control endpoint belongs to another installation");
+      daemonPid = status.pid;
       const deadline = Date.now() + 60_000;
       for (;;) {
         const { hosts } = await (await fetch(`${base}/api/hosts`)).json() as { hosts: { id: string; status: string }[] };
@@ -175,15 +191,6 @@ try {
         assert(Date.now() < deadline, "the automatic local host did not link within 60 s");
         await Bun.sleep(200);
       }
-      const result = Bun.spawnSync([...ompweb, "host", "status"], { env, stdout: "pipe", stderr: "pipe" });
-      assert(result.exitCode === 0, result.stderr.toString());
-      const status: unknown = JSON.parse(result.stdout.toString());
-      assert(status && typeof status === "object" && "pid" in status && typeof status.pid === "number" && status.pid > 1
-        && "entrypoint" in status && typeof status.entrypoint === "string" && "executable" in status && typeof status.executable === "string");
-      const expected = binary ? [binary] : [path.join(dir, "bin", "omp-web-host.js"), path.join(dir, "bin", "omp-web.js")];
-      const actual = path.resolve(binary ? status.executable : status.entrypoint);
-      assert(expected.some((file) => process.platform === "win32" ? path.resolve(file).toLowerCase() === actual.toLowerCase() : path.resolve(file) === actual), "the control endpoint belongs to another installation");
-      daemonPid = status.pid;
     });
 
     // Sessions list only through the daemon, so this also proves the server ran as production: it wrote the link.

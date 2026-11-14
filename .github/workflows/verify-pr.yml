@@ -26,6 +26,9 @@ jobs:
   verify:
     name: Verify (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -55,6 +58,21 @@ jobs:
 
       - name: ESLint check
         run: npm run lint
+
+      # Hosted Linux runs in a service cgroup. Permit this runner to create scopes, not control services.
+      - name: Allow isolated native fixture scopes (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          rule="polkit.addRule(function(action, subject) { if (action.id === 'org.freedesktop.systemd1.manage-units' && subject.user === '$(id -un)' && /\\.scope$/.test(action.lookup('unit') || '')) { return polkit.Result.YES; } });"
+          printf '%s\n' "$rule" | sudo tee /etc/polkit-1/rules.d/49-ompweb-fixture-scopes.rules >/dev/null
+          systemd-run --scope --quiet --collect --no-ask-password true
+
+      # Do not pass pwsh's Core module search path to Windows PowerShell children used by the native tests.
+      - name: Select Windows PowerShell modules (Windows only)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          "PSModulePath=$env:PSModulePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Run unit & integration test suite
         run: npm test

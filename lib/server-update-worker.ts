@@ -11,13 +11,15 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { setTimeout as pause } from "node:timers/promises";
 import { promisify } from "node:util";
 import { requestHostControl, type HostControlStatus } from "./hosts/host-control";
-import { assertOwnedPath, HOST_VERSION_PATTERN, hostLaunch, moveHostRelease, sharedHostInstallReason } from "./hosts/update-worker";
+import { assertOwnedPath, HOST_VERSION_PATTERN, hostLaunch, moveHostRelease, sharedHostInstallReason, validateApprovedReleasePin } from "./hosts/update-worker";
 import { getAgentDir } from "./omp/paths";
 import { isProcessAlive } from "./process-identity";
 import { atomicWrite, attemptPath, isActiveLease, leasePath, markerPath, patchStatus, readStateJson, removeSecureFile, renewLease, secureRegularFile, statusPath, type SelfUpdateStage, type StoredStatus } from "./self-update-state";
 import { inspectUpgradeProcess, launchDetachedUpgrade, restartUpgradeProcess, stopUpgradeProcess, type UpgradeLaunch, type UpgradeProcess } from "./upgrade-process";
 import { isRecord } from "./type-guards";
 import type { UpgradeParticipant, UpgradePlan } from "./upgrade-types";
+import type { ApprovedReleasePin } from "./hosts/update-types";
+import { releaseRepo } from "./release-repo";
 
 const exec = promisify(execFile);
 
@@ -31,12 +33,16 @@ export interface ServerUpdateDescriptor {
   installDir: string;
   /** The staged and preflighted release: inside serverArtifact(installDir, "staging", attemptId). */
   release: string;
+  /** The immutable artifact identity approved by the user and verified before staging. */
+  releasePin: ApprovedReleasePin;
   fromVersion: string;
   targetVersion: string;
   /** Node, for the package launcher and the host's package entrypoint. */
   runtime: string;
   /** The inspected top process: the npm launcher, or the compiled server itself. `pids` are every pid of the server tree known at commit. */
   server: { process: UpgradeProcess; launch: Omit<UpgradeLaunch, "env">; pids: number[] };
+  /** The specific server whose authenticated application link must return; null only for an untouched separate host. */
+  serverUrl: string | null;
   /**
    * absent: no daemon answers, so one starts from the new installation after the cutover. separate: a daemon from another
    * installation, untouched. shared: the daemon runs from this installation and is replaced in the same cutover.
@@ -183,16 +189,28 @@ export function readServerUpdateDescriptor(path: string): ServerUpdateDescriptor
   if (!Array.isArray(hostArgs) || hostArgs.some((arg) => arg !== "--allow-http")) bad("hostArgs");
   if (raw.participantId !== null && typeof raw.participantId !== "string") bad("participantId");
   if (typeof raw.interruptSessions !== "boolean") bad("interruptSessions");
+  let serverUrl: string | null = null;
+  if (raw.serverUrl !== null) {
+    const url = new URL(text(raw.serverUrl, "serverUrl"));
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) bad("serverUrl");
+    serverUrl = url.toString().replace(/\/+$/, "");
+  }
+  if (localHost.kind !== "separate" && serverUrl === null) bad("serverUrl");
+  const releasePin = validateApprovedReleasePin(raw.releasePin, targetVersion, releaseRepo());
+  const staged = readStateJson<{ release?: string; releasePin?: unknown }>(join(attemptPath(attemptId), "release.json"));
+  if (staged?.release !== release || JSON.stringify(validateApprovedReleasePin(staged?.releasePin, targetVersion, releaseRepo())) !== JSON.stringify(releasePin)) bad("approved candidate evidence");
   const descriptor: ServerUpdateDescriptor = {
     version: 1,
     attemptId,
     installMethod,
     installDir,
     release,
+    releasePin,
     fromVersion,
     targetVersion,
     runtime: absolute(raw.runtime, "runtime"),
     server: { process: processOf(server.process, "server", "server process"), launch: { command: text(server.launch.command, "server launch"), args: server.launch.args as string[], cwd: absolute(server.launch.cwd, "server launch cwd") }, pids: server.pids as number[] },
+    serverUrl,
     localHost: localHost.kind === "shared" ? { kind: "shared", process: processOf(localHost.process, "host", "host process") } : { kind: localHost.kind as "absent" | "separate" },
     hostArgs: hostArgs as string[],
     participantId: raw.participantId as string | null,
@@ -272,7 +290,7 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
   try { writeFileSync(join(attemptPath(id), "worker.lock"), String(process.pid), { flag: "wx", mode: 0o600 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return 1; throw error; }
 
-  const flags = { hostDrained: false, hostStopped: false, serverStopped: false, swapped: false, restarted: false };
+  const flags = { hostDrainPending: false, hostDrained: false, hostStopped: false, serverStopped: false, swapped: false, restarted: false };
   const serverProcess = d.server.process;
   const hostProcess = d.localHost.kind === "shared" ? d.localHost.process : null;
   const backup = serverArtifact(d.installDir, "backup", id);
@@ -315,8 +333,9 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
     for (;;) {
       try {
         const status = await deps.hostControl("status");
-        if (status.version === version && status.linked && status.pid !== replaced && hostInInstall(status, d.installDir)) return status;
-        last = `it answered version ${status.version}${status.linked ? "" : ", not linked to a server"}${status.pid === replaced ? " from the process that was replaced" : ""}`;
+        const linked = status.linked && status.linkedServers?.some((url) => url.replace(/\/+$/, "") === d.serverUrl) === true;
+        if (status.version === version && linked && status.pid !== replaced && hostInInstall(status, d.installDir)) return status;
+        last = `it answered version ${status.version}${linked ? "" : ", not linked to this server"}${status.pid === replaced ? " from the process that was replaced" : ""}`;
       } catch (error) { last = message(error); }
       if (Date.now() > deadline) throw new Error(`The local host did not report ${version} linked within ${deps.hostTimeoutMs / 1000} s: ${last}`);
       await pause(deps.pollMs);
@@ -327,11 +346,15 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
   const freezeHost = async (): Promise<void> => {
     const status = await probeLocalHost(deps.hostControl);
     if (!status || status.pid !== hostProcess!.pid || !hostInInstall(status, d.installDir)) throw new Error("The local host is no longer the process the update was approved for; refusing to stop it");
+    if (status.drained) throw new Error("The local host was already drained before this update; refusing to take over its maintenance state");
     try {
+      flags.hostDrainPending = true;
       await deps.hostControl("drain");
       flags.hostDrained = true;
+      flags.hostDrainPending = false;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "host_busy") throw error;
+      flags.hostDrainPending = false;
       if (!d.interruptSessions) throw new Error(`The local host started running work after the update was approved, and the approval did not authorize interrupting it: ${message(error)}`);
     }
   };
@@ -362,7 +385,12 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
       await deps.restart(hostProcess!, launchFor(d));
       await awaitHost(d.fromVersion, hostProcess!.pid);
     });
-    else if (flags.hostDrained && !flags.hostStopped) await step("The local host could not be resumed", async () => { await deps.hostControl("resume"); });
+    else if ((flags.hostDrained || flags.hostDrainPending) && !flags.hostStopped) await step("The local host's maintenance state could not be released", async () => {
+      const status = await probeLocalHost(deps.hostControl);
+      if (!status || status.pid !== hostProcess!.pid || !hostInInstall(status, d.installDir)) throw new Error("The drained daemon's identity could not be reconciled");
+      if (status.drained) await deps.hostControl("resume");
+      flags.hostDrainPending = false;
+    });
     const touched = flags.serverStopped || flags.hostStopped || flags.swapped || flags.restarted || flags.hostDrained;
     const detail = notes.length ? `; ${notes.join("; ")}` : touched ? "; the previous release was restored" : "";
     return { message: `${message(primary)}${detail}`.slice(0, 1500), recovered: notes.length === 0 };
@@ -391,7 +419,7 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
           break;
         } catch (error) {
           if (!isProcessAlive(hostProcess.pid)) { flags.hostStopped = true; break; }
-          if (/did not stop/.test(message(error))) signalled = true;
+          if ((error as NodeJS.ErrnoException).code === "stop_pending") signalled = true;
           if (!d.interruptSessions || attempt >= 5) {
             if (signalled) flags.hostStopped = true;
             throw error;
@@ -399,8 +427,17 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
         }
       }
     }
-    await deps.stop(serverProcess);
-    flags.serverStopped = true;
+    try {
+      await deps.stop(serverProcess);
+      flags.serverStopped = true;
+    } catch (error) {
+      // A rejected stop may already have signalled shutdown. Reconcile it before declaring recovery.
+      if ((error as NodeJS.ErrnoException).code === "stop_pending") {
+        flags.serverStopped = true;
+        await deps.stop(serverProcess);
+      } else if (!isProcessAlive(serverProcess.pid)) flags.serverStopped = true;
+      throw error;
+    }
     const leftover = await deps.sharedInstall(d.installDir, [process.pid]);
     if (leftover) throw new Error(leftover);
 

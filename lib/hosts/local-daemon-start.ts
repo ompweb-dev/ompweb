@@ -53,8 +53,7 @@ async function probe(): Promise<HostControlStatus | null> {
 /** This install's host command: the standalone binary's `host`, or the package's entrypoint under the Node runtime. */
 export function localHostLaunch(env: NodeJS.ProcessEnv = process.env): UpgradeLaunch {
   if (typeof Bun !== "undefined" && Bun.isStandaloneExecutable) return { command: process.execPath, args: ["host"], cwd: process.cwd() };
-  const packageDir = env.OMP_WEB_PACKAGE_DIR;
-  if (!packageDir) throw new Error("OMP_WEB_PACKAGE_DIR is not set, so the host entrypoint cannot be found");
+  const packageDir = env.OMP_WEB_PACKAGE_DIR ?? process.cwd();
   // The daemon is Node-only: a web server running on Bun must start it with the launcher's Node binary.
   const command = env.OMP_WEB_NODE_BIN || (process.versions.bun ? "node" : process.execPath);
   return { command, args: [join(resolve(packageDir), "bin", "omp-web-host.js")], cwd: process.cwd() };

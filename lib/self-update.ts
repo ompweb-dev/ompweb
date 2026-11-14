@@ -1,12 +1,12 @@
 // The web server's side of an application update. prepare → plan (upgrade-plan.ts); commit → explicit approval, the
 // release staged and preflighted, the plan's other hosts updated, then a detached worker (server-update-worker.ts)
 // replaces this installation (binary, npm or bun) and the host sharing it, restarts both and proves them healthy.
-import { accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { delimiter, dirname, basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import packageJson from "../package.json";
-import { hostReleaseName, preflightHostRelease, stageBinary, stagePackage } from "./hosts/update-worker";
+import { hostReleaseName, preflightHostRelease, stageBinary, stagePackage, validateApprovedReleasePin } from "./hosts/update-worker";
 import { checkNpmUpdate, detectInstallMethod } from "./npm-update";
 import { createChildProcessEnvironment } from "./project-command-env";
 import { isProcessAlive } from "./process-identity";
@@ -16,11 +16,15 @@ import {
   atomicWrite, attemptsDir, ensureSecureRoot, isActiveLease, LEASE_MS, leasePath, markerPath, patchStatus, readStateJson, removeSecureEmptyDirectory, removeSecureFile,
   renewLease, resolveSelfUpdateTempRoot, secureDirectory, SelfUpdateError, statusPath, type SelfUpdateStatus, type StoredStatus,
 } from "./self-update-state";
-import { type UpgradeLaunch, inspectUpgradeProcess, launchDetachedUpgrade, secureUpgradeDirectory } from "./upgrade-process";
-import { approveUpgradePlan, getUpgradePlan, prepareUpgradePlan, removeUpgradePlan, upgradePlannedHosts } from "./upgrade-plan";
+import { type UpgradeLaunch, assertUpgradeProcessControl, inspectUpgradeProcess, launchDetachedUpgrade, secureUpgradeDirectory } from "./upgrade-process";
+import { approveUpgradePlan, getApprovedReleasePin, getUpgradePlan, prepareUpgradePlan, removeUpgradePlan, upgradePlannedHosts } from "./upgrade-plan";
 import type { UpgradeApproval, UpgradePlan } from "./upgrade-types";
 import { DISABLE_AUTOUPDATE_ENV_VAR, isUpdateDisabled } from "./update-policy";
 import { isRecord } from "./type-guards";
+import { localLinkUrl } from "./hosts/local-bootstrap";
+import { readHostLinks } from "./hosts/host-login";
+import { hostForToken, LOCAL_HOST_ID } from "./hosts/registry";
+import type { ApprovedReleasePin } from "./hosts/update-types";
 
 export { resolveSelfUpdateTempRoot, SelfUpdateError };
 export type { SelfUpdateStage, SelfUpdateState, SelfUpdateStatus } from "./self-update-state";
@@ -158,7 +162,7 @@ function discardAttempt(attemptId: string): void {
   removeAttemptArtifacts(attemptId);
   const lease = readStateJson<{ attemptId?: unknown }>(leasePath());
   if (lease?.attemptId === attemptId) removeSecureFile(leasePath());
-  removeSecureFile(statusPath());
+  if (readStateJson<StoredStatus>(statusPath())?.attemptId === attemptId) removeSecureFile(statusPath());
 }
 /** Staging and failed-candidate trees of attempts nobody runs any more (only ever called with no active attempt); the backup of a failed recovery is kept. */
 function pruneServerArtifacts(installDir: string): void {
@@ -237,7 +241,35 @@ export function getSelfUpdateStatus(): SelfUpdateStatus | null {
 
 // ---------------------------------------------------------------- prepare
 
+/** One atomic gate for prepare/replacement/commit, including web processes sharing this agent directory. */
+async function withUpdateMutation<T>(run: () => Promise<T>): Promise<T> {
+  const root = ensureSecureRoot(true)!;
+  await securePrivateDirectory(root);
+  const file = join(root, "mutation.json");
+  const id = randomUUID();
+  for (let reclaimed = false; ; reclaimed = true) {
+    try {
+      writeFileSync(file, JSON.stringify({ id, pid: process.pid }), { flag: "wx", mode: 0o600 });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const held = readStateJson<{ id?: string; pid?: number }>(file);
+      const info = lstatSync(file);
+      if (reclaimed || isProcessAlive(held?.pid) || !held?.pid && Date.now() - info.mtimeMs < LEASE_MS) {
+        throw new SelfUpdateError("update_in_progress", "Another update request is in progress", 409);
+      }
+      removeSecureFile(file);
+    }
+  }
+  try { return await run(); }
+  finally { if (readStateJson<{ id?: string }>(file)?.id === id) removeSecureFile(file); }
+}
+
 export async function prepareSelfUpdate(): Promise<PrepareResult> {
+  return withUpdateMutation(prepareSelfUpdateOwned);
+}
+
+async function prepareSelfUpdateOwned(): Promise<PrepareResult> {
   assertUpdatesEnabled();
   const install = resolveServerInstall();
   cleanupStaleSelfUpdate(Date.now());
@@ -251,9 +283,14 @@ export async function prepareSelfUpdate(): Promise<PrepareResult> {
     }
     discardAttempt(current.attemptId);
   }
+  const previousLease = JSON.stringify(readStateJson(leasePath()));
+  const previousStatus = JSON.stringify(readStateJson(statusPath()));
   const npmStatus = await checkNpmUpdate(true);
   if (!npmStatus.updateAvailable || !npmStatus.availableVersion) {
     throw new SelfUpdateError("no_update_available", "No update available", 409);
+  }
+  if (JSON.stringify(readStateJson(leasePath())) !== previousLease || JSON.stringify(readStateJson(statusPath())) !== previousStatus) {
+    throw new SelfUpdateError("update_in_progress", "The update owner changed while preparing the release", 409);
   }
   pruneServerArtifacts(install.installDir);
   const attemptId = randomUUID();
@@ -328,7 +365,9 @@ interface CommitJob {
   install: ServerInstall;
   fromVersion: string;
   targetVersion: string;
+  releasePin: ApprovedReleasePin;
   server: ServerUpdateDescriptor["server"];
+  serverUrl: string | null;
   localHost: ServerUpdateDescriptor["localHost"];
   hostArgs: string[];
   participantId: string | null;
@@ -360,21 +399,22 @@ async function coordinate(job: CommitJob): Promise<void> {
   let hostsPhase = false;
   const attemptDir = join(attemptsDir(true)!, attemptId);
   try {
-    const saved = readStateJson<{ release?: string }>(join(attemptDir, "release.json"));
+    const saved = readStateJson<{ release?: string; releasePin?: unknown }>(join(attemptDir, "release.json"));
     let release: string;
-    if (saved?.release && insideInstall(staging, saved.release)) {
+    if (saved?.release && saved.releasePin && insideInstall(staging, saved.release)) {
+      if (JSON.stringify(validateApprovedReleasePin(saved.releasePin, targetVersion, releaseRepo())) !== JSON.stringify(job.releasePin)) throw new Error("The staged release no longer matches the approved artifact identity");
       release = saved.release;
     } else {
       // An interrupted download cannot be reused as a verified candidate.
       if (existsSync(staging)) { assertOwnedWritableDirectory(staging, "The staged release"); rmSync(staging, { recursive: true }); }
       mkdirSync(staging, { mode: 0o700 });
       release = install.method === "binary"
-        ? await stageBinary({ version: targetVersion, releaseRepo: releaseRepo() }, staging)
-        : await stagePackage({ version: targetVersion, installMethod: install.method, managerPath: resolveManager(install.method) }, staging);
+        ? await stageBinary({ version: targetVersion, releaseRepo: releaseRepo(), releasePin: job.releasePin, requireReleasePin: true }, staging)
+        : await stagePackage({ version: targetVersion, installMethod: install.method, managerPath: resolveManager(install.method), releasePin: job.releasePin, requireReleasePin: true }, staging);
     }
     renewLease(attemptId);
     await preflightHostRelease({ installMethod: install.method, version: targetVersion, runtime: install.runtime }, release);
-    atomicWrite(join(attemptDir, "release.json"), JSON.stringify({ release }));
+    atomicWrite(join(attemptDir, "release.json"), JSON.stringify({ release, releasePin: job.releasePin }));
     renewLease(attemptId);
     hostsPhase = true;
     // The hosts this server does not share an installation with: each answers with its own authenticated receipt.
@@ -388,10 +428,12 @@ async function coordinate(job: CommitJob): Promise<void> {
       installMethod: install.method,
       installDir: install.installDir,
       release,
+      releasePin: job.releasePin,
       fromVersion: job.fromVersion,
       targetVersion,
       runtime: install.runtime,
       server: job.server,
+      serverUrl: job.serverUrl,
       localHost: job.localHost,
       hostArgs: job.hostArgs,
       participantId: job.participantId,
@@ -414,7 +456,7 @@ async function coordinate(job: CommitJob): Promise<void> {
  * staging, the other hosts' updates and the worker run after, and their outcome is the attempt's status and plan.
  */
 export async function commitSelfUpdate(attemptId: string, approval: UpgradeApproval): Promise<{ accepted: true; attemptId: string }> {
-  return startSelfUpdate(attemptId, approval, false);
+  return withUpdateMutation(() => startSelfUpdate(attemptId, approval, false));
 }
 
 async function startSelfUpdate(attemptId: string, approval: UpgradeApproval, resuming: boolean): Promise<{ accepted: true; attemptId: string }> {
@@ -448,6 +490,13 @@ async function startSelfUpdate(attemptId: string, approval: UpgradeApproval, res
       && JSON.stringify(serverProcess.supervisor) === JSON.stringify(localHost.process.supervisor)) {
       throw unsupported("The server and host share one supervisor; separate their services before upgrading");
     }
+    await controllable("The server's supervisor does not permit stopping and restarting this service", () => assertUpgradeProcessControl(serverProcess));
+    if (localHost.kind === "shared") await controllable("The local host's supervisor does not permit stopping and restarting its service", () => assertUpgradeProcessControl(localHost.process));
+    const loopback = localLinkUrl();
+    const links = "url" in loopback ? [loopback.url]
+      : readHostLinks().filter((link) => hostForToken(link.token)?.id === LOCAL_HOST_ID).map((link) => link.url);
+    const serverUrl = links.length === 1 ? links[0].replace(/\/+$/, "") : null;
+    if (localHost.kind !== "separate" && !serverUrl) throw unsupported("The local host's link to this server could not be identified");
     await controllable("The detached update worker cannot be started safely", () =>
       launchDetachedUpgrade({ command: process.execPath, args: ["--version"], cwd: install.installDir, env: helperEnvironment() }));
     // Stopping the shared host interrupts what it runs (the approval required Force for it); null (unknown) counts as work.
@@ -459,6 +508,7 @@ async function startSelfUpdate(attemptId: string, approval: UpgradeApproval, res
     atomicWrite(join(attemptDir, "job.json"), JSON.stringify({ attemptId }));
     // Persist approval only after controllability and private-state checks pass.
     if (!resuming) await approveUpgradePlan(attemptId, confirmed);
+    const releasePin = getApprovedReleasePin(attemptId);
     patchStatus(attemptId, { state: "running", stage: "preparing", startedAt: new Date().toISOString(), coordinatorPid: process.pid });
     renewLease(attemptId);
     void coordinate({
@@ -466,7 +516,9 @@ async function startSelfUpdate(attemptId: string, approval: UpgradeApproval, res
       install,
       fromVersion: status.fromVersion,
       targetVersion: status.targetVersion,
+      releasePin,
       server: { process: serverProcess, launch, pids: top === process.pid ? [process.pid] : [process.pid, top] },
+      serverUrl,
       localHost,
       hostArgs,
       participantId: localHost.kind === "separate" ? null : local?.id ?? null,
@@ -489,7 +541,8 @@ export async function resumeCoordinatedSelfUpdate(): Promise<void> {
     const plan = getUpgradePlan(status.attemptId);
     if (!plan?.approved) throw new Error("The interrupted upgrade has no stored approval");
     renewLease(status.attemptId);
-    await startSelfUpdate(status.attemptId, { planId: plan.id, force: plan.approved.force }, true);
+    const approval = { planId: plan.id, force: plan.approved.force };
+    await withUpdateMutation(() => startSelfUpdate(status.attemptId, approval, true));
   } catch (error) {
     failAttempt(status.attemptId, error, "report");
   }

@@ -14,6 +14,8 @@ export interface HostControlStatus {
   version: string;
   protocol: number;
   linked: boolean;
+  /** Authenticated application links, by configured server URL; absent on historical daemons. */
+  linkedServers?: string[];
   drained: boolean;
   executable: string;
   entrypoint: string;
@@ -248,6 +250,7 @@ export async function requestHostControl(value: HostControlCommand, agentDir = g
         if (!reply?.ok) throw Object.assign(new Error(reply?.error?.message || "Host control failed"), { code: reply?.error?.code });
         const status = reply.status;
         if (!status || !Number.isSafeInteger(status.pid) || status.pid < 1 || !Number.isSafeInteger(status.protocol) || typeof status.version !== "string" || typeof status.linked !== "boolean" || typeof status.drained !== "boolean" || typeof status.executable !== "string" || typeof status.entrypoint !== "string") throw new Error("Invalid host control status");
+        if (status.linkedServers !== undefined && (!Array.isArray(status.linkedServers) || !status.linkedServers.every((url: unknown) => typeof url === "string"))) throw new Error("Invalid host control server links");
         resolve(status);
       } catch (error) { reject(error); }
       socket.destroy();

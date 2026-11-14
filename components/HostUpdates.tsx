@@ -88,7 +88,7 @@ export function HostUpdates({ host }: { host: HostRow }) {
         setInfo(next);
         setError(null);
         setNeedsStatus(false);
-        if (next.operation?.state === "running") {
+        if (next.operation?.state === "running" && !next.operation.recoveryRequired) {
           watching.current = true;
           deadline.current ||= Date.now() + RECONNECT_MS;
           setMonitoring(true);
@@ -182,8 +182,8 @@ export function HostUpdates({ host }: { host: HostRow }) {
       {(["ompweb"] as const).map((target) => {
         const software = info?.[target];
         const label = t(`hostUpdates.${target}`);
-        const updateDisabled = disabled || needsStatus || !software?.canUpdate;
-        const forceable = software?.updateAvailable === true && !software.canUpdate && software.canForceUpdate === true;
+        const updateDisabled = disabled || needsStatus || operation?.recoveryRequired === true || !software?.canUpdate;
+        const forceable = operation?.recoveryRequired !== true && software?.updateAvailable === true && !software.canUpdate && software.canForceUpdate === true;
         return (
           <div key={target} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
             <div style={{ minWidth: 0, flex: "1 1 200px", fontSize: 12, color: "var(--text-muted)", overflowWrap: "anywhere" }}>
@@ -213,7 +213,7 @@ export function HostUpdates({ host }: { host: HostRow }) {
         {monitoring && <div role="status">{operation?.state === "running" ? t("hostUpdates.updating", { software: t(`hostUpdates.${operation.target}`), version: operation.version }) : t("hostUpdates.reconnecting")}</div>}
         {!monitoring && !posting && !error && operation?.state === "succeeded" && <div role="status">{t(operation.awaitingServerCutover ? "hostUpdates.awaitingServerCutover" : "hostUpdates.succeeded")}</div>}
         {!monitoring && operation?.force === true && operation.interruptedSessions !== undefined && operation.state !== "running" && <div>{t("hostUpdates.interruptedSessions", { count: operation.interruptedSessions })}</div>}
-        {!monitoring && operation?.state === "failed" && <div role="alert" style={{ color: "var(--status-error)" }}>{t("hostUpdates.updateFailed", { error: operation.error || t("hostUpdates.unknownError") })}</div>}
+        {!monitoring && (operation?.state === "failed" || operation?.recoveryRequired) && <div role="alert" style={{ color: "var(--status-error)" }}>{t("hostUpdates.updateFailed", { error: operation.error || t("hostUpdates.unknownError") })}</div>}
         {error && <div role="alert" style={{ color: "var(--status-error)" }}>{error}</div>}
         {needsStatus && <div>{t("hostUpdates.statusRequired")}</div>}
       </div>

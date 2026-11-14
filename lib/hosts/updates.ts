@@ -8,11 +8,11 @@ import { getOmpVersion } from "../omp/omp-cli";
 import { createChildProcessEnvironment } from "../project-command-env";
 import { isUpdateDisabled } from "../update-policy";
 import { releaseRepo } from "../release-repo";
-import { inspectUpgradeProcess, launchDetachedUpgrade, type UpgradeProcess } from "../upgrade-process";
+import { assertUpgradeProcessControl, inspectUpgradeProcess, launchDetachedUpgrade, type UpgradeProcess } from "../upgrade-process";
 import { processStartIdentity, isProcessAlive } from "../process-identity";
 import { isRecord } from "../type-guards";
 import type { HostSoftwareUpdate, HostUpdateBlocker, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateRequest, HostUpdateTarget } from "./update-types";
-import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, pruneHostUpdateArtifacts, readHostUpdateState, sharedHostInstallReason, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
+import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, pruneHostUpdateArtifacts, readHostUpdateState, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
 
 // Covers a 15 min release download (update-worker.ts DOWNLOAD_TIMEOUT_MS) plus preflight, stop and restart.
 const LEASE_MS = 30 * 60 * 1000;
@@ -43,6 +43,7 @@ export function configureHostUpdateSafety(guard: () => string | null, state?: Ho
 export function getHostUpdateOperation(): HostUpdateOperation | null {
   const state = readHostUpdateState();
   if (!state) return null;
+  if (state.operation.recoveryRequired) return state.operation;
   if (state.operation.state === "running" && (Date.now() - state.startedAt > LEASE_MS || (Date.now() - state.startedAt > 30000 && !isProcessAlive(state.workerPid ?? state.daemonPid)))) {
     finishHostUpdate(state.operation.id, "Host update was interrupted before completion");
     return readHostUpdateState()!.operation;
@@ -66,6 +67,7 @@ export function acknowledgeHostUpdateHealth(): void {
     assertOwnedPath(path);
     const descriptor = JSON.parse(readFileSync(path, "utf8")) as HostUpdateDescriptor;
     if (descriptor.id !== state.operation.id || ![descriptor.version, descriptor.fromVersion].includes(packageJson.version)) return;
+    if (descriptor.receipt && descriptor.version === packageJson.version) return;
     writeHostUpdateJson(join(attempt, "health.json"), { id: state.operation.id, version: packageJson.version, pid: process.pid });
   } catch (error) { console.error("Could not acknowledge host update health:", messageOf(error)); }
 }
@@ -153,6 +155,7 @@ async function inspectHost(method: "npm" | "bun" | "binary", fresh: boolean): Pr
   const key = `${method}:${installDir}`;
   if (!fresh && inspection?.key === key && Date.now() - inspection.at < INSPECTION_TTL_MS) return inspection.value;
   const value = await inspectUpgradeProcess({ pid: process.pid, installDir, role: "host", launch: hostLaunch({ installMethod: method, installDir, runtime: process.execPath, hostArgs: hostArguments(method === "binary"), cwd: process.cwd() }) });
+  await assertUpgradeProcessControl(value);
   inspection = { key, at: Date.now(), value };
   return value;
 }
@@ -194,6 +197,7 @@ async function evaluateHostUpdate(compatibility: HostUpdateCompatibility, refres
   const disabled = isUpdateDisabled() ? "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE" : null;
   const [npm, ompVersion] = await Promise.all([checkNpmUpdate(refresh).catch(() => null), getOmpVersion()]);
   const base: HostSoftwareUpdate = { currentVersion: null, availableVersion: null, updateAvailable: false, canUpdate: false, blockers: [], canForceUpdate: false, blockedReason: null, updateCommand: "" };
+  base.supportsReleasePin = true;
   const installMethod = typeof Bun !== "undefined" && Bun.isStandaloneExecutable ? "binary" : detectInstallMethod(installDirectory());
   const ompweb: HostUpdateInfo["ompweb"] = { ...base, ...npm, currentVersion: packageJson.version, installMethod, protocolVersion: null, activeSessions: safetyState.sessions(), updateCommand: installMethod === "binary" ? `https://github.com/${releaseRepo()}/releases/latest` : installMethod === "bun" ? "bun add -g @kahme247/ompweb" : "npm install -g @kahme247/ompweb" };
   // omp updates with ompweb (its runner ships inside each release): the row only reports the running version.
@@ -287,7 +291,9 @@ export function copyHostWorkerSources(entry: string, directory: string): string 
     const target = join(directory, source === entry ? "worker.mts" : `${basename(source, ".ts")}.mts`);
     if ([...copies.values()].includes(target)) throw new Error(`Two worker modules would both be copied as ${basename(target)}`);
     copies.set(source, target);
-    const text = readFileSync(source, "utf8").replace(RELATIVE_RUNTIME_IMPORT, (_whole, keyword: string, middle: string, specifier: string) => `${keyword}${middle}from "./${basename(copy(`${resolve(dirname(source), specifier)}.ts`))}";`);
+    const text = readFileSync(source, "utf8")
+      .replace(RELATIVE_RUNTIME_IMPORT, (_whole, keyword: string, middle: string, specifier: string) => `${keyword}${middle}from "./${basename(copy(`${resolve(dirname(source), specifier)}.ts`))}";`)
+      .replace(/\bimport\("(\.{1,2}\/[^"]+)"\)/g, (_whole, specifier: string) => `import("./${basename(copy(`${resolve(dirname(source), specifier)}.ts`))}")`);
     writeFileSync(target, text, { mode: 0o600 });
     return target;
   };
@@ -342,10 +348,18 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
   if (target !== "ompweb") throw new HostUpdateError("invalid_target", "Invalid host software target", 400);
   if (typeof version !== "string" || version.length > 100 || !HOST_VERSION_PATTERN.test(version)) throw new HostUpdateError("invalid_version", "Invalid host update version", 400);
   if (request.operationId !== undefined && (typeof request.operationId !== "string" || !OPERATION_ID.test(request.operationId))) throw new HostUpdateError("invalid_request", "operationId must be a UUID", 400);
+  if (request.requireReleasePin !== undefined && typeof request.requireReleasePin !== "boolean" || request.requireReleasePin && !request.releasePin) throw new HostUpdateError("invalid_request", "Missing approved release pin", 400);
+  const releasePin = request.releasePin === undefined ? undefined : validateApprovedReleasePin(request.releasePin, version, releaseRepo());
   // A coordinator that retries an operation gets its state back; nothing is started twice.
   const existing = request.operationId === undefined ? null : getHostUpdateOperation();
   if (existing && existing.id === request.operationId) {
     if (existing.target !== target || existing.version !== version) throw new HostUpdateError("operation_conflict", "That operation id already names a different host update");
+    if (releasePin || request.requireReleasePin) {
+      const path = join(hostUpdateRoot(), existing.id, "descriptor.json");
+      assertOwnedPath(path);
+      const descriptor = JSON.parse(readFileSync(path, "utf8")) as HostUpdateDescriptor;
+      if (!descriptor.releasePin || JSON.stringify(validateApprovedReleasePin(descriptor.releasePin, version, releaseRepo())) !== JSON.stringify(releasePin) || !!descriptor.requireReleasePin !== !!request.requireReleasePin) throw new HostUpdateError("operation_conflict", "That operation id already names different approved artifacts");
+    }
     return { accepted: true, operation: existing };
   }
   if (isUpdateDisabled()) throw new HostUpdateError("updates_disabled", "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE", 403);
@@ -359,6 +373,7 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
     if (!software.canUpdate && !(force && software.canForceUpdate)) throw new HostUpdateError(software.canForceUpdate ? "host_busy" : "update_blocked", software.blockedReason || "This host update is blocked");
     const method = info.ompweb.installMethod;
     if (!plan?.process) throw new HostUpdateError("update_blocked", "This host's process could not be verified");
+    if (releasePin && plan?.restartOnly) throw new HostUpdateError("update_blocked", "An existing installation cannot be adopted as an approved release without artifact evidence");
     if (isUpdateDisabled()) throw new HostUpdateError("updates_disabled", "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE", 403);
     const operation: HostUpdateOperation = { id, target, version, state: "running", ...(force ? { force: true as const, interruptedSessions: safetyState.sessions() } : {}), ...(awaitsServerCutover ? { awaitingServerCutover: true as const } : {}) };
     writeHostUpdateJson(join(root, "status.json"), { operation, startedAt: Date.now(), daemonPid: process.pid });
@@ -368,6 +383,8 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
     if (busy && (!force || safetyState.drained())) throw new HostUpdateError(safetyState.drained() ? "host_drained" : "host_busy", busy);
     const binary = method === "binary";
     const descriptor: HostUpdateDescriptor = { id, target, version, fromVersion: packageJson.version, installMethod: method, installDir: installDirectory(), runtime: process.execPath, hostArgs: hostArguments(binary), cwd: process.cwd(), daemonPid: process.pid, process: plan.process, releaseRepo: releaseRepo(), restartOnly: plan.restartOnly || undefined, force: force || undefined, receipt: request.targetCompatibility };
+    descriptor.releasePin = releasePin;
+    descriptor.requireReleasePin = request.requireReleasePin;
     if (!binary && !descriptor.restartOnly) descriptor.managerPath = resolvePackageManager(method as "npm" | "bun");
     await launchHostUpdateWorker(root, descriptor, binary ? "compiled" : "script");
     return { accepted: true, operation };

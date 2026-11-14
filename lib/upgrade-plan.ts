@@ -5,13 +5,13 @@ import { setTimeout as pause } from "node:timers/promises";
 import { getAgentDir } from "./omp/paths";
 import { isRecord } from "./type-guards";
 import { releaseRepo } from "./release-repo";
-import { checkNpmUpdate } from "./npm-update";
+import { checkNpmUpdate, detectInstallMethod } from "./npm-update";
 import { isUpdateDisabled } from "./update-policy";
 import { requestHostControl } from "./hosts/host-control";
 import { getHostSoftwareUpdates, getHostUpgradeInventory, hostsSnapshot, updateHostSoftware, type HostUpgradeInventory } from "./hosts/hub";
-import { assertOwnedPath, fetchHostUpdateBytes, HOST_VERSION_PATTERN } from "./hosts/update-worker";
+import { assertOwnedPath, fetchHostUpdateBytes, HOST_VERSION_PATTERN, validateApprovedReleasePin } from "./hosts/update-worker";
 import { HostOpError } from "./hosts/link-protocol";
-import type { HostUpdateCompatibility } from "./hosts/update-types";
+import type { ApprovedReleasePin, HostUpdateCompatibility } from "./hosts/update-types";
 import type { UpgradeApproval, UpgradeParticipant, UpgradePlan } from "./upgrade-types";
 import { inspectUpgradeProcess } from "./upgrade-process";
 import { renewLease } from "./self-update-state";
@@ -40,28 +40,38 @@ export function parseReleaseCompatibility(source: string): HostUpdateCompatibili
   return { min: values[0], max: values[1] };
 }
 
-async function candidateIdentity(version: string): Promise<{ compatibility: HostUpdateCompatibility; fingerprint: string }> {
+async function candidateIdentity(version: string, includeNpm = true): Promise<{ compatibility: HostUpdateCompatibility; fingerprint: string; pin: ApprovedReleasePin }> {
   if (!HOST_VERSION_PATTERN.test(version)) throw new UpgradePlanError("invalid_version", "Invalid server update version", 400);
   const repo = releaseRepo();
-  const [source, bytes] = await Promise.all([
+  const [source, bytes, npmBytes] = await Promise.all([
     fetchHostUpdateBytes(`https://raw.githubusercontent.com/${repo}/v${version}/lib/hosts/link-protocol.ts`, 128 * 1024),
     fetchHostUpdateBytes(`https://api.github.com/repos/${repo}/releases/tags/v${version}`, 2 * 1024 * 1024),
+    includeNpm ? fetchHostUpdateBytes(`https://registry.npmjs.org/${encodeURIComponent("@kahme247/ompweb")}/${version}`, 2 * 1024 * 1024).catch(() => null) : Promise.resolve(null),
   ]);
   const release: unknown = JSON.parse(bytes.toString("utf8"));
   if (!isRecord(release) || release.tag_name !== `v${version}` || release.draft === true || !Array.isArray(release.assets)) {
     throw new UpgradePlanError("unpublished_release", "The candidate server has no matching published release");
   }
-  const digests: string[] = [];
+  const assets: Record<string, string> = {};
   for (const asset of release.assets) {
-    if (!isRecord(asset) || typeof asset.name !== "string" || !/^ompweb-(?:linux|darwin|windows)-/.test(asset.name)) continue;
+    if (!isRecord(asset) || typeof asset.name !== "string" || !/^ompweb-(?:(?:linux|darwin)-(?:x64|arm64)\.tar\.gz|windows-x64\.zip)$/.test(asset.name)) continue;
     if (typeof asset.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(asset.digest)) throw new UpgradePlanError("release_integrity", "A candidate release asset has no verified digest");
-    if (digests.some((entry) => entry.startsWith(`${asset.name}:`))) throw new UpgradePlanError("release_integrity", "The candidate release has duplicate platform assets");
-    digests.push(`${asset.name}:${asset.digest}`);
+    if (Object.hasOwn(assets, asset.name)) throw new UpgradePlanError("release_integrity", "The candidate release has duplicate platform assets");
+    assets[asset.name] = asset.digest.slice(7);
   }
-  if (!digests.length) throw new UpgradePlanError("release_integrity", "The candidate release has no verified platform assets");
+  let pin = validateApprovedReleasePin({ version, releaseRepo: repo, assets }, version, repo);
+  if (npmBytes !== null) {
+    try {
+      const npm: unknown = JSON.parse(npmBytes.toString("utf8"));
+      if (!isRecord(npm) || npm.name !== "@kahme247/ompweb" || npm.version !== version || !isRecord(npm.dist)) throw new Error("Unverified npm publication");
+      pin = validateApprovedReleasePin({ ...pin, npm: { tarball: npm.dist.tarball, integrity: npm.dist.integrity } }, version, repo);
+    } catch { /* Package participants below require a valid npm publication; binary-only plans do not. */ }
+  }
+  const compatibility = parseReleaseCompatibility(source.toString("utf8"));
   return {
-    compatibility: parseReleaseCompatibility(source.toString("utf8")),
-    fingerprint: createHash("sha256").update(source).update(JSON.stringify(digests.sort())).digest("hex"),
+    compatibility,
+    fingerprint: createHash("sha256").update(JSON.stringify({ compatibility, pin })).digest("hex"),
+    pin,
   };
 }
 
@@ -134,6 +144,19 @@ export function getUpgradePlan(id: string): UpgradePlan | null {
   return value;
 }
 
+/** Private approval evidence; never reconstructed from mutable release metadata after approval. */
+export function getApprovedReleasePin(attemptId: string): ApprovedReleasePin {
+  const plan = getUpgradePlan(attemptId);
+  if (!plan?.approved) throw new UpgradePlanError("approval_required", "The upgrade plan has not been approved");
+  const path = join(planDirectory(attemptId), "identity.json");
+  assertOwnedPath(path);
+  const identity: unknown = JSON.parse(readFileSync(path, "utf8"));
+  if (!isRecord(identity) || typeof identity.release !== "string" || !/^[a-f0-9]{64}$/.test(identity.release)) throw new UpgradePlanError("invalid_plan", "Invalid private release approval");
+  const pin = validateApprovedReleasePin(identity.pin, plan.targetVersion, releaseRepo());
+  if (identity.release !== createHash("sha256").update(JSON.stringify({ compatibility: plan.compatibility, pin })).digest("hex")) throw new UpgradePlanError("invalid_plan", "Stored artifacts do not match the approved release fingerprint");
+  return pin;
+}
+
 function snapshot(inventory: HostUpgradeInventory[]): string {
   return createHash("sha256").update(JSON.stringify(inventory.map(({ host, sessionProcesses, sessionIds }) => ({
     id: host.id, version: host.ompwebVersion ?? null, protocol: host.hostVersion,
@@ -158,7 +181,7 @@ export function buildUpgradePlan(input: { id: string; fromVersion: string; targe
     const blockedReason = needsUpgrade && !missing && (host.status === "offline" && !maintenance || recovery === "none")
       ? `${host.label || host.id}: host compatibility and recovery could not be established; reconnect it before upgrading the server` : null;
     return {
-      id: host.id, label: host.label || host.id, currentVersion: host.ompwebVersion ?? null,
+      id: host.id, label: host.label || host.id, currentVersion: missing ? null : host.ompwebVersion ?? null,
       protocolVersion: host.hostVersion, targetVersion: needsUpgrade ? input.targetVersion : host.ompwebVersion ?? null,
       needsUpgrade, recovery, sessionProcesses: missing ? 0 : sessionProcesses, activeTurns: missing ? 0 : activeTurns,
       blockedReason, stage: needsUpgrade ? "pending" : "unchanged",
@@ -180,6 +203,9 @@ export async function prepareUpgradePlan(attemptId: string, targetVersion: strin
     return existing;
   }
   const [candidate, inventory] = await Promise.all([candidateIdentity(targetVersion), getHostUpgradeInventory()]);
+  const serverMethod = typeof Bun !== "undefined" && Bun.isStandaloneExecutable ? "binary" : detectInstallMethod(resolve(process.env.OMP_WEB_PACKAGE_DIR || process.cwd()));
+  if (serverMethod !== "binary" && !candidate.pin.npm) throw new UpgradePlanError("release_integrity", "The official npm release required by this server could not be pinned");
+  let needsNpm = serverMethod !== "binary";
   let sharedLocal = false, localMissing = false;
   try {
     const local = await requestHostControl("status");
@@ -197,16 +223,25 @@ export async function prepareUpgradePlan(attemptId: string, targetVersion: strin
   const plan = buildUpgradePlan({ id: attemptId, fromVersion, targetVersion, compatibility: candidate.compatibility, inventory, sharedLocal, localMissing });
   await Promise.all(plan.hosts.filter((host) => host.needsUpgrade && host.recovery !== "shared-local" && !(host.id === "local" && localMissing) && !host.blockedReason).map(async (host) => {
     try {
-      const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility);
-      if (!status.ompweb.updateAvailable || status.ompweb.availableVersion !== targetVersion || !status.ompweb.canUpdate && !status.ompweb.canForceUpdate && host.id !== "local") {
+      const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility, candidate.pin);
+      if (status.ompweb.installMethod !== "binary") needsNpm = true;
+      if (status.ompweb.installMethod !== "binary" && !candidate.pin.npm) {
+        host.blockedReason = "The official npm release required by this host could not be pinned";
+        return;
+      }
+      if (!status.ompweb.updateAvailable || status.ompweb.availableVersion !== targetVersion || !status.ompweb.canUpdate && !status.ompweb.canForceUpdate) {
         host.blockedReason = status.ompweb.blockedReason || "This host has no verified update/recovery path to the candidate server version";
-      } else if (!status.ompweb.canUpdate || host.recovery === "legacy") plan.requiresForce = true;
+      } else if (!status.ompweb.canUpdate || status.ompweb.forceMethod === "recovery" || host.recovery === "legacy") plan.requiresForce = true;
     } catch (error) { host.blockedReason = error instanceof Error ? error.message : "The host update path could not be checked"; }
   }));
+  if (!needsNpm && candidate.pin.npm) {
+    delete candidate.pin.npm;
+    candidate.fingerprint = createHash("sha256").update(JSON.stringify({ compatibility: candidate.compatibility, pin: candidate.pin })).digest("hex");
+  }
   plan.blockedReason = plan.hosts.find((host) => host.blockedReason)?.blockedReason ?? null;
   const directory = planDirectory(attemptId, true);
   mkdirSync(directory, { mode: 0o700 });
-  writeFileSync(join(directory, "identity.json"), JSON.stringify({ snapshot: snapshot(inventory), release: candidate.fingerprint }), { flag: "wx", mode: 0o600 });
+  writeFileSync(join(directory, "identity.json"), JSON.stringify({ snapshot: snapshot(inventory), release: candidate.fingerprint, pin: candidate.pin }), { flag: "wx", mode: 0o600 });
   writePlan(plan);
   return plan;
 }
@@ -224,7 +259,7 @@ export async function approveUpgradePlan(attemptId: string, approval: UpgradeApp
   const identityFile = join(planDirectory(attemptId), "identity.json");
   assertOwnedPath(identityFile);
   const identity: unknown = JSON.parse(readFileSync(identityFile, "utf8"));
-  const [candidate, inventory, available] = await Promise.all([candidateIdentity(plan.targetVersion), getHostUpgradeInventory(), checkNpmUpdate(true)]);
+  const [candidate, inventory, available] = await Promise.all([candidateIdentity(plan.targetVersion, isRecord(identity) && isRecord(identity.pin) && identity.pin.npm !== undefined), getHostUpgradeInventory(), checkNpmUpdate(true)]);
   if (!isRecord(identity) || identity.release !== candidate.fingerprint || identity.snapshot !== snapshot(inventory)
     || available.availableVersion !== plan.targetVersion || !available.updateAvailable) {
     throw new UpgradePlanError("plan_changed", "The candidate release, registered hosts or affected sessions changed; review a new upgrade plan", 412);
@@ -248,10 +283,12 @@ export function upgradePlannedHosts(attemptId: string): Promise<UpgradePlan> {
 async function coordinateHosts(attemptId: string): Promise<UpgradePlan> {
   const plan = getUpgradePlan(attemptId);
   if (!plan?.approved) throw new UpgradePlanError("approval_required", "The upgrade plan has not been approved");
+  const releasePin = getApprovedReleasePin(attemptId);
   if (plan.state === "ready" || plan.state === "updating-server" || plan.state === "succeeded") return plan;
   if (plan.state === "failed" || plan.state === "recovery-required") throw new UpgradePlanError("recovery_required", plan.error || "The previous coordinated update requires recovery");
   plan.state = "updating-hosts";
   writePlan(plan);
+  let recoveryRequired = false;
   try {
     const registered = hostsSnapshot().hosts.map((host) => host.id).sort();
     if (JSON.stringify(registered) !== JSON.stringify(plan.hosts.map((host) => host.id).sort())) throw new UpgradePlanError("plan_changed", "The registered host set changed before server cutover", 412);
@@ -266,12 +303,15 @@ async function coordinateHosts(attemptId: string): Promise<UpgradePlan> {
       for (;;) {
         renewLease(attemptId);
         try {
-          const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility);
-          if (status.operation?.state === "failed" && status.operation.id === host.operationId) throw new UpgradePlanError("host_upgrade_failed", `${host.label}: ${status.operation.error || "Host update failed"}`);
+          const status = await getHostSoftwareUpdates(host.id, true, plan.compatibility, releasePin);
+          if (status.operation?.id === host.operationId && (status.operation.state === "failed" || status.operation.recoveryRequired)) {
+            recoveryRequired = status.operation.recoveryRequired === true;
+            throw new UpgradePlanError("host_upgrade_failed", `${host.label}: ${status.operation.error || "Host update failed"}`);
+          }
           if (status.ompweb.currentVersion === plan.targetVersion && status.operation?.state === "succeeded"
             && status.operation.id === host.operationId && status.operation.version === plan.targetVersion) break;
           if (status.ompweb.currentVersion !== plan.targetVersion && status.operation?.id !== host.operationId) {
-            const accepted = await updateHostSoftware(host.id, "ompweb", plan.targetVersion, { force: plan.approved.force, compatibility: plan.compatibility, operationId: host.operationId });
+            const accepted = await updateHostSoftware(host.id, "ompweb", plan.targetVersion, { force: plan.approved.force, compatibility: plan.compatibility, operationId: host.operationId, releasePin, requireReleasePin: true });
             if (accepted.operation.id !== host.operationId) throw new UpgradePlanError("host_operation_changed", `${host.label} accepted a different update operation`);
           }
         } catch (error) {
@@ -290,7 +330,7 @@ async function coordinateHosts(attemptId: string): Promise<UpgradePlan> {
     plan.error = error instanceof Error ? error.message : "The coordinated host update failed";
     const host = plan.hosts.find((item) => item.stage === "updating");
     if (host) { host.stage = "failed"; host.error = plan.error; }
-    plan.state = plan.hosts.some((item) => item.stage === "ready") ? "recovery-required" : "failed";
+    plan.state = recoveryRequired || plan.hosts.some((item) => item.stage === "ready") ? "recovery-required" : "failed";
     writePlan(plan);
     throw error;
   }

@@ -6,7 +6,8 @@
 // host's authenticated operation receipt is the only success signal.
 import { releaseRepo } from "../release-repo";
 import { isRecord } from "../type-guards";
-import { HOST_VERSION_PATTERN } from "./update-worker";
+import { HOST_VERSION_PATTERN, validateApprovedReleasePin } from "./update-worker";
+import type { ApprovedReleasePin } from "./update-types";
 
 /** The server's published release whose binary carries the recovery CLI (`ompweb recover-host`). `tag` names that exact
  * release when it is not the stable `v<version>` (a prerelease build of the same package version). */
@@ -26,12 +27,16 @@ export interface LegacyRecoveryInput {
   /** The host's `process.platform`: linux, darwin or win32. */
   platform: string;
   force: boolean;
+  releasePin?: ApprovedReleasePin;
+  requireReleasePin?: boolean;
 }
 
 /** What the helper binary embeds (lib/hosts/recovery.ts), encoded so this module, bundled into every release, does not:
  * a release without the recovery CLI must not match. An old ompweb given an unknown subcommand starts the web server. */
 export const RECOVERY_CLI_MARKER_BASE64 = "b21wd2ViLXJlY292ZXJ5LWNsaS12MQ==";
 const RECOVERY_CLI_MARKER = Buffer.from(RECOVERY_CLI_MARKER_BASE64, "base64").toString();
+export const RECOVERY_PIN_CLI_MARKER_BASE64 = "b21wd2ViLXJlY292ZXJ5LXBpbi1jbGktdjE=";
+const RECOVERY_PIN_CLI_MARKER = Buffer.from(RECOVERY_PIN_CLI_MARKER_BASE64, "base64").toString();
 
 const GITHUB = "https://github.com";
 const OPERATION_ID = /^[a-zA-Z0-9-]{1,80}$/;
@@ -59,6 +64,7 @@ interface Plan {
   force: boolean;
   /** Pinned SHA-256 (hex) of each architecture's archive. */
   digests: Map<string, string>;
+  releasePin?: string;
 }
 
 function refuse(message: string): never {
@@ -78,6 +84,8 @@ function validate(input: LegacyRecoveryInput): Plan {
   if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || min < 1 || max < min || max > 1000) refuse("protocol compatibility");
   if (typeof platform !== "string" || !Object.hasOwn(PLATFORMS, platform)) refuse("platform");
   if (typeof force !== "boolean") refuse("force flag");
+  if (input.requireReleasePin !== undefined && typeof input.requireReleasePin !== "boolean" || input.requireReleasePin && !input.releasePin) refuse("missing approved release pin or malformed pin requirement");
+  const releasePin = input.releasePin === undefined ? undefined : Buffer.from(JSON.stringify(validateApprovedReleasePin(input.releasePin, targetVersion, releaseRepo()))).toString("base64url");
   if (!Array.isArray(helper.assets) || helper.assets.some((asset) => !isRecord(asset) || typeof asset.name !== "string" || typeof asset.digest !== "string")) refuse("helper assets");
   const { os, extension, architectures } = PLATFORMS[platform as keyof typeof PLATFORMS];
   const digests = new Map<string, string>();
@@ -91,12 +99,12 @@ function validate(input: LegacyRecoveryInput): Plan {
     digests.set(architecture, digest[1]);
   }
   if (digests.size === 0) refuse(`the helper release has no ${os} asset with a digest`);
-  return { operationId, platform: platform as keyof typeof PLATFORMS, repo: helper.repo, tag, targetVersion, min, max, force, digests };
+  return { operationId, platform: platform as keyof typeof PLATFORMS, repo: helper.repo, tag, targetVersion, min, max, force, digests, releasePin };
 }
 
 /** The arguments of `ompweb recover-host` (runHostRecoveryCli's strict flags), identical on every platform. */
 function recoverArguments(plan: Plan): string[] {
-  return ["recover-host", "--operation", plan.operationId, "--version", plan.targetVersion, "--min-protocol", String(plan.min), "--max-protocol", String(plan.max), ...(plan.force ? ["--force"] : [])];
+  return ["recover-host", "--operation", plan.operationId, "--version", plan.targetVersion, "--min-protocol", String(plan.min), "--max-protocol", String(plan.max), ...(plan.force ? ["--force"] : []), ...(plan.releasePin ? ["--release-pin", plan.releasePin] : [])];
 }
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", `'\\''`)}'`;
@@ -131,7 +139,7 @@ esac
 asset="ompweb-${os}-$arch${extension}"
 entry="ompweb-${os}-$arch/ompweb"
 url=${shellQuote(`${base}/${plan.repo}/releases/download/${plan.tag}/`)}"$asset"
-marker=${shellQuote(RECOVERY_CLI_MARKER)}
+marker=${shellQuote(plan.releasePin ? RECOVERY_PIN_CLI_MARKER : RECOVERY_CLI_MARKER)}
 digest_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f 1
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d ' ' -f 1
@@ -149,7 +157,7 @@ tar -tzf "$work/archive" > "$work/entries" || fail 'cannot list the release arch
 [ "$(grep -Fxc -- "$entry" "$work/entries" || true)" = 1 ] || fail "release archive must contain exactly one $entry"
 ( ulimit -f ${MAX_BYTES / 512} && tar -xzOf "$work/archive" "$entry" > "$work/ompweb" ) || fail 'cannot extract the ompweb binary'
 [ -s "$work/ompweb" ] || fail 'the ompweb binary is empty'
-grep -aqF -- "$marker" "$work/ompweb" || fail 'the pinned ompweb release has no recovery support'
+grep -aqF -- "$marker" "$work/ompweb" || fail ${shellQuote(plan.releasePin ? "the pinned ompweb release has no approved release pin support" : "the pinned ompweb release has no recovery support")}
 chmod 700 "$work/ompweb"
 rm -f "$work/archive" "$work/entries"
 if "$work/ompweb" ${recoverArguments(plan).map(shellQuote).join(" ")} </dev/null; then keep=1; else status=$?; printf 'ompweb recovery bootstrap: recover-host exited with %s\n' "$status" >&2; exit "$status"; fi
@@ -181,7 +189,7 @@ try {
   $url = ${powershellQuote(`${base}/${plan.repo}/releases/download/${plan.tag}/ompweb-windows-x64.zip`)}
   $want = ${powershellQuote(digest)}
   $entry = ${powershellQuote(entry)}
-  $marker = ${powershellQuote(RECOVERY_CLI_MARKER)}
+  $marker = ${powershellQuote(plan.releasePin ? RECOVERY_PIN_CLI_MARKER : RECOVERY_CLI_MARKER)}
   $cap = ${MAX_BYTES}
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
   $acl = New-Object Security.AccessControl.DirectorySecurity
@@ -244,7 +252,7 @@ try {
       $tail = $text.Substring([Math]::Max(0, $text.Length - $marker.Length + 1))
     }
   } finally { $file.Dispose() }
-  if (-not $found) { throw 'the pinned ompweb release has no recovery support' }
+  if (-not $found) { throw ${powershellQuote(plan.releasePin ? "the pinned ompweb release has no approved release pin support" : "the pinned ompweb release has no recovery support")} }
   $arguments = @(${argumentList})
   & $exe @arguments
   $code = $LASTEXITCODE

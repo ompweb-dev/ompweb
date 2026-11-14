@@ -124,12 +124,49 @@ const encodePowershell = (script: string): string => Buffer.from(script, "utf16l
 async function powershell(script: string, timeout = 60000): Promise<string> {
   const wrapped = `$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'\ntry {\n${script}\n} catch { [Console]::Error.WriteLine([string]$_.Exception.Message); exit 1 }`;
   try {
-    const { stdout } = await exec(powershellBinary(), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodePowershell(wrapped)], { timeout, windowsHide: true, maxBuffer: 16 * MIB, encoding: "utf8" });
+    // pwsh's inherited module paths cannot load Windows PowerShell's built-in Security module.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:PSModulePath|PSHOME)$/i.test(key)));
+    const { stdout } = await exec(powershellBinary(), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodePowershell(wrapped)], { timeout, windowsHide: true, maxBuffer: 16 * MIB, encoding: "utf8", env });
     return stdout;
   } catch (error) { return fail(`PowerShell failed: ${messageOf(error)}`); }
 }
 function parseJson<T>(text: string, what: string): T {
   try { return JSON.parse(text) as T; } catch { return fail(`Unreadable ${what}: ${text.slice(0, 200)}`); }
+}
+
+/** ps loses argv boundaries: accept only an unambiguous, existing script operand, never fragments of its path. */
+function posixArguments(command: string, exe: string): string[] {
+  if (!exe) return [command];
+  if (!(command === exe || command.startsWith(`${exe} `))) {
+    const candidates: string[] = [];
+    for (let end = 1; end <= command.length; end++) {
+      if (end !== command.length && !/\s/.test(command[end])) continue;
+      try { if (realpathSync(command.slice(0, end)) === realpathSync(exe)) candidates.push(command.slice(0, end)); } catch { /* not this executable */ }
+    }
+    if (candidates.length !== 1) return [command];
+    exe = candidates[0];
+  }
+  let rest = command.slice(exe.length).trim();
+  const args = [exe];
+  while (rest.startsWith("-")) {
+    const at = rest.search(/\s/);
+    const flag = at < 0 ? rest : rest.slice(0, at);
+    args.push(flag);
+    rest = at < 0 ? "" : rest.slice(at).trim();
+    if (/^-[a-z]*c[a-z]*$/.test(flag) && SHELL.test(basename(exe))) return [...args, rest];
+  }
+  if (!rest) return args;
+  if (rest.startsWith("/")) {
+    const candidates: string[] = [];
+    for (let end = 1; end <= rest.length; end++) {
+      if (end !== rest.length && !/\s/.test(rest[end])) continue;
+      try { if (statSync(rest.slice(0, end)).isFile()) candidates.push(rest.slice(0, end)); } catch { /* not a path boundary */ }
+    }
+    if (candidates.length !== 1) return args; // ambiguous paths are not ownership evidence
+    const script = candidates[0];
+    return [...args, script, ...rest.slice(script.length).trim().split(/\s+/).filter(Boolean)];
+  }
+  return [...args, ...rest.split(/\s+/)];
 }
 
 async function listProcesses(): Promise<ProcessInfo[]> {
@@ -161,8 +198,10 @@ async function listProcesses(): Promise<ProcessInfo[]> {
   const rows: ProcessInfo[] = [];
   for (const line of commands.stdout.split("\n")) {
     const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
-    // shortcut: arguments with spaces split apart (ps prints one string); only the first few are compared with paths.
-    if (match) rows.push({ pid: Number(match[1]), ppid: Number(match[2]), state: match[3], exe: exes.get(Number(match[1])) ?? "", args: match[4].trim().split(/\s+/).filter(Boolean), cwd: null, created: null });
+    if (match) {
+      const exe = exes.get(Number(match[1])) ?? "";
+      rows.push({ pid: Number(match[1]), ppid: Number(match[2]), state: match[3], exe, args: posixArguments(match[4].trim(), exe), cwd: null, created: null });
+    }
   }
   return rows;
 }
@@ -182,7 +221,7 @@ async function isRunning(pid: number): Promise<boolean> {
 async function waitStopped(pid: number, timeout = STOP_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeout;
   while (await isRunning(pid)) {
-    if (Date.now() > deadline) fail(`Process ${pid} did not stop within ${timeout / 1000} seconds; it was not killed`);
+    if (Date.now() > deadline) throw Object.assign(new Error(`Process ${pid} did not stop within ${timeout / 1000} seconds; it was not killed`), { code: "stop_pending" });
     await pause(100);
   }
 }
@@ -202,6 +241,22 @@ function belongsToInstall(row: ProcessInfo, installDir: string): boolean {
   if (row.exe && inside(installDir, row.exe)) return true;
   const base = row.cwd ?? installDir;
   return row.args.slice(0, 4).some((arg) => !arg.startsWith("-") && inside(installDir, isAbsolute(arg) ? arg : resolve(base, arg)));
+}
+
+/** Running servers in this installation; unknown install-bound commands are never silently dismissed. */
+export async function findUpgradeServerProcesses(installDir: string): Promise<number[]> {
+  const root = realpathSync(installDir);
+  const servers: number[] = [];
+  for (const row of await listProcesses()) {
+    if (row.state === "Z" || !belongsToInstall(row, root) || isHostCommand(row.args)) continue;
+    const args = row.args.slice(1);
+    if (args.some((arg) => ["recover-host", "host-update-worker", "server-update-worker", "preflight", "fetch-omp", "--version", "--help"].includes(arg) || /(?:^|[/\\])(?:host-update-worker|server-update-worker|recover-host)\.[cm]?[jt]s$/.test(arg))) continue;
+    const script = args.some((arg) => inside(root, arg) && [join(root, "bin", "omp-web.js"), join(root, "server", "main.ts")].some((path) => inside(path, arg)));
+    const compiled = [join(root, "ompweb"), join(root, "ompweb.exe")].some((path) => inside(path, row.exe));
+    if (!script && !compiled) fail(`Cannot determine whether process ${row.pid} is a server in ${root}; refusing to assume its supervisor is independent`);
+    servers.push(row.pid);
+  }
+  return servers;
 }
 
 /** `start` and its parents, nearest first; a parent younger than its child is a recycled pid, so the real one is gone. */
@@ -238,7 +293,7 @@ async function waitForInstance(plan: UpgradeProcess, within: (rows: ProcessInfo[
     for (const row of rows) {
       if (!allowed.has(row.pid) || row.state === "Z" || isHostCommand(row.args) !== (plan.role === "host") || !belongsToInstall(row, plan.installDir)) continue;
       const identity = await processStartIdentity(row.pid);
-      if (identity && identity !== plan.identity && identity !== plan.current.identity) found.push({ pid: row.pid, identity });
+      if (identity && (row.pid !== plan.pid || identity !== plan.identity) && (row.pid !== plan.current.pid || identity !== plan.current.identity)) found.push({ pid: row.pid, identity });
     }
     if (found.length === 1) return found[0];
     if (Date.now() > deadline) return { pid: null, identity: null };
@@ -269,7 +324,7 @@ async function systemctl(user: boolean, args: string[], timeout = 15000): Promis
 const EXEC_KEYS = ["ExecStartPre", "ExecStart", "ExecStartPost", "ExecStop", "ExecStopPost"];
 /** A unit's definition and live state. Exec lines keep only path/argv/ignore_errors: their pid and times change with every start. */
 async function systemdUnit(unit: string, user: boolean): Promise<{ props: Record<string, string>; execs: Record<string, string[]>; hash: string }> {
-  const out = await systemctl(user, ["show", `--property=${["FragmentPath", "DropInPaths", "ControlGroup", "MainPID", "ActiveState", "Transient", ...EXEC_KEYS].join(",")}`, unit]);
+  const out = await systemctl(user, ["show", `--property=${["FragmentPath", "DropInPaths", "ControlGroup", "MainPID", "ActiveState", "Transient", "CanStart", "CanStop", ...EXEC_KEYS].join(",")}`, unit]);
   const props: Record<string, string> = {};
   const execs: Record<string, string[]> = {};
   for (const line of out.split("\n")) {
@@ -558,6 +613,130 @@ function assertPlan(plan: UpgradeProcess): void {
   }
 }
 
+// OpenService/AccessCheck inspect this token's effective rights; neither invokes the supervisor.
+const WINDOWS_CONTROL_ACCESS = `using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+public static class UpgradeControlAccess {
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr OpenSCManager(string machine, string database, uint access);
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr OpenService(IntPtr manager, string name, uint access);
+  [DllImport("advapi32.dll")] static extern bool CloseServiceHandle(IntPtr handle);
+  [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateToken(IntPtr token, int level, out IntPtr copy);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+  [StructLayout(LayoutKind.Sequential)] struct Mapping { public uint Read, Write, Execute, All; }
+  [DllImport("advapi32.dll", SetLastError = true)] static extern bool AccessCheck(byte[] descriptor, IntPtr token, uint desired, ref Mapping mapping, IntPtr privileges, ref uint size, out uint granted, out bool allowed);
+  public static void Process(uint pid) {
+    IntPtr process = OpenProcess(1, false, pid);
+    if (process == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+    CloseHandle(process);
+  }
+  public static void Service(string name) {
+    IntPtr manager = OpenSCManager(null, null, 1);
+    if (manager == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      // Stop-Service and WaitForStatus also query status and dependents.
+      IntPtr service = OpenService(manager, name, 0x10 | 0x20 | 0x4 | 0x8);
+      if (service == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+      CloseServiceHandle(service);
+    } finally { CloseServiceHandle(manager); }
+  }
+  public static void Task(string sddl) {
+    var descriptor = new RawSecurityDescriptor(sddl);
+    var bytes = new byte[descriptor.BinaryLength];
+    descriptor.GetBinaryForm(bytes, 0);
+    using (var identity = WindowsIdentity.GetCurrent()) {
+      IntPtr token;
+      if (!DuplicateToken(identity.Token, 2, out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
+      try {
+        var mapping = new Mapping { Read = 0x120089, Write = 0x120116, Execute = 0x1200a0, All = 0x1f01ff };
+        uint size = 0, granted;
+        bool allowed;
+        if (AccessCheck(bytes, token, 0x1200a9, ref mapping, IntPtr.Zero, ref size, out granted, out allowed)) {
+          if (!allowed) throw new UnauthorizedAccessException("Task read/execute access denied");
+          return;
+        }
+        if (Marshal.GetLastWin32Error() != 122 || size == 0 || size > 65536) throw new Win32Exception(Marshal.GetLastWin32Error());
+        IntPtr privileges = Marshal.AllocHGlobal((int)size);
+        try {
+          if (!AccessCheck(bytes, token, 0x1200a9, ref mapping, privileges, ref size, out granted, out allowed)) throw new Win32Exception(Marshal.GetLastWin32Error());
+          if (!allowed) throw new UnauthorizedAccessException("Task read/execute access denied");
+        } finally { Marshal.FreeHGlobal(privileges); }
+      } finally { CloseHandle(token); }
+    }
+  }
+}`;
+
+/** Non-mutating admission proof for stop AND start; permission to launch a detached scope is not sufficient. */
+export async function assertUpgradeProcessControl(plan: UpgradeProcess): Promise<void> {
+  assertPlan(plan);
+  const sup = plan.supervisor;
+  const pid = await runningInstance(plan);
+  switch (sup.kind) {
+    case "foreground":
+      if (pid !== null) {
+        if (process.platform === "win32") await powershell(`Add-Type -TypeDefinition ${psString(WINDOWS_CONTROL_ACCESS)}\n[UpgradeControlAccess]::Process(${pid})`);
+        else process.kill(pid, 0);
+      }
+      return;
+    case "restart-loop":
+      await verifyLoop(sup);
+      process.kill(sup.pid, 0);
+      if (pid !== null) process.kill(pid, 0);
+      return;
+    case "systemd": {
+      const props = await verifySystemd(sup);
+      if (props.CanStart !== "yes" || props.CanStop !== "yes") fail(`${sup.unit} does not support manual stop and start`);
+      if (sup.user) {
+        const uid = process.getuid?.();
+        if (uid === undefined || process.geteuid?.() !== uid || realpathSync(process.env.XDG_RUNTIME_DIR ?? `/run/user/${uid}`) !== `/run/user/${uid}` || (process.env.DBUS_SESSION_BUS_ADDRESS && process.env.DBUS_SESSION_BUS_ADDRESS !== `unix:path=/run/user/${uid}/bus`)) fail("Cannot prove control of this user's systemd manager");
+        if (statSync(`/run/user/${uid}/bus`).uid !== uid) fail("The systemd user bus belongs to another account");
+        return;
+      }
+      if (process.geteuid?.() === 0) return;
+      const stat = readFileSync("/proc/self/stat", "utf8");
+      const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+      const uid = process.getuid?.();
+      if (!/^\d+$/.test(start ?? "") || uid === undefined || process.geteuid?.() !== uid) fail("Cannot identify this process for systemd authorization");
+      for (const verb of ["stop", "start"]) {
+        try {
+          // systemd's manage-units policy uses unit/verb; pkcheck without interaction never prompts.
+          await exec("pkcheck", ["--action-id", "org.freedesktop.systemd1.manage-units", "--process", `${process.pid},${start},${uid}`, "--detail", "unit", sup.unit, "--detail", "verb", verb], { timeout: 10000 });
+        } catch (error) { fail(`Non-interactive ${verb} authorization for ${sup.unit} could not be established: ${messageOf(error)}`); }
+      }
+      return;
+    }
+    case "launchd": {
+      if (process.getuid?.() === undefined || process.getuid?.() !== process.geteuid?.() || sup.domain !== launchdDomain()) fail("Cannot prove control of another launchd domain");
+      assertTrustedFile(sup.plist, "launchd property list");
+      const job = await verifyLaunchd(sup);
+      if (!job.loaded || (pid !== null && job.pid !== pid)) fail("Cannot prove control of the inspected launchd job");
+      await launchctl(["print", sup.domain]);
+      return;
+    }
+    case "windows-service":
+      await verifyWindowsService(sup);
+      await powershell(`Add-Type -TypeDefinition ${psString(WINDOWS_CONTROL_ACCESS)}\n[UpgradeControlAccess]::Service(${psString(sup.name)})`);
+      return;
+    case "windows-task":
+      await verifyWindowsTask(sup);
+      await powershell(`Add-Type -TypeDefinition ${psString(WINDOWS_CONTROL_ACCESS)}
+$scheduler = New-Object -ComObject Schedule.Service; $scheduler.Connect()
+$task = $scheduler.GetFolder(${psString(sup.path)}).GetTask(${psString(sup.name)})
+if (-not $task.Definition.Settings.AllowDemandStart) { throw 'The task does not permit on-demand starts' }
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+$account = [string]$task.Definition.Principal.UserId
+if ($account -match '^S-1-') { $sid = $account } else { $sid = (New-Object Security.Principal.NTAccount($account)).Translate([Security.Principal.SecurityIdentifier]).Value }
+if ($identity.User.Value -ne 'S-1-5-18' -and -not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -and $sid -ne $identity.User.Value) { throw 'Cannot stop a task running under different credentials' }
+[UpgradeControlAccess]::Task($task.GetSecurityDescriptor(7))
+${pid === null ? "" : `[UpgradeControlAccess]::Process(${pid})`}`);
+      return;
+  }
+}
+
 /**
  * Binds `pid` to what is needed to stop and start it again: its start identity, the executable and installation it
  * runs from, and what supervises it. Anything that cannot be controlled safely (unrecognised supervisor, changed
@@ -643,16 +822,23 @@ export async function stopUpgradeProcess(plan: UpgradeProcess): Promise<void> {
       return;
     }
     case "windows-task":
+      if (pid === null) fail("The scheduled task's inspected process is no longer running or cannot identify its current instance; refusing to stop it");
       await verifyWindowsTask(sup);
       await powershell(`Stop-ScheduledTask ${taskTarget(sup)}\n$t = $null\nfor ($i = 0; $i -lt 120; $i++) { $t = Get-ScheduledTask ${taskTarget(sup)}; if ([string]$t.State -ne 'Running') { break }; Start-Sleep -Milliseconds 500 }\nif ([string]$t.State -eq 'Running') { throw 'The scheduled task did not stop' }`, 120000);
       // Stopping the task ends its script, not necessarily the host it started.
       if (pid !== null) { await signalProcess(pid, "SIGTERM"); await waitStopped(pid); }
       return;
-    case "windows-service":
-      await verifyWindowsService(sup);
+    case "windows-service": {
+      const service = await verifyWindowsService(sup);
+      if (pid === null) {
+        if (plan.current.pid !== null && service.state === "Stopped") return;
+        fail("The service's inspected process is no longer running or cannot identify its current instance; refusing to stop it");
+      }
+      if (!descendants(await listProcesses(), service.pid, true).includes(pid)) fail("The service now runs a different process; refusing to stop it");
       await powershell(`$s = Get-Service -Name ${psString(sup.name)}\nif ($s.Status -ne 'Stopped') { Stop-Service -InputObject $s; $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(90)) }`, 120000);
-      if (pid !== null) await waitStopped(pid);
+      await waitStopped(pid);
       return;
+    }
   }
 }
 
@@ -717,9 +903,16 @@ export async function restartUpgradeProcess(plan: UpgradeProcess, launch: Upgrad
     }
     case "windows-task": {
       if ((await verifyWindowsTask(sup)).state === "Running") fail(`Scheduled task ${sup.name} is already running; refusing to start a second instance`);
-      const since = BigInt(Date.now() - 5000) * BigInt(10000) + BigInt("621355968000000000"); // .NET ticks, as in the process list's `created`
+      const before = new Set((await listProcesses()).map((row) => `${row.pid}:${row.created}`));
       await powershell(`Start-ScheduledTask ${taskTarget(sup)}`);
-      instance = await waitForInstance(plan, (rows) => rows.filter((row) => row.created && BigInt(row.created) >= since).map((row) => row.pid), 60000);
+      instance = await waitForInstance(plan, async (rows) => {
+        const target = sup.path + sup.name;
+        // A shared task engine cannot vouch for which task owns a descendant.
+        const engines = parseJson<number[]>(await powershell(`$scheduler = New-Object -ComObject Schedule.Service; $scheduler.Connect()\n$running = @($scheduler.GetRunningTasks(1)); $target = ${psString(target)}\nConvertTo-Json -Compress -InputObject @($running | Where-Object { $_.Path -eq $target } | ForEach-Object { $engine = [int]$_.EnginePID; if ($engine -gt 0 -and -not @($running | Where-Object { $_.Path -ne $target -and [int]$_.EnginePID -eq $engine }).Count) { $engine } })`), "running task engines");
+        const byPid = new Map(rows.map((row) => [row.pid, row]));
+        const roots = rows.filter((row) => !before.has(`${row.pid}:${row.created}`) && row.args.some((arg) => sup.scripts.includes(arg.toLowerCase().replaceAll("\\", "/"))) && ancestry(byPid, row).some((parent) => engines.includes(parent.pid)));
+        return roots.flatMap((row) => descendants(rows, row.pid, false));
+      }, 60000);
       break;
     }
     case "windows-service": {

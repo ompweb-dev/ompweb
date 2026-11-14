@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { createGunzip, inflateRawSync } from "node:zlib";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
-import type { HostUpdateOperation, HostUpdateTarget } from "./update-types";
+import type { ApprovedReleasePin, HostUpdateOperation, HostUpdateTarget } from "./update-types";
 import type { UpgradeLaunch, UpgradeProcess } from "../upgrade-process";
 import type * as ProcessRuntime from "../upgrade-process";
 import type * as IdentityRuntime from "../process-identity";
@@ -52,6 +52,8 @@ export interface HostUpdateDescriptor {
   restartOnly?: boolean;
   /** Binary release source; absent only on a legacy restart-only descriptor, which downloads nothing. */
   releaseRepo?: string;
+  releasePin?: ApprovedReleasePin;
+  requireReleasePin?: boolean;
   /** Explicitly approved to end this host's activity: bypasses only the activity wait, never any release or process check. */
   force?: boolean;
   /** The protocol range the candidate must speak for a maintenance receipt to acknowledge it, while its application protocol may await the server's cutover. */
@@ -139,13 +141,23 @@ export function finishHostUpdate(id: string, error?: string): void {
   }
 }
 
+/** A lifecycle transition remains uncertain: preserve the claim and block work until an operator reconciles it. */
+export function requireHostUpdateRecovery(id: string, error: string): void {
+  const state = readHostUpdateState();
+  if (state?.operation.id !== id) return;
+  writeHostUpdateJson(join(hostUpdateRoot(), "status.json"), {
+    ...state, workerPid: undefined,
+    operation: { ...state.operation, state: "running", committing: true, recoveryRequired: true, error: `Recovery required: ${error}`.slice(0, 1000) },
+  });
+}
+
 async function readHostUpdate(url: string, maxBytes: number, timeout: number, onChunk: (chunk: Uint8Array) => void): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
     const response = await fetch(url, { signal: controller.signal, cache: "no-store", headers: { "User-Agent": "ompweb-host-updater" } });
     if (!response.ok || !response.body) throw new Error(`Release request failed (${response.status})`);
-    if (response.url && (!response.url.startsWith("https://") || !["raw.githubusercontent.com", "api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"].includes(new URL(response.url).hostname))) throw new Error("Unexpected release download destination");
+    if (response.url && (!response.url.startsWith("https://") || !["raw.githubusercontent.com", "api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com", "registry.npmjs.org"].includes(new URL(response.url).hostname))) throw new Error("Unexpected release download destination");
     if (Number(response.headers.get("content-length")) > maxBytes) throw new Error("Release response is too large");
     const reader = response.body.getReader();
     let size = 0;
@@ -304,18 +316,47 @@ export async function extractHostReleaseArchive(archive: string, root: string, s
   }
 }
 
+/** Validate at every process boundary and return one canonical representation for persisted evidence. */
+export function validateApprovedReleasePin(value: unknown, version?: string, repo?: string): ApprovedReleasePin {
+  const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  const invalid = (): never => { throw new Error("Invalid approved release pin"); };
+  if (!record(value) || !["assets,releaseRepo,version", "assets,npm,releaseRepo,version"].includes(Object.keys(value).sort().join(","))
+    || typeof value.version !== "string" || value.version.length > 100 || !HOST_VERSION_PATTERN.test(value.version) || version !== undefined && value.version !== version
+    || typeof value.releaseRepo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(value.releaseRepo) || repo !== undefined && value.releaseRepo !== repo
+    || !record(value.assets) || !Object.keys(value.assets).length || Object.keys(value.assets).length > 10
+    || value.npm !== undefined && (!record(value.npm) || Object.keys(value.npm).sort().join(",") !== "integrity,tarball")) return invalid();
+  const assets: Record<string, string> = {};
+  for (const name of Object.keys(value.assets).sort()) {
+    const digest = value.assets[name];
+    if (!/^ompweb-(?:(?:linux|darwin)-(?:x64|arm64)\.tar\.gz|windows-x64\.zip)$/.test(name) || typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) return invalid();
+    assets[name] = digest;
+  }
+  if (value.npm === undefined) return { version: value.version, releaseRepo: value.releaseRepo, assets };
+  const { tarball, integrity } = value.npm as Record<string, unknown>;
+  if (tarball !== `https://registry.npmjs.org/@kahme247/ompweb/-/ompweb-${value.version}.tgz`
+    || typeof integrity !== "string" || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(integrity)
+    || `sha512-${Buffer.from(integrity.slice(7), "base64").toString("base64")}` !== integrity) return invalid();
+  return { version: value.version, releaseRepo: value.releaseRepo, assets, npm: { tarball: tarball as string, integrity } };
+}
+
 export interface HostReleaseSource {
   version: string;
   /** `owner/repository` of the official GitHub release. */
   releaseRepo: string;
+  releasePin?: ApprovedReleasePin;
+  requireReleasePin?: boolean;
 }
 /** Downloads, digest-verifies and unpacks the official binary release `source` into the owned directory `staging`; returns the staged release directory. */
 export async function stageBinary(source: HostReleaseSource, staging: string): Promise<string> {
+  if (source.requireReleasePin !== undefined && typeof source.requireReleasePin !== "boolean") throw new Error("Invalid approved release pin requirement");
+  if (source.requireReleasePin && !source.releasePin) throw new Error("Missing approved release pin");
+  const pin = source.releasePin === undefined ? undefined : validateApprovedReleasePin(source.releasePin, source.version, source.releaseRepo);
   const name = hostReleaseName();
   const assetName = `${name}${process.platform === "win32" ? ".zip" : ".tar.gz"}`;
   const metadata = JSON.parse((await fetchHostUpdateBytes(`https://api.github.com/repos/${source.releaseRepo}/releases/tags/v${source.version}`, 2 * 1024 * 1024)).toString("utf8")) as { tag_name?: string; assets?: { name: string; digest?: string }[] };
   const asset = metadata.assets?.find((item) => item.name === assetName);
   if (metadata.tag_name !== `v${source.version}` || !asset?.digest || !/^sha256:[a-f0-9]{64}$/.test(asset.digest)) throw new Error("Official release asset digest is unavailable");
+  if (pin && asset.digest !== `sha256:${pin.assets[assetName]}`) throw new Error("Official release metadata differs from the approved digest");
   const download = join(staging, assetName);
   if (await downloadHostUpdateFile(`https://github.com/${source.releaseRepo}/releases/download/v${source.version}/${assetName}`, download, HOST_RELEASE_MAX_ARCHIVE) !== asset.digest) throw new Error("Official release asset digest mismatch or unavailable");
   const release = join(staging, name);
@@ -335,13 +376,27 @@ export interface HostPackageSource {
   installMethod: "npm" | "bun";
   /** The package manager's absolute path; absent, `installMethod` is looked up on PATH. */
   managerPath?: string;
+  releasePin?: ApprovedReleasePin;
+  requireReleasePin?: boolean;
 }
 /** Installs the pinned package `source` with its manager into the owned directory `staging`; returns the staged release directory with its `node_modules` moved inside. */
 export async function stagePackage(d: HostPackageSource, staging: string): Promise<string> {
+  if (d.requireReleasePin !== undefined && typeof d.requireReleasePin !== "boolean") throw new Error("Invalid approved release pin requirement");
+  if (d.requireReleasePin && !d.releasePin) throw new Error("Missing approved release pin");
+  const pin = d.releasePin === undefined ? undefined : validateApprovedReleasePin(d.releasePin, d.version);
+  if (pin && !pin.npm) throw new Error("Approved npm tarball integrity is missing");
   const prefix = join(staging, "fetch");
   mkdirSync(prefix, { mode: 0o700 });
   writeFileSync(join(prefix, "package.json"), '{"private":true}', { mode: 0o600 });
-  const packageName = `@kahme247/ompweb@${d.version}`;
+  let packageName = `@kahme247/ompweb@${d.version}`;
+  if (pin) {
+    packageName = join(staging, "approved-package.tgz");
+    const fd = openSync(packageName, "wx", 0o600);
+    const hash = createHash("sha512");
+    try { await readHostUpdate(pin.npm!.tarball, HOST_RELEASE_MAX_ARCHIVE, DOWNLOAD_TIMEOUT_MS, (chunk) => { writeSync(fd, chunk); hash.update(chunk); }); }
+    finally { closeSync(fd); }
+    if (`sha512-${hash.digest("base64")}` !== pin.npm!.integrity) throw new Error("Approved npm tarball integrity mismatch");
+  }
   const args = d.installMethod === "bun" ? ["add", "--cwd", prefix, "--production", "--exact", "--registry=https://registry.npmjs.org", packageName] : ["install", "--prefix", prefix, "--omit=dev", "--no-audit", "--no-fund", "--registry=https://registry.npmjs.org", packageName];
   const command = d.managerPath || d.installMethod;
   const windows = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
@@ -561,6 +616,14 @@ async function stopDaemon(plan: UpgradeProcess, pid: number, force: boolean, run
     catch (error) { if (!runtime.identity.isProcessAlive(pid)) return; if (!force || attempt >= 5) throw error; }
   }
 }
+
+/** A successful signal may outlast the stop wait. Never launch beside a live or replaced instance. */
+async function reconcilePendingStop(plan: UpgradeProcess, pid: number, runtime: WorkerRuntime): Promise<void> {
+  for (const deadline = Date.now() + 30000; runtime.identity.isProcessAlive(pid); await pause(100)) {
+    if (plan.current.pid !== pid || await runtime.identity.processStartIdentity(pid) !== plan.current.identity) throw new Error("The signalled daemon's process identity could not be reconciled");
+    if (Date.now() >= deadline) throw new Error("The signalled daemon is still stopping; no replacement was started");
+  }
+}
 /** After a stop, nothing may still hold the installation (an orphaned session, a scanner): the swap would fail or tear it. */
 async function waitUnshared(installDir: string): Promise<void> {
   for (const deadline = Date.now() + 15000; ; await pause(500)) {
@@ -598,7 +661,7 @@ function recordPreflight(d: HostUpdateDescriptor): string {
   writeHostUpdateJson(join(hostUpdateRoot(), d.id, "preflight.json"), { id: d.id, version: d.version, nonce });
   return nonce;
 }
-/** Only the recovery CLI's drained old daemon (descriptor.recovery): put it back to work, because nothing was stopped. A static import cannot work: this file is copied alone outside an npm install, which never has that descriptor and has no host-control module beside it; the binary that runs a recovery bundles it. */
+/** Only recovery's drained old daemon: put it back to work when staging fails before anything was stopped. */
 async function resumeDrainedDaemon(): Promise<void> {
   const { requestHostControl } = await import("./host-control");
   await requestHostControl("resume");
@@ -611,9 +674,10 @@ async function resumeDrainedDaemon(): Promise<void> {
  */
 async function launchDaemon(d: HostUpdateDescriptor, plan: UpgradeProcess, runtime: WorkerRuntime, health: string, expected: string, nonce?: string): Promise<number> {
   if (existsSync(health)) { assertOwnedPath(health); rmSync(health); }
-  const deadline = Date.now() + 30000;
+  // Supervisor restart may itself take time; the acknowledgement gets its full window afterwards.
   try {
     const launched = (await runtime.process.restartUpgradeProcess(plan, hostLaunch(d))) ?? plan.current.pid ?? undefined;
+    const deadline = Date.now() + 30000;
     while (Date.now() < deadline) {
       if (existsSync(health)) {
         assertOwnedPath(health);
@@ -623,7 +687,8 @@ async function launchDaemon(d: HostUpdateDescriptor, plan: UpgradeProcess, runti
           : marker.pid !== d.daemonPid && marker.pid !== process.pid && (marker.identity === undefined || marker.identity === await runtime.identity.processStartIdentity(marker.pid));
         if (marker.id === d.id && vouches && runtime.identity.isProcessAlive(marker.pid)) {
           if (marker.version !== expected) throw new Error(`Host acknowledged version ${marker.version}, expected ${expected}`);
-          if (marker.receipt !== undefined && (!d.receipt || !nonce || marker.receipt !== nonce || !(marker.protocol >= d.receipt.min && marker.protocol <= d.receipt.max))) throw new Error("The host's maintenance receipt does not match this operation's release proof and approved protocol range");
+          const requiresReceipt = d.receipt !== undefined && expected === d.version;
+          if ((requiresReceipt || marker.receipt !== undefined) && (!d.receipt || !nonce || marker.receipt !== nonce || !Number.isSafeInteger(marker.protocol) || !(marker.protocol >= d.receipt.min && marker.protocol <= d.receipt.max))) throw new Error("The host's maintenance receipt does not match this operation's release proof and approved protocol range");
           return marker.pid;
         }
       }
@@ -646,6 +711,9 @@ function validateDescriptor(path: string): HostUpdateDescriptor {
   if (d.releaseRepo === undefined ? d.restartOnly !== true : typeof d.releaseRepo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(d.releaseRepo)) throw new Error("Invalid host update descriptor");
   if (d.restartOnly !== undefined && typeof d.restartOnly !== "boolean") throw new Error("Invalid host restart-only descriptor");
   if (d.force !== undefined && typeof d.force !== "boolean") throw new Error("Invalid host update descriptor");
+  if (d.requireReleasePin !== undefined && typeof d.requireReleasePin !== "boolean" || d.requireReleasePin && !d.releasePin) throw new Error("Invalid host update descriptor: missing approved release pin");
+  if (d.releasePin !== undefined) d.releasePin = validateApprovedReleasePin(d.releasePin, d.version, d.releaseRepo);
+  if (d.releasePin && d.restartOnly) throw new Error("An existing installation cannot be adopted as an approved release without artifact evidence");
   if (d.receipt !== undefined && (!d.receipt || !Number.isSafeInteger(d.receipt.min) || !Number.isSafeInteger(d.receipt.max) || d.receipt.min < 1 || d.receipt.max < d.receipt.min)) throw new Error("Invalid host update descriptor: the approved protocol range");
   if (d.recovery !== undefined && (!d.recovery || typeof d.recovery.drained !== "boolean")) throw new Error("Invalid host update descriptor");
   // The daemon's process snapshot, or what an earlier engine recorded instead: an identity, or the service it had verified.
@@ -677,6 +745,9 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
   let swapped = false;
   let staging: string | undefined;
   let stagingCreated = false;
+  let stopPending = false;
+  let recoveryRequired = false;
+  let nonce: string | undefined;
   try {
     d = validateDescriptor(path);
     runtime = await workerRuntime(d);
@@ -691,6 +762,7 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
     // Give the host op response time to reach the web server before any stop.
     await pause(500);
     plan = await daemonProcess(d, runtime);
+    await runtime.process.assertUpgradeProcessControl(plan);
     let release: string | undefined;
     if (!d.restartOnly) {
       // The daemon's own sessions and subagents run the installed runner; stopping the daemon ends them, so they are not sharers. Anything else is.
@@ -701,13 +773,13 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
       stagingCreated = true;
       if (!d.releaseRepo) throw new Error("The host update has no verified release repository");
       release = d.installMethod === "binary"
-        ? await stageBinary({ version: d.version, releaseRepo: d.releaseRepo }, staging)
-        : await stagePackage({ version: d.version, installMethod: d.installMethod, managerPath: d.managerPath }, staging);
+        ? await stageBinary({ version: d.version, releaseRepo: d.releaseRepo, releasePin: d.releasePin, requireReleasePin: d.requireReleasePin }, staging)
+        : await stagePackage({ version: d.version, installMethod: d.installMethod, managerPath: d.managerPath, releasePin: d.releasePin, requireReleasePin: d.requireReleasePin }, staging);
       const sharingAfterStage = await sharedHostInstallReason(d.installDir, [process.pid], [d.daemonPid]);
       if (sharingAfterStage) throw new Error(sharingAfterStage);
     }
     await preflightHostRelease(d, release ?? d.installDir);
-    const nonce = d.receipt ? recordPreflight(d) : undefined;
+    nonce = d.receipt ? recordPreflight(d) : undefined;
     // Normally the daemon blocks new children for the entire persisted running operation; a forced one only from its commit.
     if (readHostUpdateState()?.operation.id !== d.id || readHostUpdateState()?.operation.state !== "running") throw new Error("Host update no longer owns the operation");
     validateDescriptor(path);
@@ -716,7 +788,11 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
     // The supervisor stops the daemon (a forced one ends its sessions with it, after the daemon has preserved its resume manifest).
     if (runtime.identity.isProcessAlive(d.daemonPid)) {
       try { await stopDaemon(plan, d.daemonPid, d.force === true, runtime); }
-      catch (error) { stopped = !runtime.identity.isProcessAlive(d.daemonPid); throw error; }
+      catch (error) {
+        stopPending = (error as NodeJS.ErrnoException).code === "stop_pending";
+        stopped = !runtime.identity.isProcessAlive(d.daemonPid);
+        throw error;
+      }
     }
     stopped = true;
     if (release) {
@@ -737,11 +813,23 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
       } catch {}
     }
     let message = error instanceof Error ? error.message : String(error);
-    if (d?.recovery?.drained && !stopped) {
+    if (stopPending && d && plan && runtime && !stopped) {
+      try { await reconcilePendingStop(plan, d.daemonPid, runtime); stopped = true; }
+      catch (reconcileError) {
+        recoveryRequired = true;
+        message += `; ${reconcileError instanceof Error ? reconcileError.message : String(reconcileError)}`;
+      }
+    }
+    if (error instanceof UnsafeHostRestartError) recoveryRequired = true;
+    if (d?.recovery?.drained && !stopped && !stopPending) {
       try { await resumeDrainedDaemon(); }
-      catch (resumeError) { message += `; the old host stays drained and must be resumed with \`ompweb host resume\`: ${resumeError instanceof Error ? resumeError.message : String(resumeError)}`; }
+      catch (resumeError) { recoveryRequired = true; message += `; the old host stays drained and must be resumed with \`ompweb host resume\`: ${resumeError instanceof Error ? resumeError.message : String(resumeError)}`; }
     }
     if (d?.restartOnly && stopped) message += "; existing shared installation retained; the previous loaded runtime cannot be restored without reinstalling";
+    if (d?.restartOnly && stopPending && stopped && plan && runtime) {
+      try { await launchDaemon(d, plan, runtime, join(dirname(path), "health.json"), d.version, nonce); }
+      catch (restartError) { recoveryRequired = true; message += `; existing installation restart failed: ${String(restartError)}`; }
+    }
     if (d && plan && runtime && stopped && !d.restartOnly && !(error instanceof UnsafeHostRestartError)) {
       try {
         if (swapped && backup) {
@@ -750,9 +838,12 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
         }
         await launchDaemon(d, plan, runtime, join(dirname(path), "health.json"), d.fromVersion);
         message += "; previous host release restored";
-      } catch (rollbackError) { message += `; rollback/restart failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`; }
+      } catch (rollbackError) { recoveryRequired = true; message += `; rollback/restart failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`; }
     }
-    if (d) finishHostUpdate(d.id, message);
+    if (d) {
+      if (recoveryRequired) requireHostUpdateRecovery(d.id, message);
+      else finishHostUpdate(d.id, message);
+    }
     return 1;
   } finally {
     // Only this attempt's newly-created staging directory can be removed.

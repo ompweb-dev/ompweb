@@ -18,17 +18,18 @@ import { setTimeout as pause } from "node:timers/promises";
 import { detectInstallMethod } from "../npm-update";
 import { releaseRepo } from "../release-repo";
 import { isUpdateDisabled } from "../update-policy";
-import { inspectUpgradeProcess, type UpgradeProcess } from "../upgrade-process";
+import { assertUpgradeProcessControl, findUpgradeServerProcesses, inspectUpgradeProcess, type UpgradeProcess } from "../upgrade-process";
 import { dialable } from "./daemon-link";
 import { requestHostControl, type HostControlStatus } from "./host-control";
 import { readHostLinks } from "./host-login";
-import type { HostUpdateCompatibility, HostUpdateOperation } from "./update-types";
+import type { ApprovedReleasePin, HostUpdateCompatibility, HostUpdateOperation } from "./update-types";
 import { candidateProtocol, claimHostUpdate, getHostUpdateOperation, HostUpdateError, hostUpdateClaimHolder, launchHostUpdateWorker, releaseHostUpdateClaim, resolvePackageManager } from "./updates";
-import { assertOwnedPath, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostUpdateRoot, installedHostVersionMatches, sharedHostInstallReason, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
+import { assertOwnedPath, finishHostUpdate, HOST_INSTALL_SHARED, HOST_VERSION_PATTERN, hostLaunch, hostUpdateRoot, installedHostVersionMatches, requireHostUpdateRecovery, sharedHostInstallReason, validateApprovedReleasePin, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
 
 /** A legacy bootstrap refuses a helper binary without this literal: an older `ompweb` takes the unknown subcommand for a positional and starts a web server. */
 export const RECOVERY_CLI_MARKER = "ompweb-recovery-cli-v1";
-const USAGE = `${RECOVERY_CLI_MARKER}: ompweb recover-host --operation <uuid> --version <semver> --min-protocol <n> --max-protocol <n> [--force]`;
+export const RECOVERY_PIN_CLI_MARKER = "ompweb-recovery-pin-cli-v1";
+const USAGE = `${RECOVERY_CLI_MARKER} ${RECOVERY_PIN_CLI_MARKER}: ompweb recover-host --operation <uuid> --version <semver> --min-protocol <n> --max-protocol <n> [--force] [--release-pin <base64url>]`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface HostRecoveryInput {
@@ -40,6 +41,8 @@ export interface HostRecoveryInput {
   compatibility: HostUpdateCompatibility;
   /** Explicit approval to end this host's sessions at the worker's commit. Without it the old host must prove itself idle (drain). */
   force: boolean;
+  releasePin?: ApprovedReleasePin;
+  requireReleasePin?: boolean;
 }
 
 /**
@@ -59,12 +62,14 @@ export class HostRecoveryRefusal extends HostUpdateError {
 export interface HostRecoveryDependencies {
   control: typeof requestHostControl;
   inspect: typeof inspectUpgradeProcess;
+  assertControl: typeof assertUpgradeProcessControl;
+  servers: typeof findUpgradeServerProcesses;
   protocol: typeof candidateProtocol;
   shared: typeof sharedHostInstallReason;
   launchWorker: typeof launchHostUpdateWorker;
   repo(): string;
 }
-export const hostRecoveryDependencies: HostRecoveryDependencies = { control: requestHostControl, inspect: inspectUpgradeProcess, protocol: candidateProtocol, shared: sharedHostInstallReason, launchWorker: launchHostUpdateWorker, repo: releaseRepo };
+export const hostRecoveryDependencies: HostRecoveryDependencies = { control: requestHostControl, inspect: inspectUpgradeProcess, assertControl: assertUpgradeProcessControl, servers: findUpgradeServerProcesses, protocol: candidateProtocol, shared: sharedHostInstallReason, launchWorker: launchHostUpdateWorker, repo: releaseRepo };
 
 interface OldHostInstall {
   installMethod: "npm" | "bun" | "binary";
@@ -89,6 +94,7 @@ function startedOperation(input: HostRecoveryInput): HostUpdateOperation | null 
   assertOwnedPath(path);
   const started = JSON.parse(readFileSync(path, "utf8")) as HostUpdateDescriptor;
   if (started.id !== input.operationId || started.version !== input.version || (started.force === true) !== input.force || started.receipt?.min !== input.compatibility.min || started.receipt?.max !== input.compatibility.max) throw new HostRecoveryRefusal("failed", "operation_conflict", "This operation id was already used with different parameters");
+  if (JSON.stringify(started.releasePin) !== JSON.stringify(input.releasePin) || !!started.requireReleasePin !== !!input.requireReleasePin) throw new HostRecoveryRefusal("failed", "operation_conflict", "This operation id already names different approved artifacts");
   const operation = getHostUpdateOperation();
   if (operation?.id !== input.operationId) throw new HostRecoveryRefusal("failed", "operation_superseded", "A later host update replaced this operation's record");
   return operation;
@@ -136,12 +142,22 @@ async function prepare({ version, compatibility }: Pick<HostRecoveryInput, "vers
   if (protocol < compatibility.min || protocol > compatibility.max) throw new HostRecoveryRefusal("failed", "protocol_incompatible", `This release uses daemon protocol ${protocol}, outside the approved ${compatibility.min}–${compatibility.max}`);
   const layout = { installMethod: install.installMethod, installDir: install.installDir, runtime: install.runtime, hostArgs: readHostLinks().some((link) => !dialable(link.url, false)) ? ["--allow-http"] : [], cwd: homedir() };
   let supervised: UpgradeProcess;
-  try { supervised = await deps.inspect({ pid: status.pid, installDir: install.installDir, role: "host", launch: hostLaunch(layout) }); }
+  try {
+    supervised = await deps.inspect({ pid: status.pid, installDir: install.installDir, role: "host", launch: hostLaunch(layout) });
+    await deps.assertControl(supervised);
+  }
   catch (error) { throw new HostRecoveryRefusal("blocked", "supervisor_unsupported", error instanceof Error ? error.message : String(error)); }
   if (restartOnly && supervised.supervisor.kind !== "foreground") {
-    // Stopping a shared unit, loop or service would end the web server too: a server restart disguised as a host restart. When this process is the web server and answers to the very same supervisor, refuse; a caller that is no server (the recovery CLI) throws here and has nothing to compare.
-    const server = await deps.inspect({ pid: process.pid, installDir: install.installDir, role: "server", launch: { command: process.execPath, args: [], cwd: homedir() } }).catch(() => null);
-    if (server && JSON.stringify(server.supervisor) === JSON.stringify(supervised.supervisor)) throw new HostRecoveryRefusal("blocked", "supervisor_shared", "The host is supervised by the same service as the web server; restarting it would restart the server too");
+    // Recovery can run from a helper outside the install; inspect the actual web processes, not this caller.
+    try {
+      for (const pid of await deps.servers(install.installDir)) {
+        const server = await deps.inspect({ pid, installDir: install.installDir, role: "server", launch: { command: install.runtime, args: [], cwd: homedir() } });
+        if (JSON.stringify(server.supervisor) === JSON.stringify(supervised.supervisor)) throw new HostRecoveryRefusal("blocked", "supervisor_shared", "The host is supervised by the same service as the web server; restarting it would restart the server too");
+      }
+    } catch (error) {
+      if (error instanceof HostRecoveryRefusal) throw error;
+      throw new HostRecoveryRefusal("blocked", "supervisor_unsupported", error instanceof Error ? error.message : String(error));
+    }
   }
   let managerPath: string | undefined;
   try { managerPath = install.installMethod === "binary" || restartOnly ? undefined : resolvePackageManager(install.installMethod); }
@@ -171,9 +187,12 @@ export async function startHostRecovery(input: HostRecoveryInput, deps: HostReco
   const { operationId, version, compatibility, force } = input;
   if (!UUID.test(operationId)) throw new HostRecoveryRefusal("failed", "invalid_request", "operationId must be a UUID", false, 400);
   validateRequest(input);
+  if (input.requireReleasePin !== undefined && typeof input.requireReleasePin !== "boolean" || input.requireReleasePin && !input.releasePin) throw new HostRecoveryRefusal("failed", "invalid_request", "Missing approved release pin");
+  if (input.releasePin) input.releasePin = validateApprovedReleasePin(input.releasePin, input.version, deps.repo());
   const replayed = startedOperation(input);
   if (replayed) return { accepted: true, operation: replayed };
   const { status, install, layout, supervised, restartOnly, managerPath } = await prepare(input, deps, true);
+  if (input.releasePin && restartOnly) throw new HostRecoveryRefusal("blocked", "artifact_unverified", "An existing installation cannot be adopted as an approved release without artifact evidence");
 
   let root: string;
   try { root = claimHostUpdate(operationId, install.installDir); }
@@ -183,13 +202,23 @@ export async function startHostRecovery(input: HostRecoveryInput, deps: HostReco
     throw error instanceof HostUpdateError ? new HostRecoveryRefusal("failed", error.code, error.message) : error;
   }
   let drained = false;
+  let drainPending = false;
   let recorded = false;
   try {
     if (!force) {
       // Drain is the old host's own proof that nothing runs: it refuses while sessions, uploads or operations do.
-      try { await deps.control("drain"); drained = true; }
+      try {
+        drainPending = true;
+        const reply = await deps.control("drain");
+        if (reply.pid !== status.pid || !reply.drained || oldHostInstall(reply).installDir !== install.installDir) throw new Error("The drain was not acknowledged by the inspected daemon");
+        const inspected = await deps.inspect({ pid: reply.pid, installDir: install.installDir, role: "host", launch: hostLaunch(layout) });
+        if (inspected.pid !== supervised.pid || inspected.identity !== supervised.identity) throw new Error("The drained daemon's process identity changed");
+        drained = true;
+        drainPending = false;
+      }
       catch (error) {
         const busy = error instanceof Error && "code" in error && error.code === "host_busy";
+        if (busy) drainPending = false;
         throw new HostRecoveryRefusal("blocked", busy ? "host_busy" : "drain_failed", error instanceof Error ? error.message : String(error), busy);
       }
     }
@@ -197,14 +226,32 @@ export async function startHostRecovery(input: HostRecoveryInput, deps: HostReco
     writeHostUpdateJson(join(root, "status.json"), { operation, startedAt: Date.now(), daemonPid: status.pid });
     recorded = true;
     const descriptor: HostUpdateDescriptor = { id: operationId, target: "ompweb", version, fromVersion: status.version, ...layout, daemonPid: status.pid, process: supervised, managerPath, releaseRepo: deps.repo(), restartOnly: restartOnly || undefined, force: force || undefined, receipt: compatibility, recovery: { drained } };
+    descriptor.releasePin = input.releasePin;
+    descriptor.requireReleasePin = input.requireReleasePin;
     await deps.launchWorker(root, descriptor, typeof Bun !== "undefined" && Bun.isStandaloneExecutable ? "compiled" : "script");
     return { accepted: true, operation };
   } catch (error) {
-    // Nothing was stopped: the old host goes back to work, and the claim ends with the failure.
-    if (drained) await deps.control("resume").catch(() => undefined);
-    if (recorded) finishHostUpdate(operationId, error instanceof Error ? error.message : String(error));
+    let detail = error instanceof Error ? error.message : String(error);
+    if (drained || drainPending) {
+      try {
+        const current = await deps.control("status");
+        if (current.pid !== status.pid || oldHostInstall(current).installDir !== install.installDir) throw new Error("The drained daemon's installation or pid could not be reconciled");
+        const inspected = await deps.inspect({ pid: current.pid, installDir: install.installDir, role: "host", launch: hostLaunch(layout) });
+        if (inspected.pid !== supervised.pid || inspected.identity !== supervised.identity) throw new Error("The drained daemon's process identity could not be reconciled");
+        if (current.drained) {
+          const resumed = await deps.control("resume");
+          if (resumed.pid !== status.pid || resumed.drained) throw new Error("The owned daemon did not confirm that its drain was released");
+        }
+      } catch (cleanupError) {
+        detail += `; maintenance state could not be released: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+        if (!recorded) writeHostUpdateJson(join(root, "status.json"), { operation: { id: operationId, target: "ompweb", version, state: "running", ...(force ? { force: true as const } : {}) }, startedAt: Date.now(), daemonPid: status.pid });
+        requireHostUpdateRecovery(operationId, detail);
+        throw new HostRecoveryRefusal("failed", "recovery_required", `Recovery required: ${detail}`, false, 500);
+      }
+    }
+    if (recorded) finishHostUpdate(operationId, detail);
     else releaseHostUpdateClaim(root, operationId);
-    throw error instanceof HostRecoveryRefusal ? error : new HostRecoveryRefusal("failed", "recovery_failed", error instanceof Error ? error.message : String(error), false, 500);
+    throw error instanceof HostRecoveryRefusal ? error : new HostRecoveryRefusal("failed", "recovery_failed", detail, false, 500);
   }
 }
 
@@ -234,7 +281,7 @@ export function parseHostRecoveryArgs(argv: string[]): HostRecoveryInput {
     if (flag === "--force") {
       if (force) throw new Error("--force given twice");
       force = true;
-    } else if (["--operation", "--version", "--min-protocol", "--max-protocol"].includes(flag)) {
+    } else if (["--operation", "--version", "--min-protocol", "--max-protocol", "--release-pin"].includes(flag)) {
       const value = argv[++index];
       if (value === undefined || value.startsWith("--")) throw new Error(`${flag} needs a value`);
       if (values.has(flag)) throw new Error(`${flag} given twice`);
@@ -249,7 +296,10 @@ export function parseHostRecoveryArgs(argv: string[]): HostRecoveryInput {
   if (!UUID.test(operation)) throw new Error("--operation must be a UUID");
   if (version.length > 100 || !HOST_VERSION_PATTERN.test(version)) throw new Error("--version must be a release version");
   if (!/^[1-9]\d{0,8}$/.test(min) || !/^[1-9]\d{0,8}$/.test(max) || Number(max) < Number(min)) throw new Error("--min-protocol and --max-protocol must be positive integers, max not below min");
-  return { operationId: operation.toLowerCase(), version, compatibility: { min: Number(min), max: Number(max) }, force };
+  const encoded = values.get("--release-pin");
+  if (encoded !== undefined && (encoded.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(encoded) || Buffer.from(encoded, "base64url").toString("base64url") !== encoded)) throw new Error("Invalid --release-pin encoding");
+  const releasePin = encoded === undefined ? undefined : validateApprovedReleasePin(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")), version, releaseRepo());
+  return { operationId: operation.toLowerCase(), version, compatibility: { min: Number(min), max: Number(max) }, force, ...(releasePin ? { releasePin, requireReleasePin: true } : {}) };
 }
 
 /** `ompweb recover-host <argv>`: the exit code; one JSON line on stdout says what happened. 0 only once the detached worker was launched (or the host already runs the release). */

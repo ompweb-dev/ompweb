@@ -11,7 +11,7 @@ export function isProcessAlive(pid: number | undefined): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-/** A value that differs between two processes that ever shared a pid (the kernel start time, not the pid): null when unknown or gone. */
+/** Kernel start time for a separately recorded pid; different pids may share it. Keep this persisted format compatible. */
 export async function processStartIdentity(pid: number): Promise<string | null> {
   if (!Number.isSafeInteger(pid) || pid <= 1) return null;
   try {
@@ -26,7 +26,8 @@ export async function processStartIdentity(pid: number): Promise<string | null> 
       return stdout.trim() ? `darwin:${stdout.trim()}` : null;
     }
     if (process.platform === "win32") {
-      const { stdout } = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`], { timeout: 10000, windowsHide: true });
+      const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:PSModulePath|PSHOME)$/i.test(key)));
+      const { stdout } = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`], { timeout: 10000, windowsHide: true, env });
       return /^\d+$/.test(stdout.trim()) ? `win32:${stdout.trim()}` : null;
     }
   } catch {

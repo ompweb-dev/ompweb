@@ -13,13 +13,13 @@ const info = {
 };
 
 /** Render the real host row and record every request it sends. */
-async function renderHost(t, host, ompweb = {}) {
+async function renderHost(t, host, ompweb = {}, operation = null) {
   const requests = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     requests.push({ url: String(url), method: init?.method ?? "GET", body: init?.body });
     if (init?.method === "POST") return Response.json({ accepted: true, operation: { state: "running", target: "ompweb", version: "0.7.1" } });
-    return Response.json({ ...info, ompweb: { ...info.ompweb, ...ompweb } });
+    return Response.json({ ...info, operation, ompweb: { ...info.ompweb, ...ompweb } });
   };
   const container = document.createElement("div");
   document.body.append(container);
@@ -166,4 +166,15 @@ test("a forced update outlives the old 5-minute wait, and giving up later only a
   assert.ok(button(container, "Force update").disabled, "no second Force until status is re-read");
   assert.ok(button(container, "Update").disabled);
   assert.equal(posts(requests).length, 1, "giving up never resubmits");
+});
+
+test("uncertain shutdown recovery shows its durable error instead of polling Updating forever", async (t) => {
+  const operation = { id: "pending-stop", target: "ompweb", version: "0.7.1", state: "running", committing: true, recoveryRequired: true, error: "Recovery required: the daemon's shutdown could not be reconciled" };
+  const { container, requests } = await renderHost(t, modern, blocked, operation);
+  assert.ok(container.querySelector('[role="alert"]').textContent.includes(operation.error));
+  assert.equal(button(container, "Check updates").disabled, false);
+  assert.equal(button(container, "Update").disabled, true);
+  assert.equal(button(container, "Force update"), undefined);
+  assert.equal(container.querySelector('[role="status"]'), null);
+  assert.deepEqual(posts(requests), []);
 });

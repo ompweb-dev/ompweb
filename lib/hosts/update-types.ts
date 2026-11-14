@@ -9,6 +9,14 @@ export interface HostUpdateCompatibility {
   max: number;
 }
 
+/** Immutable official artifacts selected by an operator's coordinated approval. */
+export interface ApprovedReleasePin {
+  version: string;
+  releaseRepo: string;
+  assets: Record<string, string>;
+  npm?: { tarball: string; integrity: string };
+}
+
 /**
  * Why an update cannot start now, for a UI that must not infer permission from English text.
  * `forceable`: only activity (running sessions, uploads, operations); an explicit force ends it.
@@ -29,6 +37,7 @@ export interface HostSoftwareUpdate {
   availableVersion: string | null;
   updateAvailable: boolean;
   canUpdate: boolean;
+  supportsReleasePin?: boolean;
   /** Every blocker, so a UI can tell forceable ones (see HostUpdateBlocker) from final ones. Empty when `canUpdate`. Absent from a daemon that predates force. */
   blockers?: HostUpdateBlocker[];
   /** An available update is blocked only by forceable blockers: an update request with `force` would be accepted, ending this host's sessions. Absent from a daemon that predates force; never infer it. */
@@ -48,6 +57,8 @@ export interface HostUpdateOperation {
   version: string;
   state: "running" | "succeeded" | "failed";
   error?: string;
+  /** A lifecycle mutation could not be reconciled. Keep the claim until manual recovery; never expire this into an ordinary failure. */
+  recoveryRequired?: true;
   /** The update was explicitly forced past this host's activity: its sessions end at the commit. */
   force?: true;
   /** A forced update's commit has begun: this host accepts no new work (sessions, project preparation) any more. */
@@ -66,6 +77,8 @@ export interface HostUpdateRequest {
   targetCompatibility?: HostUpdateCompatibility;
   /** A UUID naming this operation, so a coordinator can correlate retries and health: the attempt, worker descriptor and acknowledgements carry it. Starting an id again returns that operation's state and starts nothing. */
   operationId?: string;
+  releasePin?: ApprovedReleasePin;
+  requireReleasePin?: boolean;
 }
 
 export interface HostUpdateInfo {
