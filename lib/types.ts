@@ -1,5 +1,6 @@
 // Types mirrored from oh-my-pi coding-agent session-entries (v3 format).
 import type { HtmlFormData, RpcAskDialogQuestion, TodoPhase } from "./pi-types";
+import type { MessageOrigin } from "./message-origin";
 
 // omp-web cannot import the Bun-only @oh-my-pi packages, so the on-disk
 // shapes are re-declared here. Legacy pi v1/v2 fields are kept optional.
@@ -78,6 +79,8 @@ export interface UserMessage {
   clientMessageId?: string;
   /** Rendered from a `branch_summary` entry, not a real prompt: omp cannot branch at it. */
   branchSummary?: true;
+  /** Server-authored provenance, stored outside the native message entry and never supplied by browser commands. */
+  origin?: MessageOrigin;
 }
 
 export interface AssistantMessage {
