@@ -2450,6 +2450,10 @@ export function AppShell({ appName }: { appName: string }) {
               className="shell-topbar-metrics"
               style={{
                 flex: "0 1 calc(10ch + 33px)",
+                // Inline-size containment zeroes the content width, so without an
+                // explicit width the right group sizes this box to 0 and the
+                // `topbar-speed` container query hides the pill even with room to spare.
+                width: "calc(10ch + 33px)",
                 minWidth: 0,
                 fontSize: 11,
                 fontFamily: "var(--font-mono)",

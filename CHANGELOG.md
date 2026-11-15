@@ -9,6 +9,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 ### Fixed
 
 - **Restore HTTP LAN and VPN access.** Browser UUID generation now works without secure-context-only `crypto.randomUUID()`, preventing the "Something went wrong" crash when opening the app or creating a session.
+- **Show the generation-speed pill in the top bar again.** Since the header opener was split from the file-panel close control, the pill's box sized to zero width and its narrow-header rule hid it on every screen; it now keeps its width. Phone-width screens still hide it.
 
 ## [v0.7.1] - 2026-11-14
 
