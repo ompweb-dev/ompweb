@@ -167,3 +167,23 @@ test("shows an artifact reader error instead of an empty transcript", async () =
 
   await waitFor(() => assert.match(document.body.textContent, /Subagent transcript exceeds the readable size limit/));
 });
+
+test("shows the error body from an unsuccessful transcript response", async () => {
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("mode=completion")) {
+      return Response.json({ completion: "Finished.", truncated: false });
+    }
+    return Response.json({ error: "Transcript storage is unavailable" }, { status: 500 });
+  };
+
+  const view = render(React.createElement(SubagentTranscriptDialog, {
+    subagent: { id: "StrictRunnerD2Luna", source: "live" },
+    sessionId: "session-1",
+    transcriptVersion: 0,
+    onClose() {},
+  }));
+  await waitFor(() => assert.match(document.body.textContent, /Finished\./));
+  fireEvent.click(view.getByRole("button", { name: "Show transcript" }));
+
+  await waitFor(() => assert.match(document.body.textContent, /Transcript storage is unavailable/));
+});

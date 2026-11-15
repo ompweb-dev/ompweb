@@ -241,7 +241,10 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
   const fetchTranscriptPage = useCallback(async (startByte: number): Promise<SubagentMessagesPage> => {
     if (!sessionId || !subagent?.id) throw new Error("No session");
     const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagent.id)}?fromByte=${startByte}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => null) as { error?: unknown } | null;
+      throw new Error(typeof body?.error === "string" && body.error ? body.error : `HTTP ${res.status}`);
+    }
     const page = await res.json() as SubagentMessagesPage;
     if (typeof page.error === "string") throw new Error(page.error);
     return page;
