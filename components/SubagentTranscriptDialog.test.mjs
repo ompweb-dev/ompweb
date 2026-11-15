@@ -141,3 +141,29 @@ test("loads a live subagent transcript from disk without waiting for its agent c
   assert.match(document.body.textContent, /First transcript message/);
   assert.equal(agentCommands.some((command) => command.type === "get_subagent_messages"), false);
 });
+
+test("shows an artifact reader error instead of an empty transcript", async () => {
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("mode=completion")) {
+      return Response.json({ completion: "Finished.", truncated: false });
+    }
+    return Response.json({
+      sessionFile: "/sessions/StrictRunnerD2Luna.jsonl",
+      fromByte: 0,
+      nextByte: 0,
+      messages: [],
+      error: "Subagent transcript exceeds the readable size limit",
+    });
+  };
+
+  const view = render(React.createElement(SubagentTranscriptDialog, {
+    subagent: { id: "StrictRunnerD2Luna", source: "live" },
+    sessionId: "session-1",
+    transcriptVersion: 0,
+    onClose() {},
+  }));
+  await waitFor(() => assert.match(document.body.textContent, /Finished\./));
+  fireEvent.click(view.getByRole("button", { name: "Show transcript" }));
+
+  await waitFor(() => assert.match(document.body.textContent, /Subagent transcript exceeds the readable size limit/));
+});

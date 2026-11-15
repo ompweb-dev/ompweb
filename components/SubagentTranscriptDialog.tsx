@@ -18,6 +18,7 @@ interface SubagentMessagesPage {
   reset?: boolean;
   messages: AgentMessage[];
   totalBytes?: number;
+  error?: string;
 }
 
 /** Compact, defensive row for one raw transcript message (content may be a
@@ -241,7 +242,9 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     if (!sessionId || !subagent?.id) throw new Error("No session");
     const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagent.id)}?fromByte=${startByte}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json() as SubagentMessagesPage;
+    const page = await res.json() as SubagentMessagesPage;
+    if (typeof page.error === "string") throw new Error(page.error);
+    return page;
   }, [sessionId, subagent?.id]);
 
   const loadTranscriptPage = useCallback(async (startByte: number) => {
