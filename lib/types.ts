@@ -562,6 +562,7 @@ export interface OutboxEntry {
   message: string;
   images?: { type: "image"; data: string; mimeType: string }[];
   uploads?: string[];
+  origin?: MessageOrigin;
   state: "held" | "waiting_host" | "delivering" | "failed" | "delivered";
   error?: string;
   /** A lost reply: omp may have it; never resent by itself. */

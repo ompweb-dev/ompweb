@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS entries (
   done_at INTEGER,
   settlement TEXT,
   replacement_id TEXT,
-  replacement_digest TEXT
+  replacement_digest TEXT,
+  origin TEXT
 );
 CREATE INDEX IF NOT EXISTS entries_session ON entries (session_id, state);
 CREATE TABLE IF NOT EXISTS completed_uploads (id TEXT PRIMARY KEY, owner TEXT NOT NULL, receipt TEXT NOT NULL, at INTEGER NOT NULL);

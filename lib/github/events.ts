@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import type { GithubActor, ItemSnapshot } from "./api";
+import type { GithubActor, ItemKind, ItemSnapshot } from "./api";
+import type { MessageOrigin } from "../message-origin";
+import type { GithubTarget } from "./gh";
 
 /**
  * What a watch has already reported, diffed against each snapshot. Pure: the
@@ -204,6 +206,34 @@ function describe(event: GithubEvent): string {
 /** Header, then one line per event. Only validated metadata comes from GitHub; never check/workflow names, branches, logs or file paths, which a fork writes. */
 export function formatUpdate(targetText: string, url: string, events: GithubEvent[]): string {
   return [`GitHub update (omp-web): ${targetText} ${url}`, ...events.map(describe)].join("\n");
+}
+
+/** Bounded, prose-free provenance for one persisted update batch. */
+export function githubMessageOrigin(
+  target: GithubTarget,
+  kind: ItemKind,
+  url: string,
+  events: GithubEvent[],
+  sentAt: string,
+): MessageOrigin {
+  return {
+    v: 1,
+    kind: "github",
+    sentAt,
+    github: {
+      repo: `${target.owner}/${target.repo}`,
+      number: target.number,
+      target: kind === "workflow_run" ? "run" : kind === "pull_request" ? "pr" : "issue",
+      url,
+      events: events.slice(0, 20).map((event) => ({
+        kind: event.kind,
+        ...("author" in event ? { author: event.author.login, bot: event.author.bot } : {}),
+        ...(event.kind === "review" ? { state: event.state }
+          : event.kind === "workflow_run" ? { state: event.conclusion ?? event.status }
+          : event.kind === "closed" && event.reason ? { state: event.reason } : {}),
+      })),
+    },
+  };
 }
 
 const jsonStringContentBytes = (value: string): number => Buffer.byteLength(JSON.stringify(value)) - 2;

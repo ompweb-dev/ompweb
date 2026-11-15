@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { MAX_AGENT_COMMAND_REQUEST_BYTES } from "../image-attachments";
+import { ORIGIN_MAX_BYTES, type MessageOrigin } from "../message-origin";
 import { readAgentToolsEnabledFromDisk } from "../web-settings";
 import { fetchSnapshot } from "./api";
-import { diffSnapshot, formatUpdate, splitUpdateEvents, updateEntryId } from "./events";
+import { diffSnapshot, formatUpdate, githubMessageOrigin, splitUpdateEvents, updateEntryId } from "./events";
 import { checkGh, defaultGhRunner, formatTarget, GhUnavailableError, parseGithubTarget, type GhRunner } from "./gh";
 import { advanceCursor, advancePendingBatch, claimPending, closeWatchStore, commitUpdate, getPending, isPosting, listWatches, pendingBatchEntryIds, postedIds, removeSessionWatches, renameSession, type PendingUpdate, type Watch } from "./watch-store";
 
@@ -18,7 +19,7 @@ export type Delivery = "ok" | "gone" | "retry" | { rejected: string };
 
 export interface WatcherDeps {
   run?: GhRunner;
-  deliver?: (sessionId: string, entryId: string, message: string) => Promise<Delivery>;
+  deliver?: (sessionId: string, entryId: string, message: string, origin?: MessageOrigin) => Promise<Delivery>;
   now?: () => number;
   /** Runs `fn` after `ms`; the returned function cancels it. */
   schedule?: (fn: () => void, ms: number) => () => void;
@@ -67,11 +68,11 @@ declare global {
   var __ompGithubWatcher: WatcherState | undefined;
 }
 
-async function defaultDeliver(sessionId: string, id: string, message: string): Promise<Delivery> {
+async function defaultDeliver(sessionId: string, id: string, message: string, origin?: MessageOrigin): Promise<Delivery> {
   try {
     // Lazy: message-outbox pulls in rpc-manager, which will load the agent tools that load this module.
     const { runOutboxCommand, outboxScope, GITHUB_WATCH_OUTBOX_OWNER } = await import("../message-outbox");
-    return await deliveryOf(await runOutboxCommand(sessionId, { type: "outbox_add", id, scope: outboxScope(), mode: "prompt", message }, false, GITHUB_WATCH_OUTBOX_OWNER));
+    return await deliveryOf(await runOutboxCommand(sessionId, { type: "outbox_add", id, scope: outboxScope(), mode: "prompt", message }, false, GITHUB_WATCH_OUTBOX_OWNER, origin));
   } catch {
     return "retry";
   }
@@ -126,7 +127,7 @@ async function deliverPending(state: WatcherState, watch: Watch, pending: Pendin
     const { pinOutboxReceipt } = await outboxReceipts();
     pinOutboxReceipt(sessionId, batch.entryId);
     if (state.stopped || !readAgentToolsEnabledFromDisk()) return;
-    const outcome = await state.deps.deliver(sessionId, batch.entryId, batch.message);
+    const outcome = await state.deps.deliver(sessionId, batch.entryId, batch.message, batch.origin);
     if (state.stopped) return;
     if (outcome === "gone") {
       if (readAgentToolsEnabledFromDisk()) removeSessionWatches(sessionId, { itemKey, registrationId, entryId: pending.entryId });
@@ -219,18 +220,21 @@ async function pollItem(state: WatcherState, itemKey: string): Promise<void> {
       const { events, cursor } = diff;
       let batches: PendingUpdate["batches"];
       try {
-        batches = splitUpdateEvents(targetText, snapshot.url, events, MAX_UPDATE_MESSAGE_CONTENT_BYTES).map((batchEvents, index) => {
+        const sentAt = new Date(state.deps.now()).toISOString();
+        batches = splitUpdateEvents(targetText, snapshot.url, events, MAX_UPDATE_MESSAGE_CONTENT_BYTES - ORIGIN_MAX_BYTES).map((batchEvents, index) => {
           const entryId = updateEntryId(`${watch.sessionId}\0${itemKey}\0${watch.registrationId}\0batch:${index}`, batchEvents);
           const message = formatUpdate(targetText, snapshot.url, batchEvents);
+          const origin = githubMessageOrigin(target, watch.kind, snapshot.url, batchEvents, sentAt);
           const bytes = Buffer.byteLength(JSON.stringify({
             type: "outbox_add",
             id: entryId,
             scope: OUTBOX_SCOPE_PLACEHOLDER,
             mode: "prompt",
             message,
+            origin,
           }));
           if (bytes > MAX_AGENT_COMMAND_REQUEST_BYTES) throw new RangeError("A GitHub update batch exceeds the agent command size limit.");
-          return { entryId, message };
+          return { entryId, message, origin };
         });
       } catch (error) {
         const watchKey = `${watch.sessionId}\0${itemKey}`;

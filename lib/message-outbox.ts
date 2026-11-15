@@ -14,6 +14,7 @@ import { STAGED_MAX_AGE_MS } from "./hosts/uploads";
 import { validateAgentImages, MAX_AGENT_COMMAND_REQUEST_BYTES, MAX_ATTACHED_IMAGE_BYTES, MAX_TOTAL_ATTACHED_IMAGE_BYTES, MAX_ATTACHED_IMAGES, getBase64DecodedByteLength } from "./image-attachments";
 import { listArchivedSessions } from "./omp/archive";
 import { OUTBOX_CHANGE_SCHEMA, OUTBOX_SCHEMA } from "./message-outbox-schema";
+import { parseMessageOrigin, type MessageOrigin } from "./message-origin";
 import { getAgentDir } from "./omp/paths";
 import { getRpcSession, getRpcSessionKeys, nativeWriteStarted, onAskClosed, onSessionMove, tapSessionFrames, type AgentEvent, type AgentSessionWrapper } from "./rpc-manager";
 import { isRecord } from "./type-guards";
@@ -38,7 +39,7 @@ const ENTRY_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const MODES: Record<OutboxMode, true> = { prompt: true, followUp: true, steer: true };
 
 
-const COLUMNS = "id, session_id, mode, message, images, uploads, owner, advisor, state, error, may_have_been_sent, created_at, upload_receipts, previous_entry_ids, source_session_id, settlement, replacement_id, replacement_digest, payload_bytes";
+const COLUMNS = "id, session_id, mode, message, images, uploads, owner, advisor, state, error, may_have_been_sent, created_at, upload_receipts, previous_entry_ids, source_session_id, settlement, replacement_id, replacement_digest, payload_bytes, origin";
 const RECEIPT_PIN_SCHEMA = "CREATE TABLE IF NOT EXISTS github_receipt_pins (session_id TEXT NOT NULL, entry_id TEXT NOT NULL, PRIMARY KEY (entry_id, session_id))";
 
 /** `owner`: the web session whose uploads the entry attaches; `advisor`: the chat's spawn flag at Send. */
@@ -62,6 +63,7 @@ interface Row {
   replacement_id: string | null;
   replacement_digest: string | null;
   payload_bytes: number;
+  origin: string | null;
 }
 type AddResult =
   | { kind: "full" }
@@ -132,7 +134,7 @@ function db(): Database {
       database.exec(OUTBOX_SCHEMA);
       database.exec(RECEIPT_PIN_SCHEMA);
       const columns = database.prepare("PRAGMA table_info(entries)").all() as { name: string }[];
-      for (const [name, type] of [["dispatch_pid", "INTEGER"], ["upload_receipts", "TEXT"], ["payload_bytes", "INTEGER NOT NULL DEFAULT 0"], ["previous_entry_ids", "TEXT"], ["source_session_id", "TEXT"], ["settlement", "TEXT"], ["replacement_id", "TEXT"], ["replacement_digest", "TEXT"]]) {
+      for (const [name, type] of [["dispatch_pid", "INTEGER"], ["upload_receipts", "TEXT"], ["payload_bytes", "INTEGER NOT NULL DEFAULT 0"], ["previous_entry_ids", "TEXT"], ["source_session_id", "TEXT"], ["settlement", "TEXT"], ["replacement_id", "TEXT"], ["replacement_digest", "TEXT"], ["origin", "TEXT"]]) {
         if (!columns.some((column) => column.name === name)) database.exec(`ALTER TABLE entries ADD COLUMN ${name} ${type}`);
       }
       database.exec("CREATE INDEX IF NOT EXISTS entries_source_session ON entries (source_session_id, state)");
@@ -260,7 +262,17 @@ function row(id: string): Row | null {
   return db().prepare(`SELECT ${COLUMNS} FROM entries WHERE id = ?`).get(id) as Row | null;
 }
 
+function storedOrigin(value: string | null): MessageOrigin | undefined {
+  if (!value) return undefined;
+  try {
+    return parseMessageOrigin(JSON.parse(value)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function toEntry(entry: Row): OutboxEntry {
+  const origin = storedOrigin(entry.origin);
   return {
     id: entry.id,
     sessionId: entry.session_id,
@@ -268,6 +280,7 @@ function toEntry(entry: Row): OutboxEntry {
     message: entry.message,
     ...(entry.images ? { images: JSON.parse(entry.images) as OutboxEntry["images"] } : {}),
     ...(entry.uploads ? { uploads: JSON.parse(entry.uploads) as string[] } : {}),
+    ...(origin ? { origin } : {}),
     state: entry.state,
     ...(entry.error ? { error: entry.error } : {}),
     ...(entry.may_have_been_sent ? { mayHaveBeenSent: true } : {}),
@@ -451,7 +464,7 @@ function setState(id: string, state: OutboxEntry["state"], error: string | null 
 /** Delivered, or removed by the user: the id stays (without the message) so a late resend of it (keepalive, Background
  * Sync) is answered instead of added again. */
 function retire(id: string, settlement: "native" | "none" | "uncorrelated", replacementId?: string, replacementDigest?: string): void {
-  db().prepare("UPDATE entries SET state = 'delivered', message = '', images = NULL, uploads = NULL, upload_receipts = NULL, previous_entry_ids = NULL, error = NULL, done_at = ?, settlement = ?, replacement_id = COALESCE(?, replacement_id), replacement_digest = COALESCE(?, replacement_digest) WHERE id = ?").run(Date.now(), settlement, replacementId ?? null, replacementDigest ?? null, id);
+  db().prepare("UPDATE entries SET state = 'delivered', message = '', images = NULL, uploads = NULL, upload_receipts = NULL, origin = NULL, previous_entry_ids = NULL, error = NULL, done_at = ?, settlement = ?, replacement_id = COALESCE(?, replacement_id), replacement_digest = COALESCE(?, replacement_digest) WHERE id = ?").run(Date.now(), settlement, replacementId ?? null, replacementDigest ?? null, id);
 }
 
 const invalid = (error: string) => Response.json({ error, code: "invalid_outbox_entry" }, { status: 400 });
@@ -473,7 +486,10 @@ function confirmedReplacementId(entry: Row, sessionId: string, value: unknown): 
     ? value : undefined;
 }
 /** `outbox_add` / `outbox_remove` for `sessionId`, as runAgentCommand answers them. */
-export async function runOutboxCommand(sessionId: string, command: Record<string, unknown>, advisor: boolean, owner: string): Promise<Response> {
+export async function runOutboxCommand(sessionId: string, command: Record<string, unknown>, advisor: boolean, owner: string, originValue?: MessageOrigin): Promise<Response> {
+  if (command.origin !== undefined) return Response.json({ error: "Message origin is server-owned.", code: "origin_not_allowed" }, { status: 400 });
+  const origin = originValue === undefined ? undefined : parseMessageOrigin(originValue);
+  if (originValue !== undefined && !origin) return invalid("origin is invalid");
   if (command.type === "outbox_scope") return Response.json({ success: true, data: { scope: outboxScope() } });
   const scope = outboxScope();
   if (command.type === "outbox_add" && command.scope !== scope) {
@@ -517,6 +533,7 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
   const imagePayload = Array.isArray(images) && images.length ? JSON.stringify(images) : null;
   const uploadIds = Array.isArray(uploads) ? uploads as string[] : [];
   const uploadPayload = uploadIds.length ? JSON.stringify(uploadIds) : null;
+  const originPayload = origin ? JSON.stringify(origin) : null;
   const digestKey = resolveWebAuthSecret().key;
   const retryDigest = createHmac("sha256", digestKey).update(JSON.stringify([mode, message, imagePayload, uploadPayload])).digest("base64url");
   const resolved = await resolveSessionHostOr404(sessionId);
@@ -534,7 +551,7 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
   const database = db();
   pruneDelivered(database, now - KEEP_DELIVERED_MS);
   const keys = sessionKeys(sessionId);
-  const entryBytes = Buffer.byteLength(JSON.stringify({ id, sessionId, mode, message, images, uploads, state: "waiting_host", createdAt: now })) + 8192;
+  const entryBytes = Buffer.byteLength(JSON.stringify({ id, sessionId, mode, message, images, uploads, origin, state: "waiting_host", createdAt: now })) + 8192;
   let result: AddResult;
   try {
     result = database.transaction((): AddResult => {
@@ -555,7 +572,7 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
         const settledAt = Date.now();
         database.prepare("UPDATE entries SET done_at = ? WHERE id = ? AND replacement_id = ?").run(settledAt, original.id, original.replacement_id);
         // Persist a matching-ID terminal receipt so this browser can replay after a lost acknowledgement.
-        database.prepare(`INSERT INTO entries (${COLUMNS}, done_at) VALUES (?, ?, ?, '', NULL, NULL, ?, ?, 'delivered', NULL, 0, ?, NULL, NULL, ?, 'none', ?, NULL, 0, ?)`)
+        database.prepare(`INSERT INTO entries (${COLUMNS}, done_at) VALUES (?, ?, ?, '', NULL, NULL, ?, ?, 'delivered', NULL, 0, ?, NULL, NULL, ?, 'none', ?, NULL, 0, NULL, ?)`)
           .run(id, original.session_id, original.mode, original.owner, original.advisor, settledAt, original.source_session_id, original.replacement_id, settledAt);
         const entry = row(id);
         if (!entry) throw new Error("The replacement receipt could not be read after commit");
@@ -599,13 +616,13 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
       const global = database.prepare("SELECT COALESCE(SUM(payload_bytes), 0) AS bytes, COUNT(*) AS count FROM entries WHERE state != 'delivered'").get() as { bytes: number; count: number };
       if (global.bytes - replacedBytes + payloadBytes > MAX_GLOBAL_OUTBOX_BYTES
         || global.count - (replaceable ? 1 : 0) >= MAX_GLOBAL_OUTBOX_ENTRIES) return { kind: "full" };
-      database.prepare(`INSERT INTO entries (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', NULL, 0, ?, ?, NULL, ?, NULL, NULL, ?, ?)`).run(
+      database.prepare(`INSERT INTO entries (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', NULL, 0, ?, ?, NULL, ?, NULL, NULL, ?, ?, ?)`).run(
         id, sessionId, mode, message,
         imagePayload,
         uploadPayload,
         entryOwner, advisor ? 1 : 0, now,
         savedUploads,
-        sessionId, retryDigest, payloadBytes,
+        sessionId, retryDigest, payloadBytes, originPayload,
       );
       let retiredRoot = replaceable;
       if (replaceable) retire(replaceable.id, "none", id, retryDigest);
@@ -616,7 +633,7 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
         retiredRoot = original;
       } else if (!original && typeof replaces === "string") {
         // A browser-only root needs the same durable identity even when this copy's acknowledgement is lost.
-        database.prepare(`INSERT INTO entries (${COLUMNS}, done_at) VALUES (?, ?, ?, '', NULL, NULL, ?, ?, 'delivered', NULL, 0, ?, NULL, NULL, ?, 'none', ?, ?, 0, ?)`)
+        database.prepare(`INSERT INTO entries (${COLUMNS}, done_at) VALUES (?, ?, ?, '', NULL, NULL, ?, ?, 'delivered', NULL, 0, ?, NULL, NULL, ?, 'none', ?, ?, 0, NULL, ?)`)
           .run(replaces, sessionId, mode, entryOwner, advisor ? 1 : 0, now, sessionId, id, retryDigest, now);
         retiredRoot = row(replaces);
         if (!retiredRoot) throw new Error("The browser retry mapping could not be read after commit");
@@ -967,10 +984,12 @@ async function deliver(entry: Row): Promise<Outcome> {
   if (uploadReceipts?.some((receipt) => receipt.completedAt !== undefined && Date.now() - receipt.completedAt > STAGED_MAX_AGE_MS)) {
     return fail(current, "The attached files are gone: attach them again", false);
   }
+  const origin = storedOrigin(current.origin);
   const command: Record<string, unknown> = {
     ...commandOf(current, !idle),
     message: current.message,
     ...(correlated ? { clientMessageId: current.id } : {}),
+    ...(origin ? { origin } : {}),
     ...(current.images ? { images: JSON.parse(current.images) as unknown } : {}),
     ...(current.uploads ? { uploads: JSON.parse(current.uploads) as unknown } : {}),
   };

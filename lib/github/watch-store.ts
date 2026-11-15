@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { Database } from "bun:sqlite";
 import { getAgentDir } from "../omp/paths";
+import type { MessageOrigin } from "../message-origin";
 import { isRecord } from "../type-guards";
 import type { ItemKind } from "./api";
 import type { WatchCursor } from "./events";
@@ -30,6 +31,7 @@ export interface Watch {
 export interface PendingBatch {
   entryId: string;
   message: string;
+  origin?: MessageOrigin;
 }
 
 export interface PendingUpdate {
