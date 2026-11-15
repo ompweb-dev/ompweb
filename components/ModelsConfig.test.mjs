@@ -19,9 +19,9 @@ const runtimeModel = {
 
 async function chooseFallback(user, effort) {
   await user.click(await screen.findByRole("combobox", { name: "Select a fallback model" }));
-  await user.click(screen.getByRole("option", { name: "openai-codex/gpt-5.6-sol" }));
+  await user.click(await screen.findByRole("option", { name: "openai-codex/gpt-5.6-sol" }));
   await user.click(screen.getByRole("combobox", { name: "Thinking levels" }));
-  await user.click(screen.getByRole("option", { name: effort }));
+  await user.click(await screen.findByRole("option", { name: effort }));
 }
 
 test("provider glyphs derive from arbitrary runtime provider ids", () => {
