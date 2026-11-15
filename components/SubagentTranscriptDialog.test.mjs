@@ -1,9 +1,26 @@
+import "../tests/setup-dom.mjs";
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { mock } from "bun:test";
 
-const { TaskBlock, CompletionBlock, SubagentDetails } = await import("./SubagentTranscriptDialog.tsx");
+const agentCommands = [];
+mock.module("@/lib/agent-client", () => ({
+  sendAgentCommand: (_sessionId, command) => {
+    agentCommands.push(command);
+    return new Promise(() => {});
+  },
+}));
+const { cleanup, fireEvent, render, waitFor } = await import("@testing-library/react/pure.js");
+const { TaskBlock, CompletionBlock, SubagentDetails, SubagentTranscriptDialog } = await import("./SubagentTranscriptDialog.tsx");
+
+const originalFetch = globalThis.fetch;
+afterEach(() => {
+  cleanup();
+  globalThis.fetch = originalFetch;
+  agentCommands.length = 0;
+});
 
 test("shows the provider-qualified model and reasoning effort split from the resolved model", () => {
   const html = renderToStaticMarkup(React.createElement(SubagentDetails, {
@@ -92,4 +109,35 @@ test("shows an empty state when no completion exists yet", () => {
     truncated: false,
   }));
   assert.match(html, /No output yet/);
+});
+
+test("loads a live subagent transcript from disk without waiting for its agent command", async () => {
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    requests.push(href);
+    if (href.includes("mode=completion")) {
+      return Response.json({ completion: "Finished.", truncated: false });
+    }
+    return Response.json({
+      sessionFile: "/sessions/StrictRunnerD2Luna.jsonl",
+      fromByte: 0,
+      nextByte: 42,
+      totalBytes: 42,
+      messages: [{ role: "user", content: "First transcript message" }],
+    });
+  };
+
+  const view = render(React.createElement(SubagentTranscriptDialog, {
+    subagent: { id: "StrictRunnerD2Luna", source: "live" },
+    sessionId: "session-1",
+    transcriptVersion: 0,
+    onClose() {},
+  }));
+  await waitFor(() => assert.match(document.body.textContent, /Finished\./));
+  fireEvent.click(view.getByRole("button", { name: "Show transcript" }));
+
+  await waitFor(() => assert.ok(requests.some((href) => href.includes("fromByte=0"))));
+  assert.match(document.body.textContent, /First transcript message/);
+  assert.equal(agentCommands.some((command) => command.type === "get_subagent_messages"), false);
 });

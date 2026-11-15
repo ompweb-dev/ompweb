@@ -237,22 +237,12 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     return await res.json() as { completion: string | null; truncated: boolean };
   }, [sessionId, subagent?.id]);
 
-  // Full transcript page (RPC registry first, disk fallback) — mirrors the
-  // get_subagent_messages response shape so both sources are interchangeable.
-  const fetchTranscriptPage = useCallback(async (startByte: number, preferDisk: boolean): Promise<SubagentMessagesPage> => {
+  const fetchTranscriptPage = useCallback(async (startByte: number): Promise<SubagentMessagesPage> => {
     if (!sessionId || !subagent?.id) throw new Error("No session");
-    if (preferDisk) {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagent.id)}?fromByte=${startByte}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json() as SubagentMessagesPage;
-    }
-    return await sendAgentCommand<SubagentMessagesPage>(sessionId, {
-      type: "get_subagent_messages",
-      subagentId: subagent.id,
-      sessionFile: subagent.sessionFile,
-      fromByte: startByte,
-    });
-  }, [sessionId, subagent?.id, subagent?.sessionFile]);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagent.id)}?fromByte=${startByte}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json() as SubagentMessagesPage;
+  }, [sessionId, subagent?.id]);
 
   const loadTranscriptPage = useCallback(async (startByte: number) => {
     if (!sessionId || !subagent?.id) return;
@@ -262,15 +252,7 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     setTranscriptLoading(true);
     setTranscriptError(null);
     try {
-      let page: SubagentMessagesPage;
-      try {
-        page = await fetchTranscriptPage(startByte, fromDisk);
-      } catch (rpcError) {
-        // The RPC registry only knows subagents of the current process; a
-        // live entry whose session restarted falls back to the disk reader.
-        if (fromDisk || !subagent.id) throw rpcError;
-        page = await fetchTranscriptPage(startByte, true);
-      }
+      const page = await fetchTranscriptPage(startByte);
       if (seq !== transcriptRequestSeqRef.current) return;
       if (page.reset) {
         setTranscriptMessages(page.messages);
@@ -286,7 +268,7 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     } finally {
       if (seq === transcriptRequestSeqRef.current) setTranscriptLoading(false);
     }
-  }, [sessionId, subagent?.id, fromDisk, fetchTranscriptPage]);
+  }, [sessionId, subagent?.id, fetchTranscriptPage]);
 
   const load = useCallback(async () => {
     if (!sessionId || !subagent?.id) return;

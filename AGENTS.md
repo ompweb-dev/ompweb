@@ -1557,12 +1557,12 @@ during the wait.
   task toolResults keep `progress[]`/`results[]` snapshots. omp-web recovers
   the roster from disk (`extractSubagentHistory`, result fields win over the
   mid-run snapshot), so past/finished runs show in the composer panel after a
-  reload. The transcript route pages the sibling file byte-wise (mirroring
-  `get_subagent_messages`, which is registry-gated and refuses files it
-  doesn't know). The dialog reads only the final output — `<id>.md` via
-  `?mode=completion` (bounded tail read that also works for transcripts
-  beyond the 16MB paging cap) with a live `get_subagents` snapshot fallback
-  for header enrichment; it never pages the raw transcript. Subagent ids are
+  reload. The host-backed transcript route pages the sibling file byte-wise
+  without waiting for a live process. The dialog reads final output from
+  `<id>.md` via `?mode=completion` (a bounded tail read that also works for
+  transcripts beyond the 16MB paging cap), uses a live `get_subagents`
+  snapshot only for header enrichment, and pages the raw transcript through
+  that route when the user opens it. Subagent ids are
   `[A-Za-z0-9_-]+` segments joined by `.`, because omp names a nested spawn
   `Parent.Child` (`SUBAGENT_ID_RE` in `lib/subagent-types.ts`, which also
   keeps `/`, `\` and `..` out of the joined path). The transcript route caps
