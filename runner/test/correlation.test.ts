@@ -22,6 +22,20 @@ afterEach(async () => {
 
 type Stamped = AgentSessionEvent & { clientMessageId?: string; clientMessageIds?: unknown };
 
+const ORIGIN = {
+	v: 1,
+	kind: "session",
+	sentAt: "2026-11-15T12:41:00.000Z",
+	session: {
+		id: "source-session",
+		name: "Source",
+		hostId: "local",
+		hostLabel: "This machine",
+		tool: "send_to_session",
+		delivery: "prompt",
+	},
+} as const;
+
 // The scripted model's `delayMs` keeps the first run streaming while input is queued behind it.
 async function correlated(responses: { content: string[]; delayMs?: number }[]) {
 	process.env.OMPWEB_HOST_SOCKET = path.join(os.tmpdir(), `ompweb-correlation-test-${process.pid}.sock`);
@@ -45,7 +59,7 @@ const userEnds = (events: Stamped[]) =>
 describe("client message correlation", () => {
 	it("stamps an idle prompt, journals its entry, reports it persisted and rejects reuse", async () => {
 		const { session, events } = await correlated([{ content: ["first"] }, { content: ["second"] }]);
-		const claim = claimClientMessage(session, "intent-1");
+		const claim = claimClientMessage(session, "intent-1", ORIGIN);
 		await submitCorrelated(claim, undefined, hooks => session.prompt("same text", hooks), true);
 		await session.prompt("same text");
 
@@ -53,10 +67,12 @@ describe("client message correlation", () => {
 		expect(ends.map(end => end.id)).toEqual(["intent-1", undefined]);
 		const start = events.find(event => event.type === "message_start" && event.message.role === "user");
 		expect(start?.clientMessageId).toBe("intent-1");
+		expect((start?.message as Record<string, unknown>)?.origin).toEqual(ORIGIN);
 
 		const status = await getClientMessageStatus(session, ["intent-1", "unknown"]);
 		expect(status.persistedClientMessageIds).toEqual(["intent-1"]);
 		expect(status.messages.map(item => item.clientMessageId)).toEqual(["intent-1"]);
+		expect((status.messages[0]?.message as Record<string, unknown>)?.origin).toEqual(ORIGIN);
 		expect(status.unresolvedClientMessageIds).toEqual(["unknown"]);
 
 		const entries = session.sessionManager.getEntries();
@@ -64,9 +80,12 @@ describe("client message correlation", () => {
 		const data = link?.type === "custom" && isRecord(link.data) ? link.data : undefined;
 		const target = entries.find(entry => entry.id === data?.entryId);
 		expect(data?.clientMessageId).toBe("intent-1");
-		expect(target?.type === "message" && target.message === ends[0]?.message).toBe(true);
+		expect(data?.origin).toEqual(ORIGIN);
+		expect(target?.type === "message" && target.message.role === "user").toBe(true);
+		expect(target?.type === "message" && "origin" in target.message).toBe(false);
 		// The model never sees the ID.
 		expect(JSON.stringify(session.messages)).not.toContain("intent-1");
+		expect(JSON.stringify(session.messages)).not.toContain('"origin"');
 
 		expect(() => claimClientMessage(session, "intent-1")).toThrow("already submitted");
 		expect(() => claimClientMessage(session, "")).toThrow("nonempty");
@@ -76,13 +95,18 @@ describe("client message correlation", () => {
 		const { session, events, started } = await correlated([{ content: ["busy"], delayMs: 200 }, { content: ["after"] }]);
 		const run = session.prompt("start");
 		await started;
-		const claim = claimClientMessage(session, "queued-1");
+		const claim = claimClientMessage(session, "queued-1", ORIGIN);
 		await submitCorrelated(claim, undefined, hooks => session.followUp("later", undefined, hooks));
 
 		const updates = events.filter(event => event.type === "queue_update");
-		expect(updates.at(-1)).toMatchObject({ followUp: ["later"], clientMessageIds: { steering: [], followUp: ["queued-1"] } });
+		expect(updates.at(-1)).toMatchObject({
+			followUp: ["later"],
+			clientMessageIds: { steering: [], followUp: ["queued-1"] },
+			messageOrigins: { steering: [], followUp: [ORIGIN] },
+		});
 		const status = await getClientMessageStatus(session, ["queued-1"]);
 		expect(status.queuedMessages.clientMessageIds?.followUp).toEqual(["queued-1"]);
+		expect(status.queuedMessages.messageOrigins?.followUp).toEqual([ORIGIN]);
 		expect(status.unresolvedClientMessageIds).toEqual([]);
 
 		await run;
@@ -114,5 +138,13 @@ describe("client message correlation", () => {
 		expect(status.resolvedClientMessageIds).toEqual(["consumed"]);
 		expect(status.unresolvedClientMessageIds).toEqual(["cancelled"]);
 		expect(claimClientMessage(session, "cancelled")?.id).toBe("cancelled");
+	});
+
+	it("requires a valid bounded origin to have a client message ID", async () => {
+		const { session } = await correlated([]);
+		expect(() => claimClientMessage(session, undefined, ORIGIN)).toThrow("origin requires clientMessageId");
+		expect(() => claimClientMessage(session, "oversized", {
+			v: 1, kind: "future", sentAt: ORIGIN.sentAt, padding: "x".repeat(4096),
+		})).toThrow("origin is invalid or larger than 4096 bytes");
 	});
 });

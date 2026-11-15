@@ -157,7 +157,7 @@ function readInput(ctx: CommandContext, op: UserInput["op"], args: Record<string
 		throw new Error(`${op}: streamingBehavior must be "steer" or "followUp"`);
 	}
 	// Throws on a malformed or reused id, before the input takes a slot.
-	const claim = claimClientMessage(ctx.session, args.clientMessageId);
+	const claim = claimClientMessage(ctx.session, args.clientMessageId, args.origin);
 	const state = prompting(ctx);
 	const sequence = state.accept();
 	// abort_and_prompt is itself an abort: it voids input accepted before it.

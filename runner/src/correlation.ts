@@ -36,15 +36,22 @@ export const CLIENT_MESSAGE_ENTRY_CUSTOM_TYPE = "client-message-entry";
 export const CLIENT_MESSAGE_RESOLUTION_CUSTOM_TYPE = "client-message-resolution";
 /** The branch's v1 frame budget: native messages past it are omitted whole, and ompweb falls back to history. */
 const STATUS_MAX_BYTES = 1024 * 1024;
+const ORIGIN_MAX_BYTES = 4096;
+type MessageOrigin = Record<string, unknown>;
 
 export interface QueuedClientMessageIds {
 	steering: (string | null)[];
 	followUp: (string | null)[];
 }
 
+export interface QueuedMessageOrigins {
+	steering: (MessageOrigin | null)[];
+	followUp: (MessageOrigin | null)[];
+}
+
 export interface ClientMessageStatus {
 	messages: { clientMessageId: string; message: AgentMessage }[];
-	queuedMessages: { steering: string[]; followUp: string[]; liveSteered: number; clientMessageIds?: QueuedClientMessageIds };
+	queuedMessages: { steering: string[]; followUp: string[]; liveSteered: number; clientMessageIds?: QueuedClientMessageIds; messageOrigins?: QueuedMessageOrigins };
 	resolvedClientMessageIds: string[];
 	persistedClientMessageIds: string[];
 	unresolvedClientMessageIds: string[];
@@ -64,12 +71,14 @@ export function isClientMessageId(value: unknown): value is string {
 export class ClientMessageClaim {
 	readonly id: string;
 	readonly #owner: Correlation;
+	readonly origin: MessageOrigin | undefined;
 	admitted = false;
 	message: AgentMessage | undefined;
 
-	constructor(id: string, owner: Correlation) {
+	constructor(id: string, owner: Correlation, origin?: MessageOrigin) {
 		this.id = id;
 		this.#owner = owner;
+		this.origin = origin;
 	}
 
 	hooks(onPromptAdmitted?: () => void): Required<SubmitHooks> {
@@ -101,6 +110,7 @@ class Correlation {
 	readonly #session: AgentSession;
 	readonly ids = new WeakMap<AgentMessage, string>();
 	readonly #claims = new Map<string, ClientMessageClaim>();
+	readonly origins = new WeakMap<AgentMessage, MessageOrigin>();
 	readonly queueListeners = new Set<(event: AgentSessionEvent) => void>();
 	#armed: ClientMessageClaim | undefined;
 	#writes: Promise<void> = Promise.resolve();
@@ -119,11 +129,11 @@ class Correlation {
 		});
 	}
 
-	claim(id: string): ClientMessageClaim {
+	claim(id: string, origin?: MessageOrigin): ClientMessageClaim {
 		const journal = journalIds(this.#session);
 		if (this.#claims.has(id) || journal.submitted.has(id)) throw new Error(`clientMessageId already submitted: ${id}`);
 		if (journal.resolved.has(id)) throw new Error(`clientMessageId already resolved: ${id}`);
-		const claim = new ClientMessageClaim(id, this);
+		const claim = new ClientMessageClaim(id, this, origin);
 		this.#claims.set(id, claim);
 		return claim;
 	}
@@ -138,6 +148,7 @@ class Correlation {
 	map(claim: ClientMessageClaim, message: AgentMessage, queued: boolean): string {
 		claim.message = message;
 		this.ids.set(message, claim.id);
+		if (claim.origin) this.origins.set(message, claim.origin);
 		if (this.#armed === claim) this.#armed = undefined;
 		if (queued && this.queueListeners.size > 0) {
 			const event = queueUpdate(this.#session);
@@ -171,7 +182,11 @@ class Correlation {
 			this.#claims.delete(claim.id);
 			const entryId = persistedEntryId(this.#session, message);
 			if (entryId) {
-				this.#session.sessionManager.appendCustomEntry(CLIENT_MESSAGE_ENTRY_CUSTOM_TYPE, { clientMessageId: claim.id, entryId });
+				this.#session.sessionManager.appendCustomEntry(CLIENT_MESSAGE_ENTRY_CUSTOM_TYPE, {
+					clientMessageId: claim.id,
+					entryId,
+					...(claim.origin ? { origin: claim.origin } : {}),
+				});
 			}
 		});
 	}
@@ -226,7 +241,10 @@ class Correlation {
 		const candidates: ClientMessageStatus["messages"] = [];
 		for (const message of session.messages) {
 			const id = this.ids.get(message);
-			if (id !== undefined && requested.has(id)) candidates.push({ clientMessageId: id, message });
+			if (id !== undefined && requested.has(id)) candidates.push({
+				clientMessageId: id,
+				message: this.withOrigin(message),
+			});
 		}
 		const queue = queueUpdate(session);
 		const queuedMessages: ClientMessageStatus["queuedMessages"] = {
@@ -234,6 +252,7 @@ class Correlation {
 			followUp: queue.followUp,
 			liveSteered: queue.liveSteered,
 			...(queue.clientMessageIds ? { clientMessageIds: queue.clientMessageIds } : {}),
+			...(queue.messageOrigins ? { messageOrigins: queue.messageOrigins } : {}),
 		};
 		const queued = new Set([...(queue.clientMessageIds?.steering ?? []), ...(queue.clientMessageIds?.followUp ?? [])]);
 		const build = (messages: ClientMessageStatus["messages"]): ClientMessageStatus => {
@@ -257,6 +276,11 @@ class Correlation {
 			messages.push(envelope);
 		}
 		return build(messages);
+	}
+
+	withOrigin(message: AgentMessage): AgentMessage {
+		const origin = this.origins.get(message);
+		return origin ? { ...message, origin } as AgentMessage : message;
 	}
 }
 
@@ -318,26 +342,63 @@ export function queuedClientMessageIds(session: AgentSession): QueuedClientMessa
 	return [...ids.steering, ...ids.followUp].some(id => id !== null) ? ids : undefined;
 }
 
+/** Origins aligned with the visible queue slots; null denotes a message without trusted provenance. */
+export function queuedMessageOrigins(session: AgentSession): QueuedMessageOrigins | undefined {
+	const state = states.get(session);
+	if (!state) return undefined;
+	const { agent } = session;
+	const steering = [...agent.peekLiveSteeredMessages(), ...agent.peekSteeringQueue()].filter(isUserAuthoredQueuedMessage);
+	const followUp = agent.peekFollowUpQueue().filter(isUserAuthoredQueuedMessage);
+	const origins = {
+		steering: steering.map(message => state.origins.get(message) ?? null),
+		followUp: followUp.map(message => state.origins.get(message) ?? null),
+	};
+	return [...origins.steering, ...origins.followUp].some(origin => origin !== null) ? origins : undefined;
+}
+
 function queueUpdate(session: AgentSession) {
 	const queue = session.getQueuedMessages();
 	const clientMessageIds = queuedClientMessageIds(session);
+	const messageOrigins = queuedMessageOrigins(session);
 	return {
 		type: "queue_update" as const,
 		steering: [...queue.steering],
 		followUp: [...queue.followUp],
 		liveSteered: queue.liveSteered,
 		...(clientMessageIds ? { clientMessageIds } : {}),
+		...(messageOrigins ? { messageOrigins } : {}),
 	};
+}
+
+function parseOrigin(value: unknown): MessageOrigin | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value) || value.v !== 1 || typeof value.kind !== "string" || !value.kind
+		|| typeof value.sentAt !== "string" || !value.sentAt) {
+		throw new Error(`origin is invalid or larger than ${ORIGIN_MAX_BYTES} bytes`);
+	}
+	try {
+		const serialized = JSON.stringify(value);
+		if (Buffer.byteLength(serialized, "utf8") > ORIGIN_MAX_BYTES) {
+			throw new Error(`origin is invalid or larger than ${ORIGIN_MAX_BYTES} bytes`);
+		}
+		return JSON.parse(serialized) as MessageOrigin;
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("origin is invalid")) throw error;
+		throw new Error(`origin is invalid or larger than ${ORIGIN_MAX_BYTES} bytes`);
+	}
 }
 
 /**
  * Reserve a command's `clientMessageId` when it arrives; undefined when it has none.
- * @throws when the ID is invalid or already submitted, persisted or resolved in this session
+ * @throws when the ID or origin is invalid, or the ID was already submitted, persisted or resolved
  */
-export function claimClientMessage(session: AgentSession, value: unknown): ClientMessageClaim | undefined {
-	if (value === undefined) return undefined;
+export function claimClientMessage(session: AgentSession, value: unknown, originValue?: unknown): ClientMessageClaim | undefined {
+	if (value === undefined) {
+		if (originValue !== undefined) throw new Error("origin requires clientMessageId");
+		return undefined;
+	}
 	if (!isClientMessageId(value)) throw new Error("clientMessageId must be a nonempty string of at most 128 characters");
-	return correlation(session).claim(value);
+	return correlation(session).claim(value, parseOrigin(originValue));
 }
 
 /**
@@ -370,13 +431,18 @@ export function stampClientMessageId(session: AgentSession, event: AgentSessionE
 	if (event.type === "message_start" || event.type === "message_end") {
 		const id = state.idOf(event.message, event.type === "message_start");
 		if (id === undefined) return event;
-		const stamped = { ...event, clientMessageId: id };
+		const stamped = { ...event, clientMessageId: id, message: state.withOrigin(event.message) };
 		return stamped;
 	}
 	if (event.type === "queue_update") {
 		const clientMessageIds = queuedClientMessageIds(session);
-		if (!clientMessageIds) return event;
-		const stamped = { ...event, clientMessageIds };
+		const messageOrigins = queuedMessageOrigins(session);
+		if (!clientMessageIds && !messageOrigins) return event;
+		const stamped = {
+			...event,
+			...(clientMessageIds ? { clientMessageIds } : {}),
+			...(messageOrigins ? { messageOrigins } : {}),
+		};
 		return stamped;
 	}
 	return event;

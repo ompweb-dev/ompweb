@@ -1,4 +1,5 @@
 import type { AgentMessage } from "./types";
+import type { MessageOrigin } from "./message-origin";
 
 // Local mirrors of the omp shapes used by omp-web. omp's SDK packages are
 // Bun-only, so these types are hand-maintained against
@@ -63,6 +64,8 @@ export interface QueuedMessages {
   followUp: string[];
   /** Native intent IDs aligned with the visible queue slots; null denotes an older uncorrelated message. */
   clientMessageIds?: { steering: (string | null)[]; followUp: (string | null)[] };
+  /** Trusted origins aligned with the visible queue slots; null denotes an ordinary message. */
+  messageOrigins?: { steering: (MessageOrigin | null)[]; followUp: (MessageOrigin | null)[] };
 }
 
 export interface ClientMessageStatus {

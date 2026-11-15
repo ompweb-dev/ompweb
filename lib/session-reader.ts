@@ -1,6 +1,7 @@
 import { closeSync, existsSync, fstatSync, openSync, readSync, statSync, type Stats } from "fs";
 import { normalize as normalizePath } from "path";
 import { getAgentDir } from "./omp/paths";
+import { parseMessageOrigin, type MessageOrigin } from "./message-origin";
 import { isClientMessageId } from "./client-message-ids";
 import {
   containsBlobRef,
@@ -564,6 +565,7 @@ interface HistoryEntryRange {
   firstKeptEntryId?: string;
   legacyCustom?: boolean;
   clientMessageId?: string;
+  origin?: MessageOrigin;
 }
 
 interface SessionHistoryIndex {
@@ -623,7 +625,13 @@ function historyEntryMetadata(entry: SessionEntry): SessionEntry {
     compact.data = isRecord(entry.data) ? { phases: entry.data.phases } : undefined;
   } else if (entry.type === "custom" && entry.customType === "client-message-entry") {
     compact.customType = entry.customType;
-    compact.data = isRecord(entry.data) ? { clientMessageId: entry.data.clientMessageId, entryId: entry.data.entryId } : undefined;
+    const data = isRecord(entry.data) ? entry.data : {};
+    const origin = parseMessageOrigin(data.origin);
+    compact.data = {
+      clientMessageId: data.clientMessageId,
+      entryId: data.entryId,
+      ...(origin ? { origin } : {}),
+    };
   } else if (entry.type === "custom" && entry.customType === "client-message-resolution") {
     compact.customType = entry.customType;
     compact.data = { clientMessageIds: isRecord(entry.data) && Array.isArray(entry.data.clientMessageIds)
@@ -645,13 +653,16 @@ function buildHistoryIndex(
   });
   if (loaded.error === "too_large") throw new SessionFileTooLargeError(filePath);
   const { selected, compactionId, entryClientIds, ...metadata } = selectSessionContext(loaded.entries, leafId, { includePreCompaction });
-  const rows = selected.map((entry): HistoryEntryRange => ({
-    id: entry.id,
-    ...ranges.get(entry)!,
-    ...(entry.type === "compaction" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
-    ...(entryClientIds.has(entry.id) ? { clientMessageId: entryClientIds.get(entry.id) } : {}),
-    ...(entry.type === "message" && entry.message.role === "custom" ? { legacyCustom: true } : {}),
-  }));
+  const rows = selected.map((entry): HistoryEntryRange => {
+    const correlation = entryClientIds.get(entry.id);
+    return {
+      id: entry.id,
+      ...ranges.get(entry)!,
+      ...(entry.type === "compaction" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
+      ...(correlation ? { clientMessageId: correlation.clientMessageId, origin: correlation.origin } : {}),
+      ...(entry.type === "message" && entry.message.role === "custom" ? { legacyCustom: true } : {}),
+    };
+  });
   const tipId = loaded.entries.at(-1)?.id ?? null;
   // Detach metadata strings from the parser's JSON source: an ID represented
   // by a sliced V8 string must not pin a multi-megabyte message body.
@@ -747,6 +758,9 @@ export function getSessionHistoryPage(
           if (message.role === "hookMessage") message.role = "custom";
         }
         if (row.clientMessageId) entry.clientMessageId = row.clientMessageId;
+        if (row.origin && entry.type === "message" && isRecord(entry.message) && entry.message.role === "user") {
+          entry.message = { ...entry.message, origin: row.origin };
+        }
         rawEntries.push(entry);
       }
       if (historyFileVersion(fstatSync(fd)) !== version || historyFileVersion(statSync(filePath)) !== version) {
@@ -845,8 +859,12 @@ export function buildSessionContext(
     entryIds: selected.map((entry) => entry.id),
     messages: selected.map((entry) => {
       if (entry.type === "compaction") return compactionUiMessage(entry, entry.id === compactionId);
-      const clientMessageId = entryClientIds.get(entry.id);
-      return entryToUiMessage(clientMessageId ? { ...entry, clientMessageId } as SessionEntry : entry, options)!;
+      const correlation = entryClientIds.get(entry.id);
+      const message = entryToUiMessage(
+        correlation ? { ...entry, clientMessageId: correlation.clientMessageId } as SessionEntry : entry,
+        options,
+      )!;
+      return correlation?.origin && message.role === "user" ? { ...message, origin: correlation.origin } : message;
     }),
   };
 }
@@ -857,7 +875,7 @@ function selectSessionContext(
   leafId?: string | null,
   options: { includePreCompaction?: boolean } = {},
 ) {
-  const empty = { selected: [] as SessionEntry[], compactionId: null as string | null, thinkingLevel: "off", model: null as SessionContext["model"], todoPhases: [] as TodoPhase[], entryClientIds: new Map<string, string>() };
+  const empty = { selected: [] as SessionEntry[], compactionId: null as string | null, thinkingLevel: "off", model: null as SessionContext["model"], todoPhases: [] as TodoPhase[], entryClientIds: new Map<string, { clientMessageId: string; origin?: MessageOrigin }>() };
   const byId = new Map<string, SessionEntry>();
   for (const e of entries) byId.set(e.id, e);
   if (leafId === null) return empty;
@@ -883,20 +901,28 @@ function selectSessionContext(
   const persistedClientMessageIds = new Set<string>();
   const resolvedClientMessageIds = new Set<string>();
   // The journal names its message by id, so only entries on the active path count: an abandoned branch's are never visited.
-  const journaled = new Map<string, string>();
+  const journaled = new Map<string, { clientMessageId: string; origin?: MessageOrigin }>();
   for (const entry of path) {
     if (entry.type === "custom" && entry.customType === "client-message-entry" && isRecord(entry.data)
       && isClientMessageId(entry.data.clientMessageId) && typeof entry.data.entryId === "string") {
-      journaled.set(entry.data.entryId, entry.data.clientMessageId);
+      const origin = parseMessageOrigin(entry.data.origin);
+      journaled.set(entry.data.entryId, {
+        clientMessageId: entry.data.clientMessageId,
+        ...(origin ? { origin } : {}),
+      });
     }
   }
-  const entryClientIds = new Map<string, string>();
+  const entryClientIds = new Map<string, { clientMessageId: string; origin?: MessageOrigin }>();
   for (const entry of path) {
     if (entry.type === "message" || entry.type === "custom_message") {
-      const id = isClientMessageId(entry.clientMessageId) ? entry.clientMessageId : journaled.get(entry.id);
-      if (id) {
-        entryClientIds.set(entry.id, id);
-        persistedClientMessageIds.add(id);
+      const journal = journaled.get(entry.id);
+      const clientMessageId = isClientMessageId(entry.clientMessageId) ? entry.clientMessageId : journal?.clientMessageId;
+      if (clientMessageId) {
+        entryClientIds.set(entry.id, {
+          clientMessageId,
+          ...(journal?.origin ? { origin: journal.origin } : {}),
+        });
+        persistedClientMessageIds.add(clientMessageId);
       }
     } else if (entry.type === "custom" && entry.customType === "client-message-resolution"
       && isRecord(entry.data) && Array.isArray(entry.data.clientMessageIds)) {
