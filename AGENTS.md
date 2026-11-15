@@ -732,6 +732,16 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   (`confirmFromServer`). Local callers never ask for this machine. A remote
   caller asks before any other host unless that host allows agent starts, and
   always before this machine, for `new_session` and `send_to_session` alike.
+- **Message origin.** Messages created by `send_to_session`, a `new_session`
+  first prompt, or the GitHub watcher remain native user messages for model
+  authority, but carry server-authored `origin` metadata. The runner stores it
+  in the existing `client-message-entry` correlation journal; the reader joins
+  it only on the active branch, and the outbox stores it beside held entries.
+  Browser/HTTP commands cannot supply `origin` (`origin_not_allowed`), and
+  readers drop malformed or over-4096-byte metadata. The chat renders trusted
+  origins as left-aligned source cards; matching text without metadata remains
+  an ordinary user bubble. Older runners ignore the optional command field and
+  show the explicit model-facing source header as plain text.
 - **Workspace operations are daemon-owned** (`lib/workspace-types.ts`,
   `lib/hosts/workspace-ops.ts`; design `docs/specs/2026-11-03-remote-workspaces-design.md`).
   Files/index/shell output/watch, Git/worktrees, browsing/default cwd and clone

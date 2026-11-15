@@ -14,6 +14,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 ### Added
 
 - **Race-free GitHub watch registration.** `watch_github` returns the metadata snapshot used as a new watch's baseline, so agents can inspect existing comments, reviews, threads and CI before relying on later watch updates.
+- **Clearly attributed automated messages.** Cross-session agent-tool messages and GitHub watcher updates now render as source-labelled cards instead of looking like messages typed by the user. Attribution is server-authored, survives queues, retries and reloads, and links to the source session or GitHub item.
 
 ## [v0.7.1] - 2026-11-14
 
