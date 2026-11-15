@@ -187,3 +187,31 @@ test("shows the error body from an unsuccessful transcript response", async () =
 
   await waitFor(() => assert.match(document.body.textContent, /Transcript storage is unavailable/));
 });
+
+test("refreshes an open transcript while completion metadata is stalled", async () => {
+  let pageRequests = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("mode=completion")) return new Response(null, { status: 404 });
+    pageRequests += 1;
+    return Response.json({
+      sessionFile: "/sessions/StrictRunnerD2Luna.jsonl",
+      fromByte: pageRequests === 1 ? 0 : 42,
+      nextByte: 42,
+      totalBytes: 42,
+      messages: pageRequests === 1 ? [{ role: "user", content: "First transcript message" }] : [],
+    });
+  };
+  const props = (transcriptVersion) => ({
+    subagent: { id: "StrictRunnerD2Luna", source: "live" },
+    sessionId: "session-1",
+    transcriptVersion,
+    onClose() {},
+  });
+
+  const view = render(React.createElement(SubagentTranscriptDialog, props(0)));
+  fireEvent.click(await view.findByRole("button", { name: "Show transcript" }));
+  await waitFor(() => assert.equal(pageRequests, 1));
+
+  view.rerender(React.createElement(SubagentTranscriptDialog, props(1)));
+  await waitFor(() => assert.equal(pageRequests, 2), { timeout: 2_000 });
+});

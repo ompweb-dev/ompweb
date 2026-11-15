@@ -338,8 +338,8 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
   // version is never dropped: a bump that arrives mid-throttle re-arms the
   // timer, and the already-processed guard prevents same-version loops.
   useEffect(() => {
-    if (!open || !sessionId || transcriptVersion === 0 || loading) return;
-    const completionDone = transcriptVersion === refetchedVersionRef.current && transcriptVersion === latestVersionRef.current;
+    if (!open || !sessionId || transcriptVersion === 0) return;
+    const completionDone = loading || (transcriptVersion === refetchedVersionRef.current && transcriptVersion === latestVersionRef.current);
     const transcriptDone = transcriptVersion === refetchedTranscriptVersionRef.current;
     if (completionDone && transcriptDone) return;
     latestVersionRef.current = transcriptVersion;
@@ -347,7 +347,7 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     versionDebounceTimerRef.current = setTimeout(() => {
       versionDebounceTimerRef.current = null;
       // Completion fetch: consume the version only when actually fired.
-      if (refetchedVersionRef.current !== latestVersionRef.current) {
+      if (!loading && refetchedVersionRef.current !== latestVersionRef.current) {
         refetchedVersionRef.current = latestVersionRef.current;
         void load();
       }
