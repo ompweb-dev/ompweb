@@ -18,6 +18,8 @@ import { useCopyFeedback } from "@/hooks/useCopyFeedback";
 import { formatCompactNumber } from "@/lib/format";
 import { TaskResultPanel } from "./MessageView-task-panel";
 import { HubResultPanel } from "./MessageView-hub-panel";
+import { OriginMessageView } from "./OriginMessageView";
+import { SessionLink } from "./SessionLink";
 import { isMessageOverflowing } from "@/lib/message-overflow";
 import { getResultDiff, PairedDiffResult, PairedResult } from "./MessageView-diff-view";
 import {
@@ -247,7 +249,9 @@ export function areMessageViewPropsEqual(prev: Props, next: Props): boolean {
 
 export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond }: Props) {
   if (message.role === "user") {
-    return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
+    const user = message as UserMessage;
+    if (user.origin) return <OriginMessageView message={user} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
+    return <UserMessageView message={user} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
   }
   if (message.role === "assistant") {
     return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkEditsPrompt={forkEditsPrompt} onFork={onFork} forking={forking} forkDisabled={forkDisabled} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} expandThinkingByDefault={expandThinkingByDefault} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} />;
@@ -565,6 +569,15 @@ export function HeldMessageView({ held, hostLabel, onDelete, onRetry }: {
             maxHeight: USER_BUBBLE_MAX_HEIGHT, overflowY: "auto",
           }}
         >
+          {held.origin?.kind === "session" && held.origin.session ? (
+            <div style={{ marginBottom: 6, color: "var(--text-dim)", fontSize: 11 }}>
+              From <SessionLink session={held.origin.session} />
+            </div>
+          ) : held.origin?.kind === "github" && held.origin.github ? (
+            <div style={{ marginBottom: 6, color: "var(--text-dim)", fontSize: 11 }}>
+              From <a href={held.origin.github.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)" }}>{held.origin.github.repo}#{held.origin.github.number}</a>
+            </div>
+          ) : null}
           {held.images?.length ? (
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: held.message ? 8 : 0 }}>
               {held.images.map((image, i) => (
@@ -1135,6 +1148,26 @@ const ToolCallBlock = memo(function ToolCallBlock({
             .map((b) => b.text)
             .join("\n"))
     : null;
+  const agentToolResult = (block.toolName === "send_to_session" || block.toolName === "new_session") && resultText
+    ? (() => {
+        try {
+          const parsed: unknown = JSON.parse(resultText);
+          return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+        } catch {
+          return null;
+        }
+      })()
+    : null;
+  const agentTargetName = typeof agentToolResult?.targetSessionName === "string"
+    ? agentToolResult.targetSessionName
+    : typeof agentToolResult?.sessionName === "string" ? agentToolResult.sessionName : null;
+  const agentTool = block.toolName === "send_to_session"
+    ? agentTargetName ? `To ${agentTargetName}` : "Send to session"
+    : block.toolName === "new_session" ? agentTargetName ? `Started ${agentTargetName}` : "Start session" : null;
+  const agentPreview = agentTool
+    ? typeof block.input.message === "string" ? block.input.message
+      : typeof block.input.prompt === "string" ? block.input.prompt : ""
+    : null;
   const passiveWrapper = result?.passiveContext ? parseLeadingWrapper(result.passiveContext) : null;
   const passiveContextText = result?.passiveContext ? contextLine(result.passiveContext, passiveWrapper, t) : null;
   const resultImages = result && Array.isArray(result.content)
@@ -1170,6 +1203,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
     : hubJobs
       ? hubJobs.map((job) => job.label).join(" · ")
       : null;
+  const rowPreview = agentPreview ?? hubPreview ?? preview;
 
   const rawFilePath = semantic.isFile && typeof block.input === "object" && block.input && "path" in block.input
     ? String((block.input as Record<string, unknown>).path).trim()
@@ -1201,7 +1235,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
           <span className="activity-tool-icon" aria-hidden>
             <ToolCategoryIcon category={category} size={12} />
           </span>
-          <span className={`activity-row-tool${isError ? " activity-row-tool-error" : ""}`}>{hubTool ?? block.toolName}</span>
+          <span className={`activity-row-tool${isError ? " activity-row-tool-error" : ""}`}>{agentTool ?? hubTool ?? block.toolName}</span>
           <span className="activity-row-preview">
             {agentIds.length > 0 && openAgentLink ? (
               <span
@@ -1218,9 +1252,9 @@ const ToolCallBlock = memo(function ToolCallBlock({
                     openAgentLink(agentIds);
                   }
                 }}
-                title={hubPreview ?? preview}
+                title={rowPreview}
               >
-                {hubPreview ?? preview}
+                {rowPreview}
               </span>
             ) : cleanFilePath && onOpenFile ? (
               <span
@@ -1237,9 +1271,9 @@ const ToolCallBlock = memo(function ToolCallBlock({
                     onOpenFile(cleanFilePath);
                   }
                 }}
-                title={hubPreview ?? preview}
+                title={rowPreview}
               >
-                {hubPreview ?? preview}
+                {rowPreview}
               </span>
             ) : webUrl ? (
               <span
@@ -1258,10 +1292,10 @@ const ToolCallBlock = memo(function ToolCallBlock({
                 }}
                 title={webUrl}
               >
-                {hubPreview ?? preview}
+                {rowPreview}
               </span>
             ) : (
-              hubPreview ?? preview
+              rowPreview
             )}
           </span>
           {duration !== undefined && (

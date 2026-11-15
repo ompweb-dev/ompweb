@@ -1879,8 +1879,16 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   // ── Queued follow-up bar ────────────────────────────────────────────────
   // Texts are mirrored locally; mutations wait for native acknowledgement.
   const queuedEntries = [
-    ...(queuedMessages?.followUp ?? []).map((text) => ({ kind: "follow-up" as const, text })),
-    ...(queuedMessages?.steering ?? []).map((text) => ({ kind: "steer" as const, text })),
+    ...(queuedMessages?.followUp ?? []).map((text, index) => ({
+      kind: "follow-up" as const,
+      text,
+      origin: queuedMessages?.messageOrigins?.followUp[index] ?? null,
+    })),
+    ...(queuedMessages?.steering ?? []).map((text, index) => ({
+      kind: "steer" as const,
+      text,
+      origin: queuedMessages?.messageOrigins?.steering[index] ?? null,
+    })),
   ];
   const firstQueued = queuedEntries[0] ?? null;
   const queuedCount = queuedEntries.length;
@@ -3090,6 +3098,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                           textTransform: "none",
                         }}
                       >
+                        {firstQueued.origin?.kind === "session" && firstQueued.origin.session
+                          ? `[From ${firstQueued.origin.session.name?.trim() || "Untitled session"}] `
+                          : firstQueued.origin?.kind === "github" && firstQueued.origin.github
+                            ? `[${firstQueued.origin.github.repo}#${firstQueued.origin.github.number}] `
+                            : ""}
                         {firstQueued.kind === "steer" ? `[${t("chatInput.queuedSteer")}] ` : ""}{firstQueued.text}
                       </span>
                     )}
@@ -3147,6 +3160,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                         }}>
                           {entry.kind === "steer" ? t("chatInput.queuedSteer") : t("chatInput.queuedFollowUp")}
                         </span>
+                        {entry.origin?.kind === "session" && entry.origin.session ? (
+                          <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>
+                            From {entry.origin.session.name?.trim() || "Untitled session"}
+                          </span>
+                        ) : entry.origin?.kind === "github" && entry.origin.github ? (
+                          <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>
+                            {entry.origin.github.repo}#{entry.origin.github.number}
+                          </span>
+                        ) : null}
                         <span
                           title={entry.text}
                           style={{

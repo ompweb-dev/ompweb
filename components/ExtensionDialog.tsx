@@ -7,6 +7,7 @@ import type { AgentConfirmPayload, UiApprovalAnswer, UiDialogRequest, UiDialogVa
 import { useI18n } from "@/lib/i18n";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import { matchMobileViewport } from "@/hooks/useIsMobile";
+import { SessionLink } from "./SessionLink";
 
 // The Other text lives as long as the question: choosing a regular option only
 // unchooses it, so the text is still in its row when Other is chosen again.
@@ -439,21 +440,6 @@ export function readFormData(form: HTMLFormElement): HtmlFormData {
 }
 
 
-function SessionRefLink({ session }: { session: AgentConfirmPayload["from"] }) {
-  const label = session.name?.trim() || "Untitled session";
-  return (
-    <a
-      href={`/?session=${encodeURIComponent(session.id)}&host=${encodeURIComponent(session.hostId)}`}
-      target="_blank"
-      rel="noopener"
-      aria-label={`Open session ${label} on ${session.hostLabel}`}
-      style={{ color: "var(--accent)", fontWeight: 600 }}
-    >
-      {label}
-    </a>
-  );
-}
-
 function ServerConfirmBody({ payload }: { payload: AgentConfirmPayload }) {
   const row = (label: string, value: ReactNode) => (
     <div style={{ display: "grid", gridTemplateColumns: "72px minmax(0, 1fr)", gap: 8 }}>
@@ -464,10 +450,10 @@ function ServerConfirmBody({ payload }: { payload: AgentConfirmPayload }) {
   const message = payload.message;
   return (
     <div style={{ display: "grid", gap: 8, color: "var(--text-muted)", fontSize: 13, lineHeight: 1.5 }}>
-      {row("From", <><SessionRefLink session={payload.from} /> · {payload.from.hostLabel}</>)}
+      {row("From", <><SessionLink session={payload.from} newTab /> · {payload.from.hostLabel}</>)}
       {payload.kind === "send_to_session" ? (
         <>
-          {row("To", payload.to ? <><SessionRefLink session={payload.to} /> · {payload.to.hostLabel}</> : "Unknown session")}
+          {row("To", payload.to ? <><SessionLink session={payload.to} newTab /> · {payload.to.hostLabel}</> : "Unknown session")}
           {row("Delivery", payload.delivery === "followUp" ? "Follow-up" : payload.delivery === "prompt" ? "New turn" : "Steer")}
         </>
       ) : (

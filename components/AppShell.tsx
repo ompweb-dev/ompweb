@@ -1416,15 +1416,15 @@ export function AppShell({ appName }: { appName: string }) {
     setExplorerRefreshKey((k) => k + 1);
   }, []);
 
-  // Notification clicks name a session id; the session list carries its cwd
-  // and project, which selecting needs. When the list cannot be read (the
-  // sign-in expired), load the session URL: sign-in carries it through.
-  const openSessionById = useCallback((sessionId: string) => {
+  // Session links and notification clicks name a session id; links may also
+  // carry its host so copied IDs on different machines stay distinct.
+  const openSessionById = useCallback((sessionId: string, hostId?: string) => {
     window.focus();
     // On narrow screens the file panel covers the chat it is about to show.
     if (isCompactOverlay) setRightPanelOpen(false);
     // A full load (not router navigation) so an expired sign-in reaches proxy.ts and the login page.
-    const sessionUrl = new URL(`/?session=${encodeURIComponent(sessionId)}`, window.location.origin).href;
+    const query = `/?session=${encodeURIComponent(sessionId)}${hostId ? `&host=${encodeURIComponent(hostId)}` : ""}`;
+    const sessionUrl = new URL(query, window.location.origin).href;
     void fetch("/api/sessions")
       .then((r) => {
         if (!r.ok) {
@@ -1432,7 +1432,8 @@ export function AppShell({ appName }: { appName: string }) {
           return;
         }
         return (r.json() as Promise<{ sessions: SessionInfo[] }>).then((d) => {
-          const session = d.sessions.find((s) => s.id === sessionId);
+          const session = d.sessions.find((candidate) => candidate.id === sessionId
+            && (!hostId || (candidate.hostId ?? "local") === hostId));
           if (session) handleSelectSession(session);
           else toast.error(translate("notifications.sessionNotFound"));
         });

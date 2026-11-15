@@ -1,4 +1,5 @@
 import type { QueuedMessages } from "./pi-types";
+import { parseMessageOrigin, type MessageOrigin } from "./message-origin";
 
 /** Opaque native intent identity; never inferred from displayed text or a timestamp. */
 export function isClientMessageId(value: unknown): value is string {
@@ -28,6 +29,17 @@ export function readQueueSnapshot(value: unknown): QueuedMessages | null {
         return [isClientMessageId(id) ? id : null];
       }) : [];
     snapshot.clientMessageIds = { steering: aligned("steering", queues[0]), followUp: aligned("followUp", queues[1]) };
+  }
+  if ("messageOrigins" in value && value.messageOrigins && typeof value.messageOrigins === "object") {
+    const origins = value.messageOrigins as Record<string, unknown>;
+    const aligned = (key: "steering" | "followUp", list: unknown): (MessageOrigin | null)[] =>
+      Array.isArray(list) ? list.flatMap((text, index) => {
+        if (typeof text !== "string") return [];
+        const source = origins[key];
+        const origin = Array.isArray(source) && source.length === list.length ? parseMessageOrigin(source[index]) : null;
+        return [origin];
+      }) : [];
+    snapshot.messageOrigins = { steering: aligned("steering", queues[0]), followUp: aligned("followUp", queues[1]) };
   }
   return snapshot;
 }
