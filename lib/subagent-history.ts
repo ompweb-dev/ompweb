@@ -352,9 +352,8 @@ function transcriptModel(file: string): string | undefined {
 /** Cap on transcript bytes materialized for the dialog (files are small). */
 export const MAX_SUBAGENT_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
 
-/** Bytes read per page call — the total cap above bounds the file, this
- * bounds the per-response window so large transcripts are delivered
- * incrementally instead of serialized whole. */
+/** Target bytes per page call. A single JSONL record may exceed this window;
+ * that page extends through the record's newline so paging never drops it. */
 export const SUBAGENT_TRANSCRIPT_PAGE_BYTES = 256 * 1024;
 
 export interface SubagentTranscriptPage {
@@ -398,17 +397,31 @@ export function readSubagentTranscriptPage(sessionFilePath: string, fromByte = 0
   const endByte = Math.min(size, startByte + SUBAGENT_TRANSCRIPT_PAGE_BYTES);
   let body: string;
   try {
-    // Positional read of just this page's window — materializing the whole
-    // file to slice one window made a pagination walk O(n²) in I/O.
-    // Slice the BYTE buffer, not the decoded string: `startByte` is a UTF-8
-    // offset, while string indices are UTF-16 code units — slicing the string
-    // misaligns every later page once non-ASCII text precedes the offset.
+    // Positional reads keep byte offsets valid when earlier content is non-ASCII.
+    // Usually one window is enough; a record wider than it extends to its newline.
     const fd = openSync(sessionFilePath, "r");
     try {
-      const windowBytes = endByte - startByte;
-      const buffer = Buffer.alloc(windowBytes);
-      const bytesRead = readSync(fd, buffer, 0, windowBytes, startByte);
-      body = buffer.subarray(0, bytesRead).toString("utf8");
+      const buffer = Buffer.alloc(endByte - startByte);
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, startByte);
+      const first = buffer.subarray(0, bytesRead);
+      const chunks = [first];
+      let totalBytes = first.length;
+      let position = startByte + bytesRead;
+      if (first.indexOf(0x0a) < 0) {
+        while (position < size) {
+          const chunk = Buffer.alloc(Math.min(SUBAGENT_TRANSCRIPT_PAGE_BYTES, size - position));
+          const chunkBytes = readSync(fd, chunk, 0, chunk.length, position);
+          if (chunkBytes === 0) break;
+          const slice = chunk.subarray(0, chunkBytes);
+          const newline = slice.indexOf(0x0a);
+          const kept = newline >= 0 ? slice.subarray(0, newline + 1) : slice;
+          chunks.push(kept);
+          totalBytes += kept.length;
+          position += chunkBytes;
+          if (newline >= 0) break;
+        }
+      }
+      body = (chunks.length === 1 ? first : Buffer.concat(chunks, totalBytes)).toString("utf8");
     } finally {
       closeSync(fd);
     }
@@ -421,11 +434,7 @@ export function readSubagentTranscriptPage(sessionFilePath: string, fromByte = 0
   const messages = entries
     .map((entry) => entryToUiMessage(entry, {}))
     .filter((message): message is AgentMessage => message !== null);
-  let nextByte = startByte + Buffer.byteLength(completeText, "utf8");
-  // Guarantee forward progress: when the window ends mid-line and more
-  // content remains, the partial line has no newline to complete it — skip
-  // it instead of returning the same offset forever.
-  if (nextByte === startByte && endByte < size) nextByte = endByte;
+  const nextByte = startByte + Buffer.byteLength(completeText, "utf8");
   return { sessionFile: sessionFilePath, fromByte: startByte, nextByte, reset, messages, totalBytes: size };
 }
 
