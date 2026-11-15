@@ -87,12 +87,17 @@ export function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] })
   const [settings, setSettings] = useState<RetrySettings | null>(null);
   const [role, setRole] = useState("default");
   const [candidate, setCandidate] = useState("");
+  const [candidateEffort, setCandidateEffort] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/omp-settings")
       .then((response) => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
-      .then((data: { settings?: RetrySettings }) => setSettings(data.settings ?? {}))
+      .then((data: { settings?: RetrySettings }) => {
+        const loaded = data.settings ?? {};
+        confirmedRef.current = loaded;
+        setSettings(loaded);
+      })
       .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, []);
 
@@ -101,6 +106,7 @@ export function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] })
   // the latest snapshot and drain a single serialized save always writing the
   // most recent state (fixes rapid fallback-chain edits scheduling stale writes).
   const latestRef = useRef<RetrySettings | null>(null);
+  const confirmedRef = useRef<RetrySettings | null>(null);
   const drainingRef = useRef(false);
   const save = (next: RetrySettings) => {
     setSettings(next);
@@ -117,8 +123,12 @@ export function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] })
             const response = await fetch("/api/omp-settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: snapshot }) });
             const data = await response.json() as { settings?: RetrySettings; error?: string };
             if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
-            if (latestRef.current === null) setSettings(data.settings ?? snapshot);
+            const confirmed = data.settings ?? snapshot;
+            confirmedRef.current = confirmed;
+            if (latestRef.current === null) setSettings(confirmed);
           } catch (reason) {
+            latestRef.current = null;
+            setSettings(confirmedRef.current ?? {});
             setError(reason instanceof Error ? reason.message : String(reason));
             break;
           }
@@ -133,6 +143,8 @@ export function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] })
   const retry = settings.retry ?? {};
   const chain = retry.fallbackChains?.[role] ?? [];
   const modelOptions = models.map((model) => `${model.provider}/${model.id}`);
+  const candidateModel = models.find((model) => `${model.provider}/${model.id}` === candidate);
+  const candidateSelector = candidate ? `${candidate}${candidateEffort ? `:${candidateEffort}` : ""}` : "";
   const updateChain = (next: string[]) => void save({ ...settings, retry: { ...retry, fallbackChains: { ...(retry.fallbackChains ?? {}), [role]: next } } });
 
   return <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -145,7 +157,11 @@ export function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] })
     </div>
     <section style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-card)", overflow: "hidden" }}>
       <div style={{ padding: "10px 12px", background: "var(--bg-panel)", display: "flex", alignItems: "center", gap: 8 }}><span style={{ color: "var(--text)", fontSize: 12, fontWeight: 600 }}>{t("modelsConfig.fallbackChainFor")}</span><ThemedSelect aria-label={t("modelsConfig.fallbackChainFor")} value={role} onChange={(nextValue) => setRole(nextValue)} style={{ padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text)" }} options={[...NATIVE_MODEL_ROLES.map((value) => ({ value: value, label: value }))]} /></div>
-      <div style={{ padding: 12, display: "flex", gap: 8 }}><ThemedSelect aria-label={t("modelsConfig.selectFallbackModel")} value={candidate} onChange={(nextValue) => setCandidate(nextValue)} style={{ flex: 1, minWidth: 0, padding: "6px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text)" }} options={[{ value: "", label: t("modelsConfig.selectFallbackModel") }, ...modelOptions.filter((value) => !chain.includes(value)).map((value) => ({ value: value, label: value }))]} /><button type="button" disabled={!candidate} onClick={() => { updateChain([...chain, candidate]); setCandidate(""); }} style={{ padding: "6px 10px", border: "none", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "white", cursor: "pointer", fontSize: 12 }}>{t("modelsConfig.add")}</button></div>
+      <div style={{ padding: 12, display: "flex", gap: 8 }}>
+        <ThemedSelect aria-label={t("modelsConfig.selectFallbackModel")} value={candidate} onChange={(nextValue) => { setCandidate(nextValue); setCandidateEffort(""); }} style={{ flex: 1, minWidth: 0, padding: "6px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text)" }} options={[{ value: "", label: t("modelsConfig.selectFallbackModel") }, ...modelOptions.filter((value) => !chain.includes(value)).map((value) => ({ value: value, label: value }))]} />
+        <ThemedSelect aria-label={t("modelsConfig.thinkingLevels")} value={candidateEffort} disabled={!candidateModel} onChange={setCandidateEffort} style={{ minWidth: 110, padding: "6px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text)", opacity: candidateModel ? 1 : 0.55 }} options={[{ value: "", label: t("modelsConfig.modelDefault") }, ...(candidateModel?.thinkingLevels ?? []).map((level) => ({ value: level, label: level }))]} />
+        <button type="button" disabled={!candidate || chain.includes(candidateSelector)} onClick={() => { updateChain([...chain, candidateSelector]); setCandidate(""); setCandidateEffort(""); }} style={{ padding: "6px 10px", border: "none", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "white", cursor: "pointer", fontSize: 12 }}>{t("modelsConfig.add")}</button>
+      </div>
       {chain.length === 0 ? (
         <div style={{ padding: "0 12px 12px", color: "var(--text-dim)", fontSize: 12 }}>{t("modelsConfig.noExplicitChain")}</div>
       ) : (
