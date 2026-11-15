@@ -10,6 +10,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 - **Restore HTTP LAN and VPN access.** Browser UUID generation now works without secure-context-only `crypto.randomUUID()`, preventing the "Something went wrong" crash when opening the app or creating a session.
 
+### Added
+
+- **Race-free GitHub watch registration.** `watch_github` returns the metadata snapshot used as a new watch's baseline, so agents can inspect existing comments, reviews, threads and CI before relying on later watch updates.
+
 ## [v0.7.1] - 2026-11-14
 
 ### Fixed

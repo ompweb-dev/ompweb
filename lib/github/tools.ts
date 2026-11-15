@@ -32,7 +32,7 @@ export const GITHUB_TOOL_DEFINITIONS: HostToolDefinition[] = [
   {
     name: "watch_github",
     description:
-      `${REQUIREMENT} Watch a pull request, issue or specific Actions workflow run. PRs/issues deliver new comments, reviews, inline review comments, finished CI per head commit (PRs), and merge/close. Workflow runs deliver status/attempt changes and final conclusion; watching ends on completion. Updates carry links and metadata only, never GitHub-written text: read it with github_read. Only activity after this call is delivered. At most ${MAX_WATCHES_PER_SESSION} watches per session; watching a target again changes nothing.`,
+      `${REQUIREMENT} Watch a pull request, issue or specific Actions workflow run. Returns the current metadata snapshot; for a new watch, that exact snapshot establishes the baseline. PRs/issues deliver later comments, reviews, inline review comments, finished CI per head commit (PRs), and merge/close. Workflow runs deliver later status/attempt changes and final conclusion; watching ends on completion. Updates and the initial snapshot carry links and metadata only, never GitHub-written text: read it with github_read. At most ${MAX_WATCHES_PER_SESSION} watches per session; watching a target again changes nothing.`,
     parameters: { type: "object", properties: { target }, required: ["target"] },
   },
   {
@@ -200,14 +200,25 @@ export async function executeGithubTool(name: string, args: Record<string, unkno
       await checkGh(ops.run);
       await allowRead(ops, ctx, t);
       const snapshot = await fetchSnapshot(ops.run, t);
-      if (snapshot.state !== "open") return { watching: false, target: label, kind: snapshot.kind, state: snapshot.state };
+      const initialSnapshot = {
+        ...snapshot,
+        threadComments: snapshot.threadComments.map(({ id, url, author, threadId, line }) => ({ id, url, author, threadId, line })),
+        ...(snapshot.head && {
+          head: {
+            sha: snapshot.head.sha,
+            checks: snapshot.head.checks.map(({ conclusion, status }) => ({ conclusion, status })),
+          },
+        }),
+      };
+      delete initialSnapshot.rateLimit;
+      if (snapshot.state !== "open") return { watching: false, target: label, kind: snapshot.kind, state: snapshot.state, snapshot: initialSnapshot };
       if (ctx.signal?.aborted) throw new Error("The tool call was cancelled; no watch was registered.");
       const registration = registerWatchIntent(intent, ctx.sourceSessionId, itemKey, snapshot.kind, baselineCursor(snapshot));
       if (registration === "cancelled") throw new Error("The watch request was cancelled by an unwatch before registration.");
       if (registration === "limit") {
         throw new Error(`This session already watches the limit of ${MAX_WATCHES_PER_SESSION} GitHub items. Unwatch one first.`);
       }
-      return { watching: true, target: label, kind: snapshot.kind, state: snapshot.state };
+      return { watching: true, target: label, kind: snapshot.kind, state: snapshot.state, snapshot: initialSnapshot };
     } finally {
       cancelWatchIntent(intent);
     }
