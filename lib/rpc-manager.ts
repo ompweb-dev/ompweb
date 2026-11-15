@@ -26,6 +26,7 @@ import { markShuttingDown, recordRunningSessions, resumeOnHostLink, takeInterrup
 import { RESUME_PROMPT } from "./hosts/host-resume";
 import { samePath } from "./paths";
 import { isRecord } from "./type-guards";
+import type { MessageOrigin } from "./message-origin";
 import { isClientMessageId, readQueueSnapshot } from "./client-message-ids";
 import { createNotificationDetector } from "./notification-events";
 import { publishNotification } from "./notification-hub";
@@ -38,7 +39,7 @@ import type {
   SessionStatsInfo,
   WebSessionState,
 } from "./pi-types";
-import type { AgentMessage, CrossSessionHostToolCall, CrossSessionHostToolEvent, ExitedRpcSession, ExtensionWidgetItem } from "./types";
+import type { AgentConfirmPayload, AgentMessage, CrossSessionHostToolCall, CrossSessionHostToolEvent, ExitedRpcSession, ExtensionWidgetItem } from "./types";
 import { isLinkUp, type Host, type HostStatus, type SpawnRequest, type SpawnResult } from "./hosts/host";
 import { freezeHostLinks, getHost, hostOwnsLifecycle, isNotifier, lastUplinkAt, listHosts, orphanExit } from "./hosts/hub";
 import { CREATION_ID_RE, HISTORY_MUTATING_COMMANDS, HostOpError, PEER_MESSAGE_FRAME, PEER_PROMPT_OUTCOME_FRAME } from "./hosts/link-protocol";
@@ -1503,7 +1504,7 @@ export class AgentSessionWrapper {
    * replay and input-needed notification. Resolves false when declined, when
    * the run ends, or when the session stops.
    */
-  confirmFromServer(title: string, signal?: AbortSignal): Promise<boolean> {
+  confirmFromServer(title: string, payload?: AgentConfirmPayload, signal?: AbortSignal): Promise<boolean> {
     if (!this._alive || signal?.aborted) return Promise.resolve(false);
     const id = `omp-web:${randomUUID()}`;
     const { promise, resolve } = Promise.withResolvers<boolean>();
@@ -1520,13 +1521,14 @@ export class AgentSessionWrapper {
     this.serverUiRequests.set(id, finish);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    else this.handleFrame({ type: "ui_request", id, method: "confirm", args: [title, ""] });
+    else this.handleFrame({ type: "ui_request", id, method: "confirm", args: [title, ""], ...(payload ? { serverPayload: payload } : {}) });
     return promise;
   }
 
   /** Records a runner dialog as pending; true when it was answered here (auto-approve) and must not reach the browser. */
   private trackUiRequest(event: UnsequencedAgentEvent): boolean {
     const id = String(event.id);
+    if (!this.serverUiRequests.has(id) && "serverPayload" in event) delete event.serverPayload;
     const args = Array.isArray(event.args) ? event.args : [];
     if (this.host.autoApproveExtension()) {
       // Only tool approvals and the “Allow tool: <name>” confirmation are covered.
@@ -1992,12 +1994,14 @@ export class AgentSessionWrapper {
       const getSessionId = () => this.sessionId;
       const context: AgentToolContext = {
         get sourceSessionId() { return getSessionId(); },
+        sourceSessionName: this._sessionName ?? null,
         sourceRequestId: id,
         sourceCwd: this.cwd,
         sourceHostId: this.host.id,
+        sourceHostLabel: this.host.label,
         enabled: loadWebServerSettings().agentToolsEnabled,
         guard: getAgentToolGuard(),
-        confirm: (title) => this.confirmFromServer(title, cancel.signal),
+        confirm: (title, payload) => this.confirmFromServer(title, payload, cancel.signal),
         signal: cancel.signal,
       };
       if (this.replaying && toolName === "new_session" && (
@@ -2579,11 +2583,13 @@ export class AgentSessionWrapper {
   }
 
 
-  async send(command: Record<string, unknown>, options?: { preserveUnknownDelivery: boolean }): Promise<unknown> {
+  async send(command: Record<string, unknown>, options?: { preserveUnknownDelivery?: boolean; origin?: MessageOrigin }): Promise<unknown> {
     if (this.restarting) throw new WebRpcError(RESTARTING_MESSAGE, "session_restarting");
     if (this.mcpListInFlight) throw new WebRpcError("MCP management is in progress. Try again when it finishes.", "session_busy");
     if (!this.isAlive()) throw new Error("Session is no longer running");
     if (this.hostDown() || this.oldChildExiting) throw this.hostOfflineError("refused");
+    if (command.origin !== undefined) throw new WebRpcError("Message origin is server-owned.", "origin_not_allowed");
+    const trustedCommand = options?.origin ? { ...command, origin: options.origin } : command;
     if (typeof command.type === "string" && command.type.startsWith("abort")) {
       console.info("[omp-web] cancellation-command", JSON.stringify({ sessionId: this._sessionId, type: command.type, at: new Date().toISOString() }));
     }
@@ -2593,7 +2599,7 @@ export class AgentSessionWrapper {
     }
     if (mutatesHistory) this.historyMutationPendingCount += 1;
     try {
-      return await this.withPendingCommand(() => this.dispatchCommand(command, options?.preserveUnknownDelivery === true));
+      return await this.withPendingCommand(() => this.dispatchCommand(trustedCommand, options?.preserveUnknownDelivery === true));
     } finally {
       if (mutatesHistory) this.historyMutationPendingCount -= 1;
     }
@@ -2643,6 +2649,7 @@ export class AgentSessionWrapper {
             ...(toImageContents(command.images) ? { images: toImageContents(command.images) } : {}),
             ...(streamingBehavior ? { streamingBehavior } : {}),
             ...(isClientMessageId(command.clientMessageId) ? { clientMessageId: command.clientMessageId } : {}),
+            ...(isRecord(command.origin) ? { origin: command.origin } : {}),
           }, PROMPT_ACK_TIMEOUT_MS, command);
           // Slash commands fully consumed by a builtin report agentInvoked:false
           // in the ack itself — no prompt_result frame follows.
@@ -2697,6 +2704,7 @@ export class AgentSessionWrapper {
           message: command.message as string,
           ...(toImageContents(command.images) ? { images: toImageContents(command.images) } : {}),
           ...(isClientMessageId(command.clientMessageId) ? { clientMessageId: command.clientMessageId } : {}),
+          ...(isRecord(command.origin) ? { origin: command.origin } : {}),
         }, undefined, command);
         return null;
       }
@@ -3041,6 +3049,7 @@ export class AgentSessionWrapper {
       message: command.message as string,
       ...(images ? { images } : {}),
       ...(isClientMessageId(command.clientMessageId) ? { clientMessageId: command.clientMessageId } : {}),
+      ...(isRecord(command.origin) ? { origin: command.origin } : {}),
     }, undefined, command);
     return { queued: true, queue: "followUp", reason: "shellRunning" };
   }
@@ -3431,12 +3440,16 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
         if (!configured) throw new Error(`Unknown host: ${host.id}`);
         return authorize(configured);
       };
-      const initialize = async (session: AgentSessionWrapper, preserveUnknownDelivery: boolean) => {
+      const initialize = async (session: AgentSessionWrapper, preserveUnknownDelivery: boolean, promptId = input.clientMessageId) => {
         if (input.provider && input.modelId) {
           await session.send({ type: "set_model", provider: input.provider, modelId: input.modelId }, { preserveUnknownDelivery });
         }
         if (input.name) await session.send({ type: "set_session_name", name: input.name }, { preserveUnknownDelivery });
-        if (input.prompt) await session.send({ type: "prompt", message: input.prompt }, { preserveUnknownDelivery });
+        if (input.prompt) await session.send({
+          type: "prompt",
+          message: input.prompt,
+          ...(promptId ? { clientMessageId: promptId } : {}),
+        }, { preserveUnknownDelivery, origin: input.origin });
       };
       if (!input.shareWorkspace && !input.explicitHost && input.hostId === source.sourceHostId) {
         const sessions = await listSessionsAllHosts();
@@ -3447,15 +3460,23 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
         if (binding) {
           const creationId = createHash("sha256").update("ompweb:agent-creation:v1:")
             .update(JSON.stringify([source.sourceSessionId, source.sourceRequestId])).digest("hex");
-          const result = await startPooledSession({ creationId, poolId: binding.pool.id, projectId: binding.project.id, intent: { ...input } }, async (host, prepared, id, onStarted) => {
+          const result = await startPooledSession({
+            creationId,
+            poolId: binding.pool.id,
+            projectId: binding.project.id,
+            intent: { ...input, clientMessageId: undefined, origin: undefined },
+          }, async (host, prepared, id, onStarted) => {
             const started = await startNewRpcSession(host, prepared.cwd, undefined, false, true, id);
             if (!started.ok) throw new HostOpError(started.status, started.code, started.error);
             const { session, realSessionId } = started.value;
             await onStarted(realSessionId);
-            await session.withPendingCommand(() => initialize(session, true), true);
-            return { sessionId: realSessionId };
+            const promptId = input.prompt
+              ? createHash("sha256").update(`ompweb:agent-prompt:v1:${creationId}`).digest("hex")
+              : undefined;
+            await session.withPendingCommand(() => initialize(session, true, promptId), true);
+            return { sessionId: realSessionId, sessionName: input.name ?? null };
           }, authorizeHost);
-          return { sessionId: result.sessionId };
+          return { sessionId: result.sessionId, sessionName: input.name ?? null };
         }
       }
       // Standalone/shared creations have no durable admission identity and cannot safely be replayed.
@@ -3476,7 +3497,7 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
         if (!(error instanceof WebRpcError && error.code === "host_offline")) await session.destroyAndWait();
         throw error;
       }
-      return { sessionId: realSessionId };
+      return { sessionId: realSessionId, sessionName: input.name ?? null };
     },
 
     async deliver(input): Promise<AgentToolDeliverResult> {
@@ -3506,7 +3527,11 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
         if (delivery === "steer" && target.isAwaitingAsk()) delivery = "followUp";
         const terminalEndsNeeded = delivery === "followUp" && wasRunning ? 2 : 1;
         const waiter = input.wait ? target.waitForTurnEnd(input.waitTimeoutMs, terminalEndsNeeded) : null;
-        await target.send({ type: DELIVERY_COMMAND[delivery], message: input.message });
+        await target.send({
+          type: DELIVERY_COMMAND[delivery],
+          message: input.message,
+          clientMessageId: input.clientMessageId,
+        }, { origin: input.origin });
         return { waiter }; // Boxed: the lease ends at delivery, not at the turn's end.
       };
       const { waiter } = cold ? await wrapper.withPendingCommand(send, true) : await send();

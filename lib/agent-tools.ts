@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
 import type { HostToolDefinition } from "./pi-types";
+import { formatSessionOriginHeader, type MessageOrigin, type SessionOriginRef } from "./message-origin";
+import type { AgentConfirmPayload } from "./types";
 import { isRecord } from "./type-guards";
 import { startsUnasked, type AgentToolHost } from "./agent-tool-hosts";
 import { GITHUB_TOOL_DEFINITIONS, GITHUB_TOOL_NAMES, executeGithubTool, type GithubToolOps } from "./github/tools";
@@ -50,7 +53,7 @@ export const AGENT_TOOL_DEFINITIONS: HostToolDefinition[] = [
   {
     name: "send_to_session",
     description:
-      "Send a message to another omp-web session by ID. If the target is not running it is resumed first, as when a user opens it. The delivered message is prefixed with the sending session's ID so the target transcript shows where it came from.",
+      "Send a message to another omp-web session by ID. If the target is not running it is resumed first, as when a user opens it. Delivered messages carry trusted source metadata and explicitly tell the receiving agent they were not typed by the user.",
     parameters: {
       type: "object",
       properties: {
@@ -107,6 +110,8 @@ export interface AgentToolCreateSessionInput {
   shareWorkspace: boolean;
   /** Already sender-attributed by executeAgentTool, or null for an idle session. */
   prompt: string | null;
+  clientMessageId?: string;
+  origin?: MessageOrigin;
   provider?: string;
   modelId?: string;
   name?: string;
@@ -116,6 +121,8 @@ export interface AgentToolDeliverInput {
   sessionId: string;
   /** Already sender-attributed by executeAgentTool. */
   message: string;
+  clientMessageId: string;
+  origin: MessageOrigin;
   delivery: "prompt" | "steer" | "followUp";
   wait: boolean;
   waitTimeoutMs: number;
@@ -125,6 +132,7 @@ export interface AgentToolDeliverResult {
   accepted: boolean;
   targetSessionId: string;
   delivery: "prompt" | "steer" | "followUp";
+  targetSessionName?: string | null;
   /** True only when wait was requested and the turn actually finished. */
   waited: boolean;
   /** Final assistant text of the waited turn, or null when wait was false. */
@@ -136,7 +144,7 @@ export interface AgentToolSessionOps {
   listSessions(): Promise<AgentToolSessionRow[]>;
   listHosts(): AgentToolHost[];
   /** Authorize the actual physical owner before any preparation or spawn. */
-  createSession(input: AgentToolCreateSessionInput, authorize: (host: AgentToolHost) => Promise<boolean>): Promise<{ sessionId: string }>;
+  createSession(input: AgentToolCreateSessionInput, authorize: (host: AgentToolHost) => Promise<boolean>): Promise<{ sessionId: string; sessionName: string | null }>;
   deliver(input: AgentToolDeliverInput): Promise<AgentToolDeliverResult>;
   /** The host a session lives on; null when no host has it. */
   sessionHostId(sessionId: string): Promise<string | null>;
@@ -146,16 +154,18 @@ export interface AgentToolSessionOps {
 
 export interface AgentToolContext {
   sourceSessionId: string;
+  sourceSessionName: string | null;
   /** Native host_tool_call identity, retained unchanged across replay. */
   sourceRequestId: string;
   sourceCwd: string;
   /** The host the calling session runs on; "local" is this machine. */
   sourceHostId: string;
+  sourceHostLabel: string;
   /** The off-by-default Settings gate (lib/web-settings agentToolsEnabled). */
   enabled: boolean;
   guard: AgentToolGuard;
   /** Ask the calling session's user; resolves false when declined or the dialog is dropped. */
-  confirm(title: string): Promise<boolean>;
+  confirm(title: string, payload?: AgentConfirmPayload): Promise<boolean>;
   /** Aborted by omp's host_tool_cancel for this call; a GitHub write checks it last, before posting. */
   signal?: AbortSignal;
 }
@@ -217,11 +227,27 @@ export class AgentToolGuard {
   }
 }
 
-/** Attribution that lands in the target transcript itself, so any reader
- * (user or target agent) can see where the message came from. The full
- * source ID is kept so it can be found in the sidebar. */
-export function formatAttributedMessage(sourceSessionId: string, message: string): string {
-  return `[From session ${sourceSessionId} via omp-web agent tools]: ${message}`;
+function sourceRef(ctx: AgentToolContext): SessionOriginRef {
+  return {
+    id: ctx.sourceSessionId,
+    name: ctx.sourceSessionName,
+    hostId: ctx.sourceHostId,
+    hostLabel: ctx.sourceHostLabel,
+    ...(ctx.sourceCwd ? { cwd: ctx.sourceCwd } : {}),
+  };
+}
+
+function sessionOrigin(
+  ctx: AgentToolContext,
+  tool: "send_to_session" | "new_session",
+  delivery: "prompt" | "steer" | "followUp",
+): MessageOrigin {
+  return {
+    v: 1,
+    kind: "session",
+    sentAt: new Date().toISOString(),
+    session: { ...sourceRef(ctx), tool, delivery },
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -365,18 +391,30 @@ export async function executeAgentTool(
     const requestedHost = optionalString(record, "host");
     const host = resolveHost(ops.listHosts(), requestedHost ?? ctx.sourceHostId);
     if (shareWorkspace && host.id !== ctx.sourceHostId) throw new Error("shareWorkspace requires the calling session's host.");
+    const origin = prompt ? sessionOrigin(ctx, "new_session", "prompt") : undefined;
     const created = await ops.createSession({
       cwd,
       hostId: host.id,
       explicitHost: requestedHost !== undefined,
       shareWorkspace,
-      prompt: prompt ? formatAttributedMessage(ctx.sourceSessionId, prompt) : null,
+      prompt: prompt && origin ? `${formatSessionOriginHeader(origin)}\n\n${prompt}` : null,
+      ...(prompt && origin ? { clientMessageId: randomUUID(), origin } : {}),
       provider,
       modelId,
       name,
-    }, async (target) => startsUnasked(target, ctx.sourceHostId) || ctx.confirm(`Start a session on ${target.label} in ${cwd}?`));
+    }, async (target) => startsUnasked(target, ctx.sourceHostId) || ctx.confirm(
+      `Start a session on ${target.label} in ${cwd}?`,
+      {
+        kind: "new_session",
+        from: sourceRef(ctx),
+        host: { id: target.id, label: target.label },
+        cwd,
+        name: name ?? null,
+        message: prompt ?? null,
+      },
+    ));
     ctx.guard.setDepth(created.sessionId, depth);
-    return { sessionId: created.sessionId };
+    return created;
   }
 
   // send_to_session
@@ -390,26 +428,45 @@ export async function executeAgentTool(
   const delivery = parseDelivery(record);
   const { wait, waitTimeoutMs } = parseWait(record);
   const depth = ctx.guard.checkChainDepth(ctx.sourceSessionId);
+  const sessions = await ops.listSessions();
+  const targetSession = sessions.find((session) => session.id === sessionId);
+  const hosts = ops.listHosts();
+  const targetHostId = ctx.sourceHostId === "local" ? targetSession?.hostId : await ops.sessionHostId(sessionId);
+  if (ctx.sourceHostId !== "local" && !targetHostId) throw new Error(`Session not found: ${sessionId}`);
+  const targetHost = targetHostId ? hosts.find((host) => host.id === targetHostId) : undefined;
   // A remote agent reaching a session on another machine asks first, as new_session does.
-  if (ctx.sourceHostId !== "local") {
-    const targetHostId = await ops.sessionHostId(sessionId);
-    if (!targetHostId) throw new Error(`Session not found: ${sessionId}`);
-    const hosts = ops.listHosts();
-    const target = hosts.find((h) => h.id === targetHostId);
-    if (targetHostId !== ctx.sourceHostId && !(target && startsUnasked(target, ctx.sourceHostId))) {
-      const sourceLabel = hosts.find((h) => h.id === ctx.sourceHostId)?.label ?? ctx.sourceHostId;
-      if (!(await ctx.confirm(`Send a message from a session on ${sourceLabel} to session ${sessionId} on ${target?.label ?? targetHostId}?`))) {
-        throw new Error(`The user declined to send a message to session ${sessionId}.`);
-      }
+  if (ctx.sourceHostId !== "local" && targetHostId !== ctx.sourceHostId
+    && !(targetHost && startsUnasked(targetHost, ctx.sourceHostId))) {
+    const sourceLabel = hosts.find((host) => host.id === ctx.sourceHostId)?.label ?? ctx.sourceHostLabel;
+    if (!(await ctx.confirm(
+      `Send a message from a session on ${sourceLabel} to session ${sessionId} on ${targetHost?.label ?? targetHostId}?`,
+      {
+        kind: "send_to_session",
+        from: sourceRef(ctx),
+        to: targetSession && targetHostId ? {
+          id: targetSession.id,
+          name: targetSession.name ?? null,
+          hostId: targetHostId,
+          hostLabel: targetHost?.label ?? targetHostId,
+          ...(targetSession.cwd ? { cwd: targetSession.cwd } : {}),
+        } : null,
+        delivery,
+        message,
+      },
+    ))) {
+      throw new Error(`The user declined to send a message to session ${sessionId}.`);
     }
   }
+  const origin = sessionOrigin(ctx, "send_to_session", delivery);
   const result = await ops.deliver({
     sessionId,
-    message: formatAttributedMessage(ctx.sourceSessionId, message),
+    message: `${formatSessionOriginHeader(origin)}\n\n${message}`,
+    clientMessageId: randomUUID(),
+    origin,
     delivery,
     wait,
     waitTimeoutMs,
   });
   ctx.guard.setDepth(sessionId, depth);
-  return result;
+  return { ...result, targetSessionName: targetSession?.name ?? null };
 }

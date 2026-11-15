@@ -989,7 +989,6 @@ async function deliver(entry: Row): Promise<Outcome> {
     ...commandOf(current, !idle),
     message: current.message,
     ...(correlated ? { clientMessageId: current.id } : {}),
-    ...(origin ? { origin } : {}),
     ...(current.images ? { images: JSON.parse(current.images) as unknown } : {}),
     ...(current.uploads ? { uploads: JSON.parse(current.uploads) as unknown } : {}),
   };
@@ -1044,7 +1043,7 @@ async function deliver(entry: Row): Promise<Outcome> {
   publish(sessionId);
   try {
     // attachUploads mutates this same command before writing it: the watcher matches the final attachment block too.
-    const response = await runAgentCommand(sessionId, command, current.advisor === 1, current.owner, uploadReceipts);
+    const response = await runAgentCommand(sessionId, command, current.advisor === 1, current.owner, uploadReceipts, origin);
     if (!response.ok) {
       // Nothing was written: a gone child is retried, and any other refusal is classified as not sent.
       const written = nativeWriteStarted(command);

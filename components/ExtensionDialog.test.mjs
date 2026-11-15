@@ -78,6 +78,40 @@ test("confirm answers true, and cancel answers with no value", async () => {
   }
 });
 
+test("server-owned send confirmation shows named endpoints and escaped message text", () => {
+  const request = {
+    type: "ui_request",
+    id: "omp-web:send",
+    method: "confirm",
+    args: ["Allow this session to send a message?", ""],
+    serverPayload: {
+      kind: "send_to_session",
+      from: { id: "source", name: "Source session", hostId: "local", hostLabel: "This machine" },
+      to: { id: "target", name: "Deploy", hostId: "worker", hostLabel: "Worker 1" },
+      delivery: "followUp",
+      message: "<b>Do not render me</b>",
+    },
+  };
+  const responses = [];
+  const view = render(React.createElement(ExtensionDialog, {
+    request,
+    onRespond: (_current, value) => responses.push(value),
+    attached: true,
+  }));
+  try {
+    assert.match(screen.getByRole("link", { name: /Source session/ }).getAttribute("href"), /session=source/);
+    assert.match(screen.getByRole("link", { name: /Deploy/ }).getAttribute("href"), /session=target/);
+    screen.getByText("Follow-up");
+    assert.equal(screen.getByText("<b>Do not render me</b>").tagName, "PRE");
+    fireEvent.click(screen.getByRole("button", { name: "Allow and send" }));
+    assert.deepEqual(responses, [true]);
+    screen.getByRole("button", { name: "Deny" });
+    assert.equal(view.container.querySelector("b"), null);
+  } finally {
+    view.unmount();
+  }
+});
+
 test("approve offers omp's choices and answers with the chosen ExtensionApprovalAnswer", async () => {
   const request = {
     type: "ui_request",

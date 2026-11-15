@@ -3,7 +3,7 @@
 import { createElement, Fragment, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode, type RefObject } from "react";
 import { Eye, EyeOff } from "lucide-react";
 import type { HtmlFormData } from "@/lib/pi-types";
-import type { UiApprovalAnswer, UiDialogRequest, UiDialogValue } from "@/lib/types";
+import type { AgentConfirmPayload, UiApprovalAnswer, UiDialogRequest, UiDialogValue } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import { matchMobileViewport } from "@/hooks/useIsMobile";
@@ -438,6 +438,53 @@ export function readFormData(form: HTMLFormElement): HtmlFormData {
   return data;
 }
 
+
+function SessionRefLink({ session }: { session: AgentConfirmPayload["from"] }) {
+  const label = session.name?.trim() || "Untitled session";
+  return (
+    <a
+      href={`/?session=${encodeURIComponent(session.id)}&host=${encodeURIComponent(session.hostId)}`}
+      target="_blank"
+      rel="noopener"
+      aria-label={`Open session ${label} on ${session.hostLabel}`}
+      style={{ color: "var(--accent)", fontWeight: 600 }}
+    >
+      {label}
+    </a>
+  );
+}
+
+function ServerConfirmBody({ payload }: { payload: AgentConfirmPayload }) {
+  const row = (label: string, value: ReactNode) => (
+    <div style={{ display: "grid", gridTemplateColumns: "72px minmax(0, 1fr)", gap: 8 }}>
+      <span style={{ color: "var(--text-dim)" }}>{label}</span>
+      <span style={{ minWidth: 0, color: "var(--text)" }}>{value}</span>
+    </div>
+  );
+  const message = payload.message;
+  return (
+    <div style={{ display: "grid", gap: 8, color: "var(--text-muted)", fontSize: 13, lineHeight: 1.5 }}>
+      {row("From", <><SessionRefLink session={payload.from} /> · {payload.from.hostLabel}</>)}
+      {payload.kind === "send_to_session" ? (
+        <>
+          {row("To", payload.to ? <><SessionRefLink session={payload.to} /> · {payload.to.hostLabel}</> : "Unknown session")}
+          {row("Delivery", payload.delivery === "followUp" ? "Follow-up" : payload.delivery === "prompt" ? "New turn" : "Steer")}
+        </>
+      ) : (
+        <>
+          {row("Host", payload.host.label)}
+          {row("Directory", <code>{payload.cwd}</code>)}
+        </>
+      )}
+      {message && (
+        <pre style={{ margin: "4px 0 0", maxHeight: 300, overflow: "auto", padding: 10, border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--tool-bg)", color: "var(--text)", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--font-mono)", fontSize: 12 }}>
+          {message}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 /**
  * Overlay dialog for omp's `ExtensionUIContext` dialogs as the runner sends them.
  * Polished UX:
@@ -510,6 +557,7 @@ export function ExtensionDialog({
     })
     : request.method !== "select" || selectedOption !== null;
   const title = dialogTitle(request, t("chatWindow.askTitle"));
+  const serverPayload = request.method === "confirm" ? request.serverPayload : undefined;
 
   // Answering removes the panel. Release its text field first, in the same
   // task, so the phone keyboard closes once instead of flashing as the
@@ -664,7 +712,9 @@ export function ExtensionDialog({
 
         <div className="extension-dialog-body">
           {request.method === "confirm" && (
-            <div style={{ color: "var(--text-muted)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{request.args[1]}</div>
+            serverPayload
+              ? <ServerConfirmBody payload={serverPayload} />
+              : <div style={{ color: "var(--text-muted)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{request.args[1]}</div>
           )}
           {request.method === "approve" && (
             <div style={{ display: "grid", gap: 6 }}>
@@ -916,11 +966,11 @@ export function ExtensionDialog({
 
         <div className="extension-dialog-footer" style={{ display: "flex", flexShrink: 0, justifyContent: "flex-end", gap: 8, padding: "10px 16px", borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
           <button className="extension-dialog-button" onClick={cancel}>
-            {t("chatWindow.cancel")}
+            {serverPayload ? "Deny" : t("chatWindow.cancel")}
           </button>
           {request.method === "confirm" ? (
             <button className="extension-dialog-button extension-dialog-button-primary" onClick={submitValue}>
-              {t("chatWindow.confirm")}
+              {serverPayload?.kind === "send_to_session" ? "Allow and send" : serverPayload ? "Allow and start" : t("chatWindow.confirm")}
             </button>
           ) : (request.method === "select" && attached) || request.method === "askDialog" ? (
             <button className="extension-dialog-button extension-dialog-button-primary" onClick={submitValue} disabled={!canSubmit || awaitingNext}>

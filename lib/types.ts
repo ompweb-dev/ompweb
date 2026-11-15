@@ -1,6 +1,6 @@
 // Types mirrored from oh-my-pi coding-agent session-entries (v3 format).
 import type { HtmlFormData, RpcAskDialogQuestion, TodoPhase } from "./pi-types";
-import type { MessageOrigin } from "./message-origin";
+import type { MessageOrigin, SessionOriginRef } from "./message-origin";
 
 // omp-web cannot import the Bun-only @oh-my-pi packages, so the on-disk
 // shapes are re-declared here. Legacy pi v1/v2 fields are kept optional.
@@ -234,6 +234,23 @@ export interface UiFormDialogResult {
   data: HtmlFormData;
 }
 
+export type AgentConfirmPayload =
+  | {
+      kind: "send_to_session";
+      from: SessionOriginRef;
+      to: SessionOriginRef | null;
+      delivery: "prompt" | "steer" | "followUp";
+      message: string;
+    }
+  | {
+      kind: "new_session";
+      from: SessionOriginRef;
+      host: { id: string; label: string };
+      cwd: string;
+      name: string | null;
+      message: string | null;
+    };
+
 /** What an omp dialog method returns; a cancel sends no value. */
 export type UiDialogValue = string | boolean | UiAskDialogResult | UiFormDialogResult | UiApprovalAnswer;
 
@@ -243,7 +260,7 @@ export type UiDialogValue = string | boolean | UiAskDialogResult | UiFormDialogR
  */
 export type UiDialogRequest = { type: "ui_request"; id: number | string; expiresAt?: number } & (
   | { method: "select"; args: [title: string, options: UiSelectItem[], dialogOptions?: UiDialogOptionsArg] }
-  | { method: "confirm"; args: [title: string, message: string, dialogOptions?: UiDialogOptionsArg] }
+  | { method: "confirm"; args: [title: string, message: string, dialogOptions?: UiDialogOptionsArg]; serverPayload?: AgentConfirmPayload }
   | { method: "input"; args: [title: string, placeholder?: string | null, dialogOptions?: UiDialogOptionsArg] }
   | {
       method: "editor";
