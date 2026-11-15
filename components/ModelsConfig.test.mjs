@@ -73,6 +73,27 @@ test("fallback chains expose the runtime off effort", async (t) => {
   ));
 });
 
+test("fallback chains allow an effort variant after the model default", async (t) => {
+  const writes = [];
+  t.mock.method(globalThis, "fetch", async (_url, init) => {
+    if (init?.method === "PUT") {
+      writes.push(JSON.parse(init.body));
+      return Response.json(JSON.parse(init.body));
+    }
+    return Response.json({ settings: { retry: { fallbackChains: { default: ["openai-codex/gpt-5.6-sol"] } } } });
+  });
+
+  render(createElement(RetryFallbackDetail, { models: [runtimeModel] }));
+  const user = userEvent.setup();
+  await chooseFallback(user, "high");
+  await user.click(screen.getByRole("button", { name: "Add" }));
+
+  await waitFor(() => assert.deepEqual(
+    writes.at(-1).settings.retry.fallbackChains.default,
+    ["openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.6-sol:high"],
+  ));
+});
+
 test("fallback chains reject an exact duplicate selector", async (t) => {
   const writes = [];
   t.mock.method(globalThis, "fetch", async (_url, init) => {
