@@ -1174,7 +1174,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
     let current = true;
     void resolveSessionRef(targetId).then((session) => { if (current) setResolvedTarget(session); }, () => {});
     return () => { current = false; };
-  }, [targetId, resultTarget?.id, result]);
+  }, [targetId, resultTarget, result]);
   const agentTarget = resultTarget ?? resolvedTarget;
   const agentState = block.toolName === "send_to_session" || block.toolName === "new_session"
     ? !result ? "Sending"
