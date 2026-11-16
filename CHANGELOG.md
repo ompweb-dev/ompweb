@@ -6,9 +6,22 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+## [v0.7.2] - 2026-11-14
+
 ### Fixed
 
 - **Restore HTTP LAN and VPN access.** Browser UUID generation now works without secure-context-only `crypto.randomUUID()`, preventing the "Something went wrong" crash when opening the app or creating a session.
+- **GUI server updates work for owned binary releases again.** Settings → System prepares a server-and-host compatibility plan before approval, pins the release artifacts and checks service stop/start permissions before incompatible hosts move. Incompatible hosts must have a verified migration or recovery path; the local host participates in the initial migration and a shared-installation cutover. Progress survives a server restart, and failed replacement retains the previous installation for rollback. Uncertain shutdowns retain their update claim and report recovery rather than starting a second update.
+- **Old supervised hosts have an explicit forced recovery path.** Settings → Hosts offers Force update when recovery is available. Confirmation warns that sessions and subagents may end. A fixed, integrity-checked bootstrap uses the historical runner channel without enabling old application traffic. Windows uses native PowerShell/.NET and process/service/task controls; Linux and macOS retain their own supervisor semantics. Force never bypasses release integrity, ownership, process identity, update disablement or service permissions.
+- **Production starts its missing local host automatically.** It prepares the loopback link, reuses any answering daemon and otherwise starts an independent host. Concurrent starts keep one daemon, and a web-server exit leaves it running. Development does not take over production's host.
+- **Coordinated upgrades stage every participant before committing.** A later host's download or preflight failure leaves earlier hosts on their existing release. Approval inventory is rechecked before host commits and server cutover. Native supervisor discovery prevents slow managed startup from being replaced by an unmanaged daemon, and macOS system LaunchDaemons retain their actual supervisor identity.
+- **Exited foreground hosts no longer reserve recycled process IDs during an update.** A confirmed exit retires only that instance; unreadable liveness remains an error, and uncertainty after a stop signal retains the recovery fence.
+- **Package servers supervised by a shell restart loop stop their server child before replacing the launcher.** Child discovery waits for the same launcher identity to reach a confirmed stopped state, including when it was still waiting to spawn. Unconfirmed freezes retain the recovery fence. The loop restarts the correct launcher, the old server releases its port, and independent host daemons keep running.
+- **Approved host updates keep their selected release and operation ownership.** A newer published release does not block pinned admission. Commit decisions become visible only when complete, and active prepared or committing workers retain their update claims past the preparation deadline. A worker that dies during commit retains its recovery claim and blocks new work.
+- **Interrupted server upgrades remain bound to the approved server.** Recovery verifies the installation, restart command and listener, supervisor and process ownership before claiming an attempt. Another installation or source checkout sharing the user’s update directory cannot resume or fail it. Older attempts without that binding are not resumed automatically.
+- **Unknown legacy host activity never grants Force permission.** A shared local daemon can be interrupted only when the approved plan explicitly authorizes Force; otherwise newly busy hosts refuse cutover.
+- **Windows update status publication tolerates brief file-sharing conflicts.** Atomic replacement retries sharing-related errors for at most one second without deleting the prior state. Persistent failures still stop the update and report the error.
+- **Local-host startup ignores unrelated services.** Installation paths match at directory boundaries, and daemon detection distinguishes the host subcommand from directory names or server argument values.
 - **Open live subagent transcripts without waiting forever.** Transcript pages now read the subagent's on-disk artifact directly instead of waiting for its busy agent process to answer first.
 
 ### Added

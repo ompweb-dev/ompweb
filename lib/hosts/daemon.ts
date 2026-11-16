@@ -23,8 +23,9 @@ import { localHost, resolveSpawnCwdResult } from "./local-host";
 import { listenHostSocket, type HostSocket } from "./omp-socket";
 import { sessionOps } from "./session-ops";
 import packageJson from "../../package.json";
-import { checkHostUpdates, configureHostUpdateSafety, getHostUpdateOperation, HostUpdateError, startHostUpdate } from "./updates";
-import type { HostUpdateCompatibility, HostUpdateOperation } from "./update-types";
+import { acknowledgeHostUpdateReceipt, checkHostUpdates, configureHostUpdateSafety, getHostUpdateOperation, hostUpdateBlocksNewWork, HostUpdateError, startHostUpdate } from "./updates";
+import type { HostUpdateCompatibility, HostUpdateOperation, HostUpdateRequest } from "./update-types";
+import { validateApprovedReleasePin } from "./update-worker";
 import { UploadRetention } from "./upload-retention";
 import { StagedUploads, UPLOAD_SWEEP_INTERVAL_MS } from "./uploads";
 import { isWorkspaceOp, WORKSPACE_OP_PARAMS } from "../workspace-types";
@@ -66,6 +67,16 @@ function updateCompatibility(value: unknown): HostUpdateCompatibility {
     throw new HostOpError(400, "invalid_request", "Invalid web-server protocol range");
   }
   return { min: Number(value.min), max: Number(value.max) };
+}
+
+/** An `updateSoftware` request's optional parts. `force` here is the explicit approval to end this host's sessions (a `checkUpdates` `force` only refreshes caches). */
+function updateRequest(args: Record<string, unknown>): HostUpdateRequest {
+  if (args.force !== undefined && typeof args.force !== "boolean") throw new HostOpError(400, "invalid_request", "force must be a boolean");
+  if (args.operationId !== undefined && typeof args.operationId !== "string") throw new HostOpError(400, "invalid_request", "operationId must be a string");
+  if (args.requireReleasePin !== undefined && typeof args.requireReleasePin !== "boolean" || args.requireReleasePin && !args.releasePin) throw new HostOpError(400, "invalid_request", "Missing approved release pin");
+  if (args.phase !== undefined && !["prepare", "commit", "cancel"].includes(String(args.phase))) throw new HostOpError(400, "invalid_request", "Invalid coordinated update phase");
+  const releasePin = args.releasePin === undefined ? undefined : validateApprovedReleasePin(args.releasePin);
+  return { force: args.force === true, operationId: args.operationId, targetCompatibility: args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility), releasePin, requireReleasePin: args.requireReleasePin as boolean | undefined, phase: args.phase as HostUpdateRequest["phase"] };
 }
 
 /** Whether `command` names an executable: a path as given, else a name on PATH (with PATHEXT's extensions on Windows). */
@@ -139,7 +150,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       let operation: HostUpdateOperation | null = null;
       try { operation = getHostUpdateOperation(); }
       catch (error) { if (!updateStateWarningLogged) log("could not read host update status: " + reason(error)); updateStateWarningLogged = true; }
-      if (operation?.target === "ompweb" && operation.state === "running") throw new HostOpError(409, "host_updating", "This host is updating its daemon; new sessions must wait");
+      if (operation?.target === "ompweb" && hostUpdateBlocksNewWork(operation)) throw new HostOpError(409, "host_updating", "This host is updating its daemon; new sessions must wait");
       const resolved = launch.creationId === undefined ? resolveSpawnCwdResult(launch.recordedCwd ?? launch.cwd) : { cwd: launch.cwd, fellBack: false };
       // A sharing session never starts on this host's own logins: no link, or no usable broker, refuses.
       if (launch.credentialsServer !== undefined && !links.has(launch.credentialsServer)) throw new HostOpError(409, "credentials_link_gone", "The web server that shares its credentials with this session is no longer linked to this host");
@@ -175,7 +186,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     },
     log,
   }).catch(error => { log("omps started from a TUI cannot attach: " + reason(error)); return undefined; });
-  configureHostUpdateSafety(() => drained ? "This host is locally drained for maintenance." : busyReason());
+  configureHostUpdateSafety(() => drained ? "This host is locally drained for maintenance." : busyReason(), { drained: () => drained, sessions: () => channels.size });
   const uploads = new StagedUploads(ack => {
     const link = uploadAttempts.get(ack.id + ":" + ack.attempt);
     link?.queue({ type: "upload_ack", ...ack }, "up:" + ack.id);
@@ -221,7 +232,9 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       recover();
     }
     return { pid: process.pid, version: packageJson.version, protocol: LINK_PROTOCOL_VERSION,
-      linked: !stopped && [...links.values()].some(link => link.isUp()), drained, executable, entrypoint };
+      linked: !stopped && [...links.values()].some(link => link.isUp()),
+      linkedServers: stopped ? [] : [...links.values()].filter(link => link.isUp()).map(link => link.login.url),
+      drained, executable, entrypoint };
   }
   function reportCapacity(): void {
     if (stopped) return;
@@ -309,6 +322,8 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
         ompwebVersion: packageJson.version, ompVersion, platform: process.platform,
         capabilities: ["status", "listSessions", "checkUpdates", "updateSoftware"] }),
       handleRequest: (op, args) => runMaintenance(link, op, args),
+      // A staged candidate that awaits its server's cutover acknowledges its operation here, not on the application link.
+      onState: up => { if (up) void acknowledgeHostUpdateReceipt(LINK_PROTOCOL_VERSION); },
       reload: () => { reconcile(link, true); },
       log,
     });
@@ -444,14 +459,16 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       }
       case "sessionFileExists": return localHost.sessionFileExists(sessionsPath(args.path));
       case "invalidateSessionLists": invalidateWorkspaceRoots(); localHost.invalidateSessionLists(args.path === undefined ? undefined : sessionsPath(args.path)); sessionsChanged(); return;
-      case "checkUpdates":
+      case "checkUpdates": {
         if (args.force !== undefined && typeof args.force !== "boolean") throw new HostOpError(400, "invalid_request", "force must be a boolean");
-        return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true);
+        const releasePin = args.releasePin === undefined ? undefined : validateApprovedReleasePin(args.releasePin);
+        return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true, args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility), releasePin);
+      }
       case "updateSoftware":
         if (args.target !== "ompweb" || typeof args.version !== "string") throw new HostOpError(400, "invalid_request", "Invalid host update");
-        return startHostUpdate(args.target, args.version, updateCompatibility(args.compatibility));
+        return startHostUpdate(args.target, args.version, updateCompatibility(args.compatibility), updateRequest(args));
       case "preparePoolProject": {
-        if (getHostUpdateOperation()?.state === "running") throw new HostUpdateError("host_updating", "This host is updating; new project preparation must wait");
+        if (hostUpdateBlocksNewWork(getHostUpdateOperation())) throw new HostUpdateError("host_updating", "This host is updating; new project preparation must wait");
         preparationsInFlight++;
         try { return await sessionOps.preparePoolProject(args.input as Parameters<typeof sessionOps.preparePoolProject>[0]); }
         finally { preparationsInFlight--; }
@@ -494,6 +511,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   function shutdown(code: number): Promise<void> {
     if (stopping) return stopping;
     stopped = true; watcher.close(); clearTimeout(reloadTimer); clearInterval(sweepTimer); clearInterval(capacityTimer); uploadRetention.stop();
+    clearTimeout(recoveryTimer);
     // Freeze before exit handlers observe children stopping.
     resume.freeze();
     // The configuration first: its requests to a server are aborted at once, so no start waiting on them holds the stop.
@@ -506,8 +524,18 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   let interrupted: HostResumeEntry[] = [];
   try { interrupted = resume.takeRunning(); } catch (error) { log("could not recover interrupted sessions: " + reason(error)); }
   let recovering = false;
+  let recoveryTimer: NodeJS.Timeout | undefined;
   function recover(): Promise<void> | undefined {
     if (drained || stopped || recovering) return;
+    let operation: HostUpdateOperation | null = null;
+    try { operation = getHostUpdateOperation(); }
+    catch (error) { if (!updateStateWarningLogged) log("could not read host update status: " + reason(error)); updateStateWarningLogged = true; }
+    // Keep the claim until the worker finishes; recovery is not permission for concurrent user starts.
+    if (interrupted.length > 0 && hostUpdateBlocksNewWork(operation)) {
+      recoveryTimer ??= setTimeout(() => { recoveryTimer = undefined; recover(); }, 100);
+      recoveryTimer.unref?.();
+      return;
+    }
     recovering = true;
     operationsInFlight++;
     return channels.recover(interrupted).then(failed => resume.retireClaim(channels.running(), failed))

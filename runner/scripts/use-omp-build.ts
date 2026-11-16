@@ -45,8 +45,14 @@ async function fetchBuild({ repo, tag }: Pin, required: string[] = []): Promise<
 	await fs.mkdir(staging);
 	const zip = path.join(staging, "omp-packages.zip");
 	await Bun.write(zip, response);
-	// Windows' bundled tar is bsdtar, which reads zip.
-	run(process.platform === "win32" ? ["tar", "-xf", zip, "-C", staging] : ["unzip", "-q", zip, "-d", staging]);
+	// PATH can select Git Bash's GNU tar, which neither reads zip nor treats drive letters as local paths.
+	if (process.platform === "win32") {
+		const systemRoot = process.env.SystemRoot;
+		if (!systemRoot || !path.isAbsolute(systemRoot)) throw new Error("SystemRoot must identify the Windows directory");
+		run([path.join(systemRoot, "System32", "tar.exe"), "-xf", zip, "-C", staging]);
+	} else {
+		run(["unzip", "-q", zip, "-d", staging]);
+	}
 	await fs.rm(zip);
 	const index: Record<string, string> = await Bun.file(path.join(staging, "index.json")).json();
 	for (const [name, file] of Object.entries(index)) {

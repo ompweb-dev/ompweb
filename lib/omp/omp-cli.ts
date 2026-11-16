@@ -1,6 +1,7 @@
 import { execFile } from "child_process";
 import { existsSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
+import { fileURLToPath } from "node:url";
 import packageJson from "../../package.json";
 import { createChildProcessEnvironment } from "../project-command-env";
 import { getAgentDir } from "./paths";
@@ -20,6 +21,8 @@ let versionProbe: Promise<string | null> | null = null;
 const BIN_NAME = process.platform === "win32" ? "ompweb-omp.exe" : "ompweb-omp";
 /** This platform's runner: `runner/release/<name>` in a source checkout and the asset of that name on each release. */
 export const OMP_RUNNER_ASSET = `ompweb-omp-${process.platform === "win32" ? "windows" : process.platform}-${process.arch}${process.platform === "win32" ? ".exe" : ""}`;
+/** Pinned package updates require this shipped-source capability before executing the candidate. */
+export const OMP_PACKAGED_RUNNER_CAPABILITY = "ompweb-packaged-runner-v1";
 // .cmd/.bat launchers (e.g. OMP_WEB_OMP_BIN pointing at a wrapper script) cannot
 // be spawned directly by Node — spawning them requires a shell. Route them
 // through `cmd.exe /c`; every other platform and binary passes through.
@@ -55,8 +58,16 @@ export function sourceCheckoutOmpBin(): string | null {
 function probeOmpBin(): string | null {
   const override = process.env.OMP_WEB_OMP_BIN;
   if (override) return existsSync(override) ? override : null;
-  const path = sourceCheckoutOmpBin() ?? fetchedOmpBin();
-  return existsSync(path) ? path : null;
+  const source = sourceCheckoutOmpBin();
+  if (source) return existsSync(source) ? source : null;
+  if (typeof Bun !== "undefined" && Bun.isStandaloneExecutable) {
+    const adjacent = fetchedOmpBin();
+    return existsSync(adjacent) ? adjacent : null;
+  }
+  const packaged = join(dirname(dirname(dirname(fileURLToPath(import.meta.url)))), BIN_NAME);
+  if (existsSync(packaged)) return packaged;
+  const fetched = fetchedOmpBin();
+  return existsSync(fetched) ? fetched : null;
 }
 
 /** What every caller that needs omp reports when resolveOmpBin finds none. */
