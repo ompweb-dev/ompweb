@@ -77,7 +77,7 @@ function sessionOrigin(value: Record<string, unknown>): SessionMessageOrigin | n
     || !(session.name === null || typeof session.name === "string") || !optionalString(session.cwd)
     || !optionalString(session.createdAt) || (session.createdAt !== undefined && !Number.isFinite(Date.parse(session.createdAt)))
     || (session.tool !== "send_to_session" && session.tool !== "new_session")
-    || !DELIVERIES[session.delivery as string]) return null;
+    || typeof session.delivery !== "string" || !Object.hasOwn(DELIVERIES, session.delivery)) return null;
   return {
     v: 1,
     kind: "session",
@@ -98,7 +98,7 @@ function sessionOrigin(value: Record<string, unknown>): SessionMessageOrigin | n
 function githubOrigin(value: Record<string, unknown>): GithubMessageOrigin | null {
   const github = value.github;
   if (!record(github) || !nonempty(github.repo) || !Number.isInteger(github.number) || (github.number as number) < 1
-    || !GITHUB_TARGETS[github.target as string] || !validHttpUrl(github.url)
+    || typeof github.target !== "string" || !Object.hasOwn(GITHUB_TARGETS, github.target) || !validHttpUrl(github.url)
     || !Array.isArray(github.events) || github.events.length > 20) return null;
   const events: GithubMessageOrigin["github"]["events"] = [];
   for (const event of github.events) {

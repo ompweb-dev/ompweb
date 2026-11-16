@@ -533,7 +533,6 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
   const imagePayload = Array.isArray(images) && images.length ? JSON.stringify(images) : null;
   const uploadIds = Array.isArray(uploads) ? uploads as string[] : [];
   const uploadPayload = uploadIds.length ? JSON.stringify(uploadIds) : null;
-  const originPayload = origin ? JSON.stringify(origin) : null;
   const digestKey = resolveWebAuthSecret().key;
   const retryDigest = createHmac("sha256", digestKey).update(JSON.stringify([mode, message, imagePayload, uploadPayload])).digest("base64url");
   const resolved = await resolveSessionHostOr404(sessionId);
@@ -551,7 +550,6 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
   const database = db();
   pruneDelivered(database, now - KEEP_DELIVERED_MS);
   const keys = sessionKeys(sessionId);
-  const entryBytes = Buffer.byteLength(JSON.stringify({ id, sessionId, mode, message, images, uploads, origin, state: "waiting_host", createdAt: now })) + 8192;
   let result: AddResult;
   try {
     result = database.transaction((): AddResult => {
@@ -609,7 +607,11 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
         throw new UploadError(409, "outbox_replacement_conflict", "A retry must keep its original mode, message and attachments");
       }
       const savedUploads = uploadReceipts.length ? JSON.stringify(uploadReceipts) : null;
-      const payloadBytes = entryBytes + (savedUploads ? Buffer.byteLength(savedUploads) : 0);
+      const savedOrigin = replaceable ? storedOrigin(replaceable.origin) : origin;
+      const savedOriginPayload = savedOrigin ? JSON.stringify(savedOrigin) : null;
+      const payloadBytes = Buffer.byteLength(JSON.stringify({
+        id, sessionId, mode, message, images, uploads, origin: savedOrigin, state: "waiting_host", createdAt: now,
+      })) + 8192 + (savedUploads ? Buffer.byteLength(savedUploads) : 0);
       const replacedBytes = replaceable?.payload_bytes ?? 0;
       const total = database.prepare(`SELECT COALESCE(SUM(payload_bytes), 0) AS bytes FROM entries WHERE ${entrySessionMatch(keys)} AND state != 'delivered'`).get(...keys, ...keys, ...keys) as { bytes: number };
       if (total.bytes - replacedBytes + payloadBytes > MAX_OUTBOX_BYTES - 64 * 1024) return { kind: "full" };
@@ -622,7 +624,7 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
         uploadPayload,
         entryOwner, advisor ? 1 : 0, now,
         savedUploads,
-        sessionId, retryDigest, payloadBytes, originPayload,
+        sessionId, retryDigest, payloadBytes, savedOriginPayload,
       );
       let retiredRoot = replaceable;
       if (replaceable) retire(replaceable.id, "none", id, retryDigest);

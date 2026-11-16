@@ -2546,8 +2546,8 @@ export class AgentSessionWrapper {
     };
   }
 
-  /** `origin`: the command a caller submitted through `send`; marked once its native message write begins. */
-  private async sendNativeMessageCommand<T = unknown>(command: { type: string; [key: string]: unknown }, timeoutMs?: number, origin?: object): Promise<T> {
+  /** `correlationKey`: the command a caller submitted through `send`; marked once its native message write begins. */
+  private async sendNativeMessageCommand<T = unknown>(command: { type: string; [key: string]: unknown }, timeoutMs?: number, correlationKey?: object): Promise<T> {
     const message = IMAGE_BEARING_COMMANDS.has(command.type);
     const proof = message && !this.messageReplacement && !this.hasPendingMessageCommands()
       ? watchReplacement(this, command, this.nativeQueuedMessages, this.messageCommandGeneration, false,
@@ -2556,13 +2556,13 @@ export class AgentSessionWrapper {
     if (message) {
       this.messageCommandGeneration += 1;
       this.pendingMessageCommands += 1;
-      if (origin) nativeWrites().add(origin);
+      if (correlationKey) nativeWrites().add(correlationKey);
     }
     const generation = this.messageCommandGeneration;
     try {
       const replacement = proof ?? this.messageReplacement;
       const result = await this.proc.sendCommand<T>(command, timeoutMs, message && replacement
-        ? (_ok, id) => replacement.replied(proof ? command : origin ?? command, id)
+        ? (_ok, id) => replacement.replied(proof ? command : correlationKey ?? command, id)
         : undefined);
       if (message && isRecord(result) && result.agentInvoked === false) {
         this.confirmMessageCommandGeneration(generation);
@@ -2599,13 +2599,13 @@ export class AgentSessionWrapper {
     }
     if (mutatesHistory) this.historyMutationPendingCount += 1;
     try {
-      return await this.withPendingCommand(() => this.dispatchCommand(trustedCommand, options?.preserveUnknownDelivery === true));
+      return await this.withPendingCommand(() => this.dispatchCommand(trustedCommand, options?.preserveUnknownDelivery === true, command));
     } finally {
       if (mutatesHistory) this.historyMutationPendingCount -= 1;
     }
   }
 
-  private async dispatchCommand(command: Record<string, unknown>, preserveUnknownDelivery = false): Promise<unknown> {
+  private async dispatchCommand(command: Record<string, unknown>, preserveUnknownDelivery = false, correlationKey: object = command): Promise<unknown> {
     const type = command.type as string;
 
     if (IMAGE_BEARING_COMMANDS.has(type)) {
@@ -2650,7 +2650,7 @@ export class AgentSessionWrapper {
             ...(streamingBehavior ? { streamingBehavior } : {}),
             ...(isClientMessageId(command.clientMessageId) ? { clientMessageId: command.clientMessageId } : {}),
             ...(isRecord(command.origin) ? { origin: command.origin } : {}),
-          }, PROMPT_ACK_TIMEOUT_MS, command);
+          }, PROMPT_ACK_TIMEOUT_MS, correlationKey);
           // Slash commands fully consumed by a builtin report agentInvoked:false
           // in the ack itself — no prompt_result frame follows.
           if (ack?.agentInvoked === false && !streamingBehavior) {
@@ -2698,14 +2698,14 @@ export class AgentSessionWrapper {
         // `steer` has the same collision while a `!!` shell command runs — and
         // there is no live turn to steer anyway, so it joins the follow-up
         // queue like a prompt would.
-        if (type === "steer" && this.bashRunning && !this.streaming) return await this.queueWhileShellRunning(command);
+        if (type === "steer" && this.bashRunning && !this.streaming) return await this.queueWhileShellRunning(command, correlationKey);
         await this.sendNativeMessageCommand({
           type,
           message: command.message as string,
           ...(toImageContents(command.images) ? { images: toImageContents(command.images) } : {}),
           ...(isClientMessageId(command.clientMessageId) ? { clientMessageId: command.clientMessageId } : {}),
           ...(isRecord(command.origin) ? { origin: command.origin } : {}),
-        }, undefined, command);
+        }, undefined, correlationKey);
         return null;
       }
 
@@ -3021,7 +3021,7 @@ export class AgentSessionWrapper {
           const result: unknown = await this.sendNativeMessageCommand(
             command as { type: string },
             type === "predict_word" ? PREDICT_WORD_TIMEOUT_MS : preserveUnknownDelivery && type === "set_thinking_level" ? PROMPT_ACK_TIMEOUT_MS : undefined,
-            command,
+            correlationKey,
           );
           if (type === "set_thinking_level") this.invalidateSessionLists();
           return result ?? null;
@@ -3042,7 +3042,7 @@ export class AgentSessionWrapper {
    * The reply carries the degradation so the client can tell the user their
    * message was queued, not steered.
    */
-  private async queueWhileShellRunning(command: Record<string, unknown>): Promise<unknown> {
+  private async queueWhileShellRunning(command: Record<string, unknown>, correlationKey: object = command): Promise<unknown> {
     const images = toImageContents(command.images);
     await this.sendNativeMessageCommand({
       type: "follow_up",
@@ -3050,7 +3050,7 @@ export class AgentSessionWrapper {
       ...(images ? { images } : {}),
       ...(isClientMessageId(command.clientMessageId) ? { clientMessageId: command.clientMessageId } : {}),
       ...(isRecord(command.origin) ? { origin: command.origin } : {}),
-    }, undefined, command);
+    }, undefined, correlationKey);
     return { queued: true, queue: "followUp", reason: "shellRunning" };
   }
 

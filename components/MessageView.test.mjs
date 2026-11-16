@@ -103,6 +103,36 @@ test("trusted session origins render as left-side source cards with raw text on 
   assert.match(card.textContent, /session id source-session/);
 });
 
+test("trusted origin messages keep their image blocks visible", () => {
+  const view = render(React.createElement(MessageView, {
+    message: {
+      role: "user",
+      content: [
+        { type: "text", text: `${sessionHeader}\n\nSee the screenshot.` },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } },
+      ],
+      origin: sessionOrigin,
+    },
+  }));
+  assert.equal(view.container.querySelector("img")?.getAttribute("src"), "data:image/png;base64,QUJD");
+});
+
+test("origin edit and fork confirmations close when the rendered entry changes", () => {
+  const props = {
+    message: { role: "user", content: `${sessionHeader}\n\nFirst.`, origin: sessionOrigin },
+    entryId: "entry-1",
+    onEdit: async () => true,
+    onFork() {},
+  };
+  const view = render(React.createElement(MessageView, props));
+  fireEvent.click(view.getByRole("button", { name: /edit this message/i }));
+  view.rerender(React.createElement(MessageView, { ...props, entryId: "entry-2" }));
+  assert.equal(view.queryByRole("dialog"), null);
+  fireEvent.click(view.getByRole("button", { name: "Fork a new session from this point" }));
+  view.rerender(React.createElement(MessageView, { ...props, entryId: "entry-3" }));
+  assert.equal(view.queryByRole("dialog"), null);
+});
+
 test("typed origin headers stay ordinary user messages without trusted metadata", () => {
   const view = render(React.createElement(MessageView, {
     message: { role: "user", content: `${sessionHeader}\n\nThis was typed.` },

@@ -31,6 +31,7 @@ import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { CommandTable } from "./commands/types";
 
 type AgentMessage = AgentSession["messages"][number];
+type AgentMessageEnvelope = AgentMessage & { origin?: MessageOrigin };
 
 export const CLIENT_MESSAGE_ENTRY_CUSTOM_TYPE = "client-message-entry";
 export const CLIENT_MESSAGE_RESOLUTION_CUSTOM_TYPE = "client-message-resolution";
@@ -50,7 +51,7 @@ export interface QueuedMessageOrigins {
 }
 
 export interface ClientMessageStatus {
-	messages: { clientMessageId: string; message: AgentMessage }[];
+	messages: { clientMessageId: string; message: AgentMessageEnvelope }[];
 	queuedMessages: { steering: string[]; followUp: string[]; liveSteered: number; clientMessageIds?: QueuedClientMessageIds; messageOrigins?: QueuedMessageOrigins };
 	resolvedClientMessageIds: string[];
 	persistedClientMessageIds: string[];
@@ -278,9 +279,9 @@ class Correlation {
 		return build(messages);
 	}
 
-	withOrigin(message: AgentMessage): AgentMessage {
+	withOrigin(message: AgentMessage): AgentMessageEnvelope {
 		const origin = this.origins.get(message);
-		return origin ? { ...message, origin } as AgentMessage : message;
+		return origin ? { ...message, origin } : message;
 	}
 }
 

@@ -758,9 +758,6 @@ export function getSessionHistoryPage(
           if (message.role === "hookMessage") message.role = "custom";
         }
         if (row.clientMessageId) entry.clientMessageId = row.clientMessageId;
-        if (row.origin && entry.type === "message" && isRecord(entry.message) && entry.message.role === "user") {
-          entry.message = { ...entry.message, origin: row.origin };
-        }
         rawEntries.push(entry);
       }
       if (historyFileVersion(fstatSync(fd)) !== version || historyFileVersion(statSync(filePath)) !== version) {
@@ -779,9 +776,9 @@ export function getSessionHistoryPage(
     context: {
       ...index.metadata,
       entryIds: index.entryIds.slice(start, end),
-      messages: entries.map((entry) => entry.type === "compaction"
+      messages: entries.map((entry, offset) => entry.type === "compaction"
         ? compactionUiMessage(entry, entry.id === index.compactionId)
-        : entryToUiMessage(entry, options)!),
+        : entryToUiMessage(entry, { ...options, origin: index.rows[start + offset]?.origin })!),
     },
   };
   return { history, leafId: index.leafId, tipId: index.tipId };
@@ -1205,7 +1202,7 @@ function compactionUiMessage(entry: CompactionEntry, active: boolean): CustomMes
 // Returns null for entries that do not map to chat history (metadata, non-message types).
 export function entryToUiMessage(
   entry: SessionEntry,
-  options: { deferThinking?: boolean; deferToolResultImages?: boolean },
+  options: { deferThinking?: boolean; deferToolResultImages?: boolean; origin?: MessageOrigin },
 ): AgentMessage | null {
   switch (entry.type) {
     case "message": {
@@ -1213,7 +1210,9 @@ export function entryToUiMessage(
       // object is missing; skip them like any other unmappable entry instead
       // of crashing every reader of the file.
       if (!isRecord(entry.message)) return null;
-      const raw = isClientMessageId(entry.clientMessageId) ? { ...entry.message, clientMessageId: entry.clientMessageId } : entry.message;
+      const nativeMessage = { ...entry.message };
+      delete (nativeMessage as Record<string, unknown>).origin;
+      const raw = isClientMessageId(entry.clientMessageId) ? { ...nativeMessage, clientMessageId: entry.clientMessageId } : nativeMessage;
       // omp-only roles are folded into displayable custom messages so the
       // existing role-keyed UI renders them without new components.
       if (raw.role === "developer") {
@@ -1261,14 +1260,15 @@ export function entryToUiMessage(
         ? toolResultImagesAsUrls(normalizeToolCalls(raw))
         : normalizeToolCalls(raw);
       const message = stripToolResultDetails(normalized);
-      if (!options.deferThinking || message.role !== "assistant") return withNormalizedTimestamp(message);
+      const displayMessage = options.origin && message.role === "user" ? { ...message, origin: options.origin } : message;
+      if (!options.deferThinking || displayMessage.role !== "assistant") return withNormalizedTimestamp(displayMessage);
       // Guard like the loader does for bad lines: normalizeToolCalls passes
       // non-array content through unchanged, so a string-content assistant
       // entry must not 500 the whole context route.
-      if (!Array.isArray(message.content)) return withNormalizedTimestamp(message);
+      if (!Array.isArray(displayMessage.content)) return withNormalizedTimestamp(displayMessage);
       const deferred = {
-        ...message,
-        content: message.content.map((block) => (
+        ...displayMessage,
+        content: displayMessage.content.map((block) => (
           block.type === "thinking" && typeof block.thinking === "string" && block.thinking.trim() !== ""
             ? { ...block, thinking: "", deferred: true }
             : block

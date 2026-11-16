@@ -3026,6 +3026,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     color: "var(--text-muted)",
                   }}
                 >
+                  {firstQueued?.origin?.kind === "session" && firstQueued.origin.session
+                    ? `[From ${firstQueued.origin.session.name?.trim() || "Untitled session"}] `
+                    : firstQueued?.origin?.kind === "github" && firstQueued.origin.github
+                      ? `[${firstQueued.origin.github.repo}#${firstQueued.origin.github.number}] `
+                      : ""}
                   {firstQueued?.text}
                 </span>
                 <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={handleQueuedEdit} title={t("chatInput.queuedEditTitle")}>
