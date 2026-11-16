@@ -7,11 +7,13 @@ import { buildAvailableSlashCommands } from "@oh-my-pi/pi-coding-agent/slash-com
 import { calculateTokensPerSecond } from "@oh-my-pi/pi-coding-agent/utils/token-rate";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { CommandTable, FrameTable } from "./types";
+import { queuedMessageOrigins } from "../correlation";
 
 // shortcut: RPC's get_state first awaits its goal controller and counts a scheduled goal turn as unsettled;
 // that controller is RPC transport state, so add it here when the runner ports goals.
 export function sessionState(session: AgentSession) {
 	const queued = session.getQueuedMessages();
+	const messageOrigins = queuedMessageOrigins(session);
 	return {
 		model: session.model,
 		thinkingLevel: session.thinkingLevel,
@@ -31,6 +33,7 @@ export function sessionState(session: AgentSession) {
 			steering: [...queued.steering],
 			followUp: [...queued.followUp],
 			liveSteered: queued.liveSteered,
+			...(messageOrigins ? { messageOrigins } : {}),
 		},
 		todoPhases: session.getTodoPhases(),
 		fastModeEnabled: session.isFastModeEnabled(),

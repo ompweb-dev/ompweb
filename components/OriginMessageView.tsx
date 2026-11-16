@@ -111,7 +111,7 @@ export function OriginMessageView({
               })}
             </div>
           )}
-          <div data-message-text><MarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile} sourceSessionId={sessionId}>{showRaw ? raw : body}</MarkdownBody></div>
+          <div data-message-text data-entry-id={entryId}><MarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile} sourceSessionId={sessionId}>{showRaw ? raw : body}</MarkdownBody></div>
         </div>
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end", gap: 6, padding: "3px 10px 7px" }}>
           {entryId && onEdit && (

@@ -11,6 +11,7 @@ import {
 	stampClientMessageId,
 	submitCorrelated,
 } from "../src/correlation";
+import { sessionState } from "../src/commands/model";
 import { createTestSession, type TestSession } from "./harness";
 
 let test: TestSession | undefined;
@@ -108,6 +109,7 @@ describe("client message correlation", () => {
 		expect(status.queuedMessages.clientMessageIds?.followUp).toEqual(["queued-1"]);
 		expect(status.queuedMessages.messageOrigins?.followUp).toEqual([ORIGIN]);
 		expect(status.unresolvedClientMessageIds).toEqual([]);
+		expect(sessionState(session).queuedMessages.messageOrigins?.followUp).toEqual([ORIGIN]);
 
 		await run;
 		await session.waitForIdle();

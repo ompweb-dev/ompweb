@@ -97,6 +97,7 @@ test("trusted session origins render as left-side source cards with raw text on 
   assert.match(card.textContent, /Check the failed build/);
   assert.doesNotMatch(card.textContent, /session id source-session/);
   assert.match(view.getByRole("link", { name: /Open session Incident review/ }).getAttribute("href"), /session=source-session/);
+  assert.ok(card.querySelector('[data-message-text][data-entry-id="entry-1"]'));
   view.getByRole("button", { name: /edit this message/i });
   view.getByRole("button", { name: "Fork a new session from this point" });
   fireEvent.click(view.getByRole("button", { name: "Show raw message" }));
