@@ -139,21 +139,55 @@ test("held automated messages identify their source before delivery", () => {
   assert.match(html, /From .*Incident review/);
 });
 
-test("cross-session tool rows use the returned session name instead of its UUID", () => {
-  const result = {
-    role: "toolResult",
-    toolCallId: "send-1",
-    content: [{ type: "text", text: JSON.stringify({ accepted: true, targetSessionId: "target-uuid", targetSessionName: "Deploy", delivery: "followUp" }) }],
-  };
-  const html = renderToStaticMarkup(React.createElement(MessageView, {
+test("cross-session tool rows link the named target and show every delivery state", () => {
+  const targetSession = { id: "target-uuid", name: "Deploy", hostId: "worker", hostLabel: "Worker 1", cwd: "/srv/app" };
+  const cases = [
+    ["Accepted", { accepted: true, targetSessionId: "target-uuid", targetSessionName: "Deploy", targetSession, delivery: "followUp", waited: false }],
+    ["Response received", { accepted: true, targetSessionId: "target-uuid", targetSessionName: "Deploy", targetSession, delivery: "followUp", waited: true, responseText: "Done" }],
+    ["Declined", { accepted: false, declined: true, targetSessionId: "target-uuid", targetSessionName: "Deploy", targetSession, delivery: "followUp", waited: false }],
+  ];
+  for (const [state, payload] of cases) {
+    const result = { role: "toolResult", toolCallId: "send-1", content: [{ type: "text", text: JSON.stringify(payload) }] };
+    const view = render(React.createElement(MessageView, {
+      message: {
+        role: "assistant", model: "m", provider: "p",
+        content: [{ type: "toolCall", toolCallId: "send-1", toolName: "send_to_session", input: { sessionId: "target-uuid", message: "Run checks", delivery: "followUp" } }],
+      },
+      toolResults: new Map([["send-1", result]]),
+    }));
+    assert.match(view.container.textContent, new RegExp(state));
+    assert.match(view.getByRole("link", { name: "Open session Deploy on Worker 1" }).getAttribute("href"), /session=target-uuid/);
+    view.unmount();
+  }
+  const failed = render(React.createElement(MessageView, {
     message: {
       role: "assistant", model: "m", provider: "p",
-      content: [{ type: "toolCall", toolCallId: "send-1", toolName: "send_to_session", input: { sessionId: "target-uuid", message: "Run checks", delivery: "followUp" } }],
+      content: [{ type: "toolCall", toolCallId: "send-1", toolName: "send_to_session", input: { sessionId: "target-uuid", message: "Run checks" } }],
     },
-    toolResults: new Map([["send-1", result]]),
+    toolResults: new Map([["send-1", { role: "toolResult", toolCallId: "send-1", isError: true, content: [{ type: "text", text: "boom" }] }]]),
   }));
-  assert.match(html, /To Deploy/);
-  assert.doesNotMatch(html, /target-uuid/);
+  assert.match(failed.container.textContent, /Failed/);
+  failed.unmount();
+});
+
+test("a pending cross-session tool row resolves and links its current target name", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => String(input).startsWith("/api/hosts")
+    ? Response.json({ hosts: [{ id: "worker", label: "Worker 1" }] })
+    : Response.json({ sessions: [{ id: "target-uuid", name: "Deploy", hostId: "worker", cwd: "/srv/app", created: "2026-11-15T12:41:00.000Z" }] });
+  try {
+    const view = render(React.createElement(MessageView, {
+      message: {
+        role: "assistant", model: "m", provider: "p",
+        content: [{ type: "toolCall", toolCallId: "send-1", toolName: "send_to_session", input: { sessionId: "target-uuid", message: "Run checks" } }],
+      },
+    }));
+    assert.match(view.container.textContent, /Sending/);
+    await waitFor(() => view.getByRole("link", { name: "Open session Deploy on Worker 1" }));
+    view.unmount();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 // Plain Copy needs the browser's layout-aware innerText (not implemented by

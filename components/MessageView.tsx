@@ -20,6 +20,8 @@ import { TaskResultPanel } from "./MessageView-task-panel";
 import { HubResultPanel } from "./MessageView-hub-panel";
 import { OriginMessageView } from "./OriginMessageView";
 import { SessionLink } from "./SessionLink";
+import { resolveSessionRef } from "@/lib/session-names";
+import type { SessionOriginRef } from "@/lib/message-origin";
 import { isMessageOverflowing } from "@/lib/message-overflow";
 import { getResultDiff, PairedDiffResult, PairedResult } from "./MessageView-diff-view";
 import {
@@ -1158,12 +1160,31 @@ const ToolCallBlock = memo(function ToolCallBlock({
         }
       })()
     : null;
-  const agentTargetName = typeof agentToolResult?.targetSessionName === "string"
-    ? agentToolResult.targetSessionName
-    : typeof agentToolResult?.sessionName === "string" ? agentToolResult.sessionName : null;
-  const agentTool = block.toolName === "send_to_session"
-    ? agentTargetName ? `To ${agentTargetName}` : "Send to session"
-    : block.toolName === "new_session" ? agentTargetName ? `Started ${agentTargetName}` : "Start session" : null;
+  const resultSession = agentToolResult?.targetSession ?? agentToolResult?.session;
+  const resultTarget: SessionOriginRef | null = resultSession && typeof resultSession === "object"
+    && typeof (resultSession as Record<string, unknown>).id === "string"
+    && typeof (resultSession as Record<string, unknown>).hostId === "string"
+    && typeof (resultSession as Record<string, unknown>).hostLabel === "string"
+    ? resultSession as SessionOriginRef : null;
+  const targetId = block.toolName === "send_to_session" && typeof block.input.sessionId === "string"
+    ? block.input.sessionId : null;
+  const [resolvedTarget, setResolvedTarget] = useState<SessionOriginRef | null>(null);
+  useEffect(() => {
+    if (!targetId || resultTarget || result) return;
+    let current = true;
+    void resolveSessionRef(targetId).then((session) => { if (current) setResolvedTarget(session); }, () => {});
+    return () => { current = false; };
+  }, [targetId, resultTarget?.id, result]);
+  const agentTarget = resultTarget ?? resolvedTarget;
+  const agentState = block.toolName === "send_to_session" || block.toolName === "new_session"
+    ? !result ? "Sending"
+      : result?.isError === true ? "Failed"
+      : agentToolResult?.declined === true ? "Declined"
+      : agentToolResult?.waited === true ? "Response received" : "Accepted"
+    : null;
+  const agentTool = agentState
+    ? `${agentState}${agentTarget ? ` · ${block.toolName === "send_to_session" ? "To" : "Started"} ${agentTarget.name?.trim() || "Untitled session"}` : ""}`
+    : null;
   const agentPreview = agentTool
     ? typeof block.input.message === "string" ? block.input.message
       : typeof block.input.prompt === "string" ? block.input.prompt : ""
@@ -1312,6 +1333,11 @@ const ToolCallBlock = memo(function ToolCallBlock({
             }}
           />
         </CollapsibleTrigger>
+        {agentTarget && (
+          <div style={{ padding: "2px 10px 4px 36px", color: "var(--text-dim)", fontSize: 11 }}>
+            {block.toolName === "send_to_session" ? "Target " : "Session "}<SessionLink session={agentTarget} />
+          </div>
+        )}
         {resultMeta && <div className="activity-row-secondary">{resultMeta}</div>}
         {passiveContextText && !expanded && (
           <div className="activity-row-secondary" title={passiveContextText}>

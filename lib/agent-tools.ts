@@ -133,10 +133,17 @@ export interface AgentToolDeliverResult {
   targetSessionId: string;
   delivery: "prompt" | "steer" | "followUp";
   targetSessionName?: string | null;
+  targetSession?: SessionOriginRef | null;
   /** True only when wait was requested and the turn actually finished. */
   waited: boolean;
   /** Final assistant text of the waited turn, or null when wait was false. */
   responseText: string | null;
+}
+
+export interface AgentToolCreateSessionResult {
+  sessionId: string;
+  sessionName: string | null;
+  session: SessionOriginRef;
 }
 
 /** Session operations supplied by lib/rpc-manager; fakes replace them in tests. */
@@ -144,7 +151,7 @@ export interface AgentToolSessionOps {
   listSessions(): Promise<AgentToolSessionRow[]>;
   listHosts(): AgentToolHost[];
   /** Authorize the actual physical owner before any preparation or spawn. */
-  createSession(input: AgentToolCreateSessionInput, authorize: (host: AgentToolHost) => Promise<boolean>): Promise<{ sessionId: string; sessionName: string | null }>;
+  createSession(input: AgentToolCreateSessionInput, authorize: (host: AgentToolHost) => Promise<boolean>): Promise<AgentToolCreateSessionResult>;
   deliver(input: AgentToolDeliverInput): Promise<AgentToolDeliverResult>;
   /** The host a session lives on; null when no host has it. */
   sessionHostId(sessionId: string): Promise<string | null>;
@@ -392,27 +399,44 @@ export async function executeAgentTool(
     const host = resolveHost(ops.listHosts(), requestedHost ?? ctx.sourceHostId);
     if (shareWorkspace && host.id !== ctx.sourceHostId) throw new Error("shareWorkspace requires the calling session's host.");
     const origin = prompt ? sessionOrigin(ctx, "new_session", "prompt") : undefined;
-    const created = await ops.createSession({
-      cwd,
-      hostId: host.id,
-      explicitHost: requestedHost !== undefined,
-      shareWorkspace,
-      prompt: prompt && origin ? `${formatSessionOriginHeader(origin)}\n\n${prompt}` : null,
-      ...(prompt && origin ? { clientMessageId: randomUUID(), origin } : {}),
-      provider,
-      modelId,
-      name,
-    }, async (target) => startsUnasked(target, ctx.sourceHostId) || ctx.confirm(
-      `Start a session on ${target.label} in ${cwd}?`,
-      {
-        kind: "new_session",
-        from: sourceRef(ctx),
-        host: { id: target.id, label: target.label },
+    let declined = false;
+    let declinedHost: AgentToolHost | undefined;
+    let created: AgentToolCreateSessionResult;
+    try {
+      created = await ops.createSession({
         cwd,
-        name: name ?? null,
-        message: prompt ?? null,
-      },
-    ));
+        hostId: host.id,
+        explicitHost: requestedHost !== undefined,
+        shareWorkspace,
+        prompt: prompt && origin ? `${formatSessionOriginHeader(origin)}\n\n${prompt}` : null,
+        ...(prompt && origin ? { clientMessageId: randomUUID(), origin } : {}),
+        provider,
+        modelId,
+        name,
+      }, async (target) => {
+        if (startsUnasked(target, ctx.sourceHostId)) return true;
+        const allowed = await ctx.confirm(`Start a session on ${target.label} in ${cwd}?`, {
+          kind: "new_session",
+          from: sourceRef(ctx),
+          host: { id: target.id, label: target.label },
+          cwd,
+          name: name ?? null,
+          message: prompt ?? null,
+        });
+        if (!allowed) {
+          declined = true;
+          declinedHost = target;
+        }
+        return allowed;
+      });
+    } catch (error) {
+      if (!declined) throw error;
+      const target = declinedHost ?? host;
+      return {
+        accepted: false, declined: true, sessionId: null, sessionName: null,
+        hostId: target.id, hostLabel: target.label, cwd,
+      };
+    }
     ctx.guard.setDepth(created.sessionId, depth);
     return created;
   }
@@ -434,27 +458,33 @@ export async function executeAgentTool(
   const targetHostId = ctx.sourceHostId === "local" ? targetSession?.hostId : await ops.sessionHostId(sessionId);
   if (ctx.sourceHostId !== "local" && !targetHostId) throw new Error(`Session not found: ${sessionId}`);
   const targetHost = targetHostId ? hosts.find((host) => host.id === targetHostId) : undefined;
+  const targetRef = targetSession && targetHostId ? {
+    id: targetSession.id,
+    name: targetSession.name ?? null,
+    hostId: targetHostId,
+    hostLabel: targetHost?.label ?? targetHostId,
+    ...(targetSession.cwd ? { cwd: targetSession.cwd } : {}),
+  } : null;
   // A remote agent reaching a session on another machine asks first, as new_session does.
   if (ctx.sourceHostId !== "local" && targetHostId !== ctx.sourceHostId
     && !(targetHost && startsUnasked(targetHost, ctx.sourceHostId))) {
     const sourceLabel = hosts.find((host) => host.id === ctx.sourceHostId)?.label ?? ctx.sourceHostLabel;
-    if (!(await ctx.confirm(
+    const allowed = await ctx.confirm(
       `Send a message from a session on ${sourceLabel} to session ${sessionId} on ${targetHost?.label ?? targetHostId}?`,
       {
         kind: "send_to_session",
         from: sourceRef(ctx),
-        to: targetSession && targetHostId ? {
-          id: targetSession.id,
-          name: targetSession.name ?? null,
-          hostId: targetHostId,
-          hostLabel: targetHost?.label ?? targetHostId,
-          ...(targetSession.cwd ? { cwd: targetSession.cwd } : {}),
-        } : null,
+        to: targetRef,
         delivery,
         message,
       },
-    ))) {
-      throw new Error(`The user declined to send a message to session ${sessionId}.`);
+    );
+    if (!allowed) {
+      return {
+        accepted: false, declined: true, targetSessionId: sessionId,
+        targetSessionName: targetSession?.name ?? null, targetSession: targetRef,
+        delivery, waited: false, responseText: null,
+      };
     }
   }
   const origin = sessionOrigin(ctx, "send_to_session", delivery);
@@ -468,5 +498,5 @@ export async function executeAgentTool(
     waitTimeoutMs,
   });
   ctx.guard.setDepth(sessionId, depth);
-  return { ...result, targetSessionName: targetSession?.name ?? null };
+  return { ...result, targetSessionName: targetSession?.name ?? null, targetSession: targetRef };
 }

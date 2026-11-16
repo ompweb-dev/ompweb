@@ -3476,7 +3476,15 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
             await session.withPendingCommand(() => initialize(session, true, promptId), true);
             return { sessionId: realSessionId, sessionName: input.name ?? null };
           }, authorizeHost);
-          return { sessionId: result.sessionId, sessionName: input.name ?? null };
+          const placedHost = getHost(result.hostId);
+          return {
+            sessionId: result.sessionId,
+            sessionName: input.name ?? null,
+            session: {
+              id: result.sessionId, name: input.name ?? null, hostId: result.hostId,
+              hostLabel: placedHost?.label ?? result.hostId, cwd: result.cwd,
+            },
+          };
         }
       }
       // Standalone/shared creations have no durable admission identity and cannot safely be replayed.
@@ -3497,7 +3505,11 @@ function createAgentToolOps(source: AgentToolContext, replaying: boolean): Agent
         if (!(error instanceof WebRpcError && error.code === "host_offline")) await session.destroyAndWait();
         throw error;
       }
-      return { sessionId: realSessionId, sessionName: input.name ?? null };
+      return {
+        sessionId: realSessionId,
+        sessionName: input.name ?? null,
+        session: { id: realSessionId, name: input.name ?? null, hostId: host.id, hostLabel: host.label, cwd: input.cwd },
+      };
     },
 
     async deliver(input): Promise<AgentToolDeliverResult> {
