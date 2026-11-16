@@ -38,7 +38,7 @@ import { getFileApiUrl, getFileName, getRelativeFilePath, joinFilePath } from "@
 import { normalizeLocalPath } from "@/lib/file-links";
 import type { WorkspaceFileSource } from "@/lib/workspace-types";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
-import { getInitialNavigation, sameSessionTarget, sessionNavigationUrl } from "@/lib/initial-navigation";
+import { findSessionTarget, getInitialNavigation, sameSessionTarget, sessionNavigationUrl } from "@/lib/initial-navigation";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { foldedHostProjectKey, hostProjectKey, LOCAL_HOST_ID, remoteHostId, projectIdentity, projectTargetId } from "@/lib/project-ordering";
 import { isClusterTarget } from "@/lib/hosts/cluster";
@@ -680,14 +680,20 @@ export function AppShell({ appName }: { appName: string }) {
   const [sessionStats, setSessionStats] = useState<SessionStatsInfo | null>(null);
   const [autoNameStatus, setAutoNameStatus] = useState<AutoNameStatus>({ kind: "idle" });
   const autoNameTimerRef = useRef<TimerHandle | undefined>(undefined);
-  const activeSessionIdRef = useRef<string | null>(selectedSession?.id ?? null);
+  const activeSelectedSessionId = selectedSession?.id ?? null;
+  const activeSelectedSessionHostId = selectedSession?.hostId;
+  const activeSessionIdRef = useRef<string | null>(activeSelectedSessionId);
+  const activeSessionTargetRef = useRef<{ id: string; hostId?: string } | null>(
+    activeSelectedSessionId ? { id: activeSelectedSessionId, hostId: activeSelectedSessionHostId } : null,
+  );
   const activeSettingsTabRef = useRef(settingsTab);
   const archiveRetryTimerRef = useRef<TimerHandle | undefined>(undefined);
   useEffect(() => () => clearTimeout(archiveRetryTimerRef.current), []);
   useLayoutEffect(() => {
-    activeSessionIdRef.current = selectedSession?.id ?? null;
+    activeSessionIdRef.current = activeSelectedSessionId;
+    activeSessionTargetRef.current = activeSelectedSessionId ? { id: activeSelectedSessionId, hostId: activeSelectedSessionHostId } : null;
     activeSettingsTabRef.current = settingsTab;
-  }, [selectedSession?.id, settingsTab]);
+  }, [activeSelectedSessionId, activeSelectedSessionHostId, settingsTab]);
   const handleSessionStatsChange = useCallback((stats: SessionStatsInfo | null) => {
     setSessionStats(stats);
   }, []);
@@ -1380,13 +1386,14 @@ export function AppShell({ appName }: { appName: string }) {
   // server-computed projectRoot, which the same-project check in
   // handleCwdChange relies on. Hydrate it from the session list so switching
   // worktrees right after creating a session doesn't close the chat.
-  const hydrateSelectedSession = useCallback((sessionId: string) => {
+  const hydrateSelectedSession = useCallback((sessionId: string, hostId?: string) => {
+    const target = { id: sessionId, hostId };
     void fetch("/api/sessions")
       .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[] }>) : null))
       .then((d) => {
-        const full = d?.sessions.find((s) => s.id === sessionId);
+        const full = findSessionTarget(d?.sessions ?? [], target);
         if (!full) return;
-        setSelectedSession((prev) => (prev && prev.id === sessionId && (!prev.projectRoot || prev.path === "") ? full : prev));
+        setSelectedSession((prev) => (prev && sameSessionTarget(prev, target) && (!prev.projectRoot || prev.path === "") ? full : prev));
       })
       .catch(() => {});
   }, []);
@@ -1397,20 +1404,22 @@ export function AppShell({ appName }: { appName: string }) {
     setNewSessionPoolProject(null);
     setSelectedSession(session);
     setRefreshKey((k) => k + 1);
-    hydrateSelectedSession(session.id);
-    router.replace(`?session=${encodeURIComponent(session.id)}`);
+    hydrateSelectedSession(session.id, session.hostId);
+    router.replace(sessionNavigationUrl(session));
   }, [router, hydrateSelectedSession]);
 
   const handleSessionMoved = useCallback((oldId: string, newId: string) => {
     if (activeSessionIdRef.current !== oldId) return;
+    const hostId = activeSelectedSessionHostId;
     activeSessionIdRef.current = newId;
-    setSelectedSession((current) => current?.id === oldId ? { ...current, id: newId, path: "" } : current);
+    activeSessionTargetRef.current = { id: newId, hostId };
+    setSelectedSession((current) => current && sameSessionTarget(current, { id: oldId, hostId }) ? { ...current, id: newId, path: "" } : current);
     setRefreshKey((key) => key + 1);
-    hydrateSelectedSession(newId);
+    hydrateSelectedSession(newId, hostId);
     // This is the same conversation. Preserve ChatWindow's run/edit fences
     // and its mounted composer, including unfinished attachments and audio.
-    router.replace(`?session=${encodeURIComponent(newId)}`);
-  }, [router, hydrateSelectedSession]);
+    router.replace(sessionNavigationUrl({ id: newId, hostId }));
+  }, [router, hydrateSelectedSession, activeSelectedSessionHostId]);
 
   const handleAgentEnd = useCallback(() => {
     setRefreshKey((k) => k + 1);
@@ -1446,8 +1455,9 @@ export function AppShell({ appName }: { appName: string }) {
   useNotifications({ sessionId: settingsTab ? null : selectedSession?.id ?? null, locale, onOpenSession: openSessionById });
 
   const handleAutoName = useCallback(async () => {
-    const sessionId = selectedSession?.id;
-    if (!sessionId || autoNameStatus.kind === "naming") return;
+    if (!activeSelectedSessionId || autoNameStatus.kind === "naming") return;
+    const sessionId = activeSelectedSessionId;
+    const sessionTarget = { id: sessionId, hostId: activeSelectedSessionHostId };
     clearTimeout(autoNameTimerRef.current);
     setActiveTopPanel(null);
     setAutoNameStatus({ kind: "naming" });
@@ -1462,24 +1472,24 @@ export function AppShell({ appName }: { appName: string }) {
       }
 
       const title = body.title.trim();
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (!activeSessionTargetRef.current || !sameSessionTarget(activeSessionTargetRef.current, sessionTarget)) return;
       setRefreshKey((key) => key + 1);
-      setSelectedSession((current) => current?.id === sessionId ? { ...current, name: title } : current);
+      setSelectedSession((current) => current && sameSessionTarget(current, sessionTarget) ? { ...current, name: title } : current);
       setSessionStats((current) => current?.sessionId === sessionId ? { ...current, sessionName: title } : current);
       setAutoNameStatus({ kind: "success" });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 1800);
     } catch (error) {
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (!activeSessionTargetRef.current || !sameSessionTarget(activeSessionTargetRef.current, sessionTarget)) return;
       const message = error instanceof Error ? error.message : String(error);
       setAutoNameStatus({ kind: "error", message });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 5000);
     }
-  }, [autoNameStatus.kind, selectedSession?.id]);
+  }, [autoNameStatus.kind, activeSelectedSessionId, activeSelectedSessionHostId]);
 
   useEffect(() => {
     clearTimeout(autoNameTimerRef.current);
     setAutoNameStatus({ kind: "idle" });
-  }, [selectedSession?.id]);
+  }, [activeSelectedSessionId, activeSelectedSessionHostId]);
 
   const handleExplorerRefresh = useCallback(() => {
     setExplorerRefreshing(true);
@@ -1491,6 +1501,7 @@ export function AppShell({ appName }: { appName: string }) {
   }, []);
 
   const handleSessionForked = useCallback((newSessionId: string) => {
+    const hostId = activeSelectedSessionHostId;
     setRefreshKey((k) => k + 1);
     setSessionKey((k) => k + 1);
     setNewSessionCwd(null);
@@ -1502,9 +1513,9 @@ export function AppShell({ appName }: { appName: string }) {
       // fork shows up immediately instead of waiting for a refresh.
       path: "",
     }));
-    hydrateSelectedSession(newSessionId);
-    router.replace(`?session=${encodeURIComponent(newSessionId)}`);
-  }, [router, hydrateSelectedSession]);
+    hydrateSelectedSession(newSessionId, hostId);
+    router.replace(sessionNavigationUrl({ id: newSessionId, hostId }));
+  }, [router, hydrateSelectedSession, activeSelectedSessionHostId]);
 
   const handleSessionDeleted = useCallback((sessionId: string) => {
     // The composer for this session can never be reopened, so its draft would

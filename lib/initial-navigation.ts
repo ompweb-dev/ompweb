@@ -32,3 +32,10 @@ export function sameSessionTarget(left: SessionTarget, right: SessionTarget): bo
 export function sessionNavigationUrl(session: SessionTarget): string {
   return `?session=${encodeURIComponent(session.id)}&host=${encodeURIComponent(session.hostId ?? "local")}`;
 }
+
+export function findSessionTarget<T extends SessionTarget>(
+  sessions: readonly T[],
+  target: SessionTarget,
+): T | undefined {
+  return sessions.find((session) => sameSessionTarget(session, target));
+}
