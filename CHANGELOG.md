@@ -23,6 +23,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 - **Windows update status publication tolerates brief file-sharing conflicts.** Atomic replacement retries sharing-related errors for at most one second without deleting the prior state. Persistent failures still stop the update and report the error.
 - **Local-host startup ignores unrelated services.** Installation paths match at directory boundaries, and daemon detection distinguishes the host subcommand from directory names or server argument values.
 - **Open live subagent transcripts without waiting forever.** Transcript pages now read the subagent's on-disk artifact directly instead of waiting for its busy agent process to answer first.
+- **Make cross-session message approval coherent across a cluster.** Choose whether every `send_to_session` call asks first, or sessions may message any session within the cluster without asking.
 
 ### Added
 

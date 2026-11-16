@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
+import { readFile } from "node:fs/promises";
 import { resolve } from "path";
 import { getAgentDir } from "./omp/paths";
 import { BROWSER_TRANSPORTS, type BrowserTransport, type BrowserTransportState } from "./event-stream-protocol";
@@ -9,6 +10,8 @@ import { isRecord } from "./type-guards";
 export type GithubActionsOperation = "dispatch" | "cancel" | "rerun";
 export type GithubActionsPermission = "deny" | "ask" | "allow";
 export type GithubActionsPermissions = Record<GithubActionsOperation, GithubActionsPermission>;
+
+export type AgentMessagePermission = "alwaysAsk" | "trustCluster";
 
 /** omp-web's own server-side settings (omp's config.yml stays omp's). */
 export interface WebServerSettings {
@@ -22,6 +25,8 @@ export interface WebServerSettings {
    * or SSE reconnect).
    */
   agentToolsEnabled: boolean;
+  /** Approval policy for send_to_session calls. */
+  agentMessagePermission: AgentMessagePermission;
   /** The GitHub agent tools may post and resolve threads as the server's `gh` account without asking the user each time. */
   githubWritesUnasked: boolean;
   /** Per-operation approval policy for GitHub Actions mutations. */
@@ -41,6 +46,7 @@ export interface WebServerSettings {
 const DEFAULTS: WebServerSettings = {
   autoResumeSessions: false,
   agentToolsEnabled: false,
+  agentMessagePermission: "alwaysAsk",
   githubWritesUnasked: false,
   githubActionsPermissions: { dispatch: "ask", cancel: "ask", rerun: "ask" },
   agentEnv: {},
@@ -94,6 +100,7 @@ function normalizeSettings(raw: Record<string, unknown>): WebServerSettings {
   return {
     autoResumeSessions: raw.autoResumeSessions === true,
     agentToolsEnabled: raw.agentToolsEnabled === true,
+    agentMessagePermission: raw.agentMessagePermission === "trustCluster" ? "trustCluster" : "alwaysAsk",
     githubWritesUnasked: raw.githubWritesUnasked === true,
     githubActionsPermissions: readGithubActionsPermissions(raw.githubActionsPermissions),
     agentEnv: readAgentEnvRecord(raw.agentEnv),
@@ -148,6 +155,14 @@ export function loadWebServerSettings(): WebServerSettings {
 /** Fresh permission gates for shared-agent-dir decisions; neither reader touches the process cache. */
 export function readAgentToolsEnabledFromDisk(): boolean {
   return freshSettingsRecord()?.agentToolsEnabled === true;
+}
+
+export async function readAgentMessagePermissionFromDisk(): Promise<AgentMessagePermission> {
+  try {
+    return parseSettingsRecord(await readFile(settingsPath(), "utf8")).agentMessagePermission === "trustCluster" ? "trustCluster" : "alwaysAsk";
+  } catch {
+    return "alwaysAsk";
+  }
 }
 
 export function readGithubWritesUnaskedFromDisk(): boolean {

@@ -2,6 +2,7 @@ import type { HostToolDefinition } from "./pi-types";
 import { isRecord } from "./type-guards";
 import { startsUnasked, type AgentToolHost } from "./agent-tool-hosts";
 import { GITHUB_TOOL_DEFINITIONS, GITHUB_TOOL_NAMES, executeGithubTool, type GithubToolOps } from "./github/tools";
+import type { AgentMessagePermission } from "./web-settings";
 
 /**
  * Server-side agent tools for issue #275: tools an agent running inside
@@ -114,6 +115,8 @@ export interface AgentToolCreateSessionInput {
 
 export interface AgentToolDeliverInput {
   sessionId: string;
+  /** Host whose approval policy was checked before delivery. */
+  hostId: string;
   /** Already sender-attributed by executeAgentTool. */
   message: string;
   delivery: "prompt" | "steer" | "followUp";
@@ -151,6 +154,10 @@ export interface AgentToolContext {
   sourceCwd: string;
   /** The host the calling session runs on; "local" is this machine. */
   sourceHostId: string;
+  /** Whether every send asks, or messages within the cluster are trusted. */
+  messagePermission: AgentMessagePermission;
+  /** Physical hosts in the first pool. */
+  clusterHostIds: ReadonlySet<string>;
   /** The off-by-default Settings gate (lib/web-settings agentToolsEnabled). */
   enabled: boolean;
   guard: AgentToolGuard;
@@ -365,6 +372,7 @@ export async function executeAgentTool(
     const requestedHost = optionalString(record, "host");
     const host = resolveHost(ops.listHosts(), requestedHost ?? ctx.sourceHostId);
     if (shareWorkspace && host.id !== ctx.sourceHostId) throw new Error("shareWorkspace requires the calling session's host.");
+    if (ctx.signal?.aborted) throw new Error("The agent tool call was cancelled before a session was started.");
     const created = await ops.createSession({
       cwd,
       hostId: host.id,
@@ -390,21 +398,26 @@ export async function executeAgentTool(
   const delivery = parseDelivery(record);
   const { wait, waitTimeoutMs } = parseWait(record);
   const depth = ctx.guard.checkChainDepth(ctx.sourceSessionId);
-  // A remote agent reaching a session on another machine asks first, as new_session does.
-  if (ctx.sourceHostId !== "local") {
-    const targetHostId = await ops.sessionHostId(sessionId);
-    if (!targetHostId) throw new Error(`Session not found: ${sessionId}`);
-    const hosts = ops.listHosts();
-    const target = hosts.find((h) => h.id === targetHostId);
-    if (targetHostId !== ctx.sourceHostId && !(target && startsUnasked(target, ctx.sourceHostId))) {
-      const sourceLabel = hosts.find((h) => h.id === ctx.sourceHostId)?.label ?? ctx.sourceHostId;
-      if (!(await ctx.confirm(`Send a message from a session on ${sourceLabel} to session ${sessionId} on ${target?.label ?? targetHostId}?`))) {
-        throw new Error(`The user declined to send a message to session ${sessionId}.`);
-      }
+  const targetHostId = await ops.sessionHostId(sessionId);
+  if (!targetHostId) throw new Error(`Session not found: ${sessionId}`);
+  const hosts = ops.listHosts();
+  const target = hosts.find((host) => host.id === targetHostId);
+  const sameCluster = ctx.messagePermission === "trustCluster"
+    && ctx.clusterHostIds.has(ctx.sourceHostId)
+    && ctx.clusterHostIds.has(targetHostId);
+  const followsExistingRule = targetHostId === ctx.sourceHostId
+    || ctx.sourceHostId === "local"
+    || (target ? startsUnasked(target, ctx.sourceHostId) : false);
+  if (ctx.messagePermission !== "trustCluster" || (!sameCluster && !followsExistingRule)) {
+    const sourceLabel = hosts.find((host) => host.id === ctx.sourceHostId)?.label ?? ctx.sourceHostId;
+    if (!(await ctx.confirm(`Send a message from a session on ${sourceLabel} to session ${sessionId} on ${target?.label ?? targetHostId}?`))) {
+      throw new Error(`The user declined to send a message to session ${sessionId}.`);
     }
   }
+  if (ctx.signal?.aborted) throw new Error("The agent tool call was cancelled before the message was sent.");
   const result = await ops.deliver({
     sessionId,
+    hostId: targetHostId,
     message: formatAttributedMessage(ctx.sourceSessionId, message),
     delivery,
     wait,

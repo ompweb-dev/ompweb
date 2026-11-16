@@ -35,7 +35,7 @@ import {
 } from "@/lib/notification-client";
 import { BROWSER_TRANSPORTS, type BrowserTransport } from "@/lib/event-stream-protocol";
 import { setConnectionDiagnosticsEnabled, useConnectionDiagnosticsEnabled } from "@/lib/connection-diagnostics-prefs";
-import type { GithubActionsOperation, GithubActionsPermission, GithubActionsPermissions } from "@/lib/web-settings";
+import type { AgentMessagePermission, GithubActionsOperation, GithubActionsPermission, GithubActionsPermissions } from "@/lib/web-settings";
 const SettingsTabLoading = () => {
   const { t } = useI18n();
   return <div role="status" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: "var(--text-sm)" }}>{t("settingsConfig.loadingSettings")}</div>;
@@ -205,6 +205,7 @@ const SETTING_INDEX: SettingIndexEntry[] = [
   // Windows Background Service & System Tray
   { id: "auto-resume-sessions", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.autoResumeSessions", descKey: "settingsConfig.autoResumeSessionsDesc", fallbackSection: "System", fallbackLabel: "Resume running sessions after a restart", fallbackDesc: "When omp-web restarts while agents are working, restart those sessions and tell each agent: \"Session interrupted and resumed. Continue as you would have done without the interruption.\" Work in progress at the moment of the restart, such as a running command, is lost." },
   { id: "agent-tools-cross-session", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.agentTools", descKey: "settingsConfig.agentToolsDesc", fallbackSection: "System", fallbackLabel: "Agent tools (cross-session)", fallbackDesc: "Allow cross-session tools and GitHub tools for watching and reading issues and pull requests, writing comments and threads, and managing Actions workflow runs. Requires the GitHub CLI (gh) installed and logged in on this server." },
+  { id: "agent-message-permission", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.agentMessagePermission", descKey: "settingsConfig.agentMessagePermissionDesc", fallbackSection: "System", fallbackLabel: "Agent message approval", fallbackDesc: "Always ask before send_to_session, or trust sends between cluster members." },
   { id: "github-writes-unasked", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.githubWritesUnasked", descKey: "settingsConfig.githubWritesUnaskedDesc", fallbackSection: "System", fallbackLabel: "Allow agent GitHub writes without asking", fallbackDesc: "Let agents post comments, reply in review threads and resolve threads through this server's gh login without a confirmation each time. Off: each of those comment and thread writes asks in the session first." },
   { id: "github-actions-dispatch", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.githubActionsDispatch", descKey: "settingsConfig.githubActionsDispatchDesc", fallbackSection: "System", fallbackLabel: "Dispatch workflows", fallbackDesc: "Choose whether agents may start GitHub Actions workflows." },
   { id: "github-actions-cancel", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.githubActionsCancel", descKey: "settingsConfig.githubActionsCancelDesc", fallbackSection: "System", fallbackLabel: "Cancel workflow runs", fallbackDesc: "Choose whether agents may cancel running GitHub Actions workflows." },
@@ -341,6 +342,61 @@ function AgentToolsSetting() {
   return (
     <NativeSetting searchId="agent-tools-cross-session" label={t("settingsConfig.agentTools")} description={t("settingsConfig.agentToolsDesc")}>
       <ToggleSwitch checked={enabled === true} disabled={enabled === null} onChange={(next) => void change(next)} />
+    </NativeSetting>
+  );
+}
+
+function AgentMessagePermissionSetting() {
+  const { t } = useI18n();
+  const [permission, setPermission] = useState<AgentMessagePermission | null>(null);
+  const [saving, setSaving] = useState(false);
+  const load = useCallback(async (response?: Response): Promise<AgentMessagePermission | null> => {
+    try {
+      const res = response ?? await fetch("/api/web-settings");
+      if (!res.ok) return null;
+      const value = (await res.json() as { agentMessagePermission?: unknown }).agentMessagePermission;
+      return value === "alwaysAsk" || value === "trustCluster" ? value : null;
+    } catch {
+      return null;
+    }
+  }, []);
+  useEffect(() => {
+    let alive = true;
+    void load().then((value) => { if (alive) setPermission(value); });
+    return () => { alive = false; };
+  }, [load]);
+  const change = async (next: AgentMessagePermission) => {
+    setSaving(true);
+    try {
+      const res = await fetch("/api/web-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentMessagePermission: next }),
+      });
+      const saved = await load(res);
+      if (!saved) throw new Error(`HTTP ${res.status}`);
+      setPermission(saved);
+    } catch (error) {
+      setPermission(null);
+      toast.error(t("settingsConfig.agentMessagePermissionSaveFailed"), error instanceof Error ? error.message : String(error));
+      setPermission(await load());
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <NativeSetting searchId="agent-message-permission" label={t("settingsConfig.agentMessagePermission")} description={t("settingsConfig.agentMessagePermissionDesc")}>
+      <ThemedSelect
+        style={nativeSelectStyle}
+        value={permission ?? "unknown"}
+        disabled={permission === null || saving}
+        options={[
+          ...(permission === null ? [{ value: "unknown", label: t("settingsConfig.agentMessagePermissionUnavailable") }] : []),
+          { value: "alwaysAsk", label: t("settingsConfig.agentMessagePermissionAlwaysAsk") },
+          { value: "trustCluster", label: t("settingsConfig.agentMessagePermissionTrustCluster") },
+        ]}
+        onChange={(next) => void change(next as AgentMessagePermission)}
+      />
     </NativeSetting>
   );
 }
@@ -1957,6 +2013,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 <AutoResumeSessionsSetting />
 
                 <AgentToolsSetting />
+                <AgentMessagePermissionSetting />
 
                 <GithubWritesSetting />
 

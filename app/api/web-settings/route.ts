@@ -53,6 +53,13 @@ export async function PUT(req: Request) {
     patch.agentToolsEnabled = payload.agentToolsEnabled;
   }
 
+  if (payload.agentMessagePermission !== undefined) {
+    if (payload.agentMessagePermission !== "alwaysAsk" && payload.agentMessagePermission !== "trustCluster") {
+      return Response.json({ error: 'agentMessagePermission must be "alwaysAsk" or "trustCluster"', code: "invalid_settings" }, { status: 400 });
+    }
+    patch.agentMessagePermission = payload.agentMessagePermission;
+  }
+
   if (payload.githubWritesUnasked !== undefined) {
     if (typeof payload.githubWritesUnasked !== "boolean") {
       return Response.json({ error: "githubWritesUnasked must be a boolean", code: "invalid_settings" }, { status: 400 });
