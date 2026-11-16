@@ -55,6 +55,8 @@ import {
   type BrowserTransport,
   type ConnectionDiagnostics,
   type FallbackReason,
+  type OutboxDiagnosticEvent,
+  type OutboxDiagnostics,
   type EventStreamChannel,
 } from "./event-stream-protocol";
 import type { LocalOutboxEntry } from "./event-stream";
@@ -1685,6 +1687,7 @@ function diagnostics(): ConnectionDiagnostics {
     effectiveType: effectiveType(),
     windowMs: DIAGNOSTICS_WINDOW_MS,
     stats: diagnosticStats(diagnosticSamples.map((entry) => entry.sample)),
+    outbox: outboxDiagnostics(now),
   };
 }
 
@@ -1767,6 +1770,11 @@ const outboxDropping = new Set<string>();
 const outboxReadRetry = new Map<string, { timer: Timer | undefined; ms: number }>();
 /** The last read of the shared list failed: this worker's list may miss other workers' earlier entries. */
 let outboxPartial = false;
+let outboxDbState: OutboxDiagnostics["db"] = "opening";
+let outboxRetries = 0;
+let outboxLastStatus: number | null = null;
+let outboxLastError: string | null = null;
+const outboxEvents: OutboxDiagnosticEvent[] = [];
 const outboxDb = openOutboxDb();
 /** The stored entries are loaded (and sent): every tab's outbox op waits for it, so none races them. */
 let outboxReady = outboxDb.then(loadOutbox);
@@ -1782,18 +1790,57 @@ async function ensureOutboxReady(): Promise<boolean> {
 /** null where IndexedDB is missing or refuses: adds must fail without a durable store. */
 function openOutboxDb(): Promise<IDBDatabase | null> {
   return new Promise((resolve) => {
+    const finish = (db: IDBDatabase | null) => {
+      outboxDbState = db ? "open" : "unavailable";
+      resolve(db);
+    };
     const factory = scope.indexedDB;
-    if (!factory) return resolve(null);
-    try {
+    if (!factory) finish(null);
+    else try {
       const request = factory.open(OUTBOX_DB, 1);
       request.onupgradeneeded = () => request.result.createObjectStore(OUTBOX_STORE, { keyPath: "id" });
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => resolve(null);
+      request.onsuccess = () => finish(request.result);
+      request.onerror = () => finish(null);
     } catch {
-      resolve(null);
+      finish(null);
     }
   });
 }
+function recordOutbox(stage: OutboxDiagnosticEvent["stage"], entry: Pick<LocalOutboxEntry, "id" | "sessionId" | "mode">, extra?: { status?: number; error?: string }): void {
+  const error = extra?.error?.slice(0, 200);
+  outboxEvents.unshift({
+    at: Date.now(),
+    stage,
+    id: entry.id.slice(0, 64),
+    sessionId: entry.sessionId.slice(0, 128),
+    mode: entry.mode === "followUp" || entry.mode === "steer" ? entry.mode : "prompt",
+    ...(extra?.status !== undefined ? { status: extra.status } : {}),
+    ...(error !== undefined ? { error } : {}),
+  });
+  if (outboxEvents.length > 20) outboxEvents.length = 20;
+  if (extra?.status !== undefined) outboxLastStatus = extra.status;
+  if (stage === "retry") outboxRetries++;
+  if (error !== undefined) outboxLastError = error;
+  if (stage === "accepted") outboxLastError = null;
+}
+
+function outboxDiagnostics(now: number): OutboxDiagnostics {
+  const items = [...outboxItems.values()];
+  const pending = items.filter((item) => item.entry.state === "sending");
+  const oldest = pending.reduce((min, item) => Math.min(min, item.entry.createdAt), Number.POSITIVE_INFINITY);
+  return {
+    db: outboxDbState,
+    read: outboxReading.size > 0 ? "reading" : outboxPartial ? "failed" : "idle",
+    pending: pending.length,
+    oldestAgeMs: Number.isFinite(oldest) ? Math.max(0, now - oldest) : null,
+    inFlight: items.filter((item) => item.inFlight).length,
+    retries: outboxRetries,
+    lastHttpStatus: outboxLastStatus,
+    lastError: outboxLastError,
+    events: outboxEvents,
+  };
+}
+
 
 /** A failed read must not let a private worker's incomplete snapshot choose which message goes first. */
 function readOutbox(db: IDBDatabase | null): Promise<LocalOutboxEntry[] | null> {
@@ -1843,7 +1890,12 @@ function readOutboxForSend(db: IDBDatabase | null): Promise<LocalOutboxEntry[] |
 /** What an earlier worker (or tab) left: every unsent entry goes again. */
 async function loadOutbox(db: IDBDatabase | null): Promise<boolean> {
   const stored = await readOutbox(db);
-  if (!stored) return false;
+  if (!stored) {
+    outboxPartial = true;
+    recordOutbox("read", { id: "", sessionId: "", mode: "prompt" }, { error: "IndexedDB read failed" });
+    return false;
+  }
+  outboxPartial = false;
   for (const entry of stored) outboxItems.set(entry.id, { entry, inFlight: false, retryTimer: undefined, retryMs: RECONNECT_MIN_MS });
   await Promise.all([...new Set(stored.map((entry) => entry.sessionId))].map((sessionId) => sendOutbox(sessionId)));
   return true;
@@ -1953,6 +2005,7 @@ function addOutbox(client: Client, n: number, entry: LocalOutboxEntry): void {
     await refreshOutbox();
     broadcastOutbox();
     post(client, { outboxAdded: n });
+    recordOutbox("stored", item.entry);
     sendOutbox(item.entry.sessionId);
   });
 }
@@ -2027,6 +2080,7 @@ async function refreshOutbox(): Promise<boolean | null> {
   const entries = await readOutboxForSend(await outboxDb);
   if (!entries) {
     outboxPartial = true;
+    recordOutbox("read", { id: "", sessionId: "", mode: "prompt" }, { error: "IndexedDB read failed" });
     return null;
   }
   const ids = new Set(entries.map((entry) => entry.id));
@@ -2106,6 +2160,7 @@ async function sendOutbox(sessionId: string): Promise<void> {
   };
   // A fresh request id per attempt; the server dedupes outbox_add by the entry's id.
   const req = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
+  recordOutbox("dispatch", item.entry);
   queueCommand({ port, streams: new Map(), visible: false }, { n: 0, req, sessionId, advisor: advisor === true, body, type: "outbox_add" });
 }
 
@@ -2135,8 +2190,11 @@ async function outboxAnswer(item: OutboxItem, status: number, body: unknown): Pr
   const { id, sessionId, replaces } = item.entry;
   if (outboxItems.get(id) !== item) return;
   const reply = (body ?? {}) as { error?: unknown };
+  const detail = typeof reply.error === "string" ? reply.error : undefined;
+  const httpStatus = status;
+  recordOutbox("response", item.entry, { status: httpStatus, ...(detail ? { error: detail } : {}) });
   const accepted = acceptedOutboxEntry(body, id);
-  if (status >= 200 && status < 300 && !accepted) status = 0;
+  if (httpStatus >= 200 && httpStatus < 300 && !accepted) status = 0;
   if (status >= 200 && status < 300) {
     // Commit the accepted ID and only server-confirmed or locally proven retry lineage together.
     const confirmedReplaces = isRecord(accepted) && typeof accepted.replaces === "string" && accepted.replaces === replaces
@@ -2170,7 +2228,17 @@ async function outboxAnswer(item: OutboxItem, status: number, body: unknown): Pr
           store.delete(entry.id);
         }
       };
-    }))) return outboxAnswer(item, 0, null);
+    }))) {
+      item.inFlight = false;
+      item.retryTimer = setTimeout(() => {
+        item.retryTimer = undefined;
+        sendOutbox(sessionId);
+      }, item.retryMs);
+      item.retryMs = Math.min(item.retryMs * 2, RECONNECT_MAX_MS);
+      recordOutbox("retry", item.entry, { status: httpStatus, error: "IndexedDB write failed" });
+      return;
+    }
+    recordOutbox("accepted", item.entry, { status });
     for (const removedId of removedIds) {
       clearTimeout(outboxItems.get(removedId)?.retryTimer);
       outboxItems.delete(removedId);
@@ -2195,6 +2263,7 @@ async function outboxAnswer(item: OutboxItem, status: number, body: unknown): Pr
       sendOutbox(sessionId);
     }, item.retryMs);
     item.retryMs = Math.min(item.retryMs * 2, RECONNECT_MAX_MS);
+    recordOutbox("retry", item.entry, { status: httpStatus, error: httpStatus >= 200 && httpStatus < 300 ? "Invalid acceptance receipt" : detail ?? `HTTP ${httpStatus}` });
     return;
   } else {
     return failOutbox(item, typeof reply.error === "string" ? reply.error : `HTTP ${status}`);
@@ -2218,6 +2287,7 @@ async function failOutbox(item: OutboxItem, error: string): Promise<void> {
     };
   });
   if (!committed) return outboxAnswer(item, 0, null);
+  recordOutbox("failed", item.entry, { error });
   item.inFlight = false;
   if (outboxItems.get(id) !== item) return;
   if (!read.stored) {

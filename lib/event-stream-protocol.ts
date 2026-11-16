@@ -54,6 +54,32 @@ export interface BrowserTransportState {
 /** Why the worker fell back to SSE: proxies refused the upgrade, or the server speaks another link version. */
 export type FallbackReason = "refused" | "version";
 
+export type OutboxDiagnosticStage = "stored" | "read" | "dispatch" | "response" | "accepted" | "retry" | "failed";
+
+/** One outbox transition. Never includes message text, attachments, proofs, or credentials. */
+export interface OutboxDiagnosticEvent {
+  at: number;
+  stage: OutboxDiagnosticStage;
+  id: string;
+  sessionId: string;
+  mode: "prompt" | "followUp" | "steer";
+  status?: number;
+  error?: string;
+}
+
+export interface OutboxDiagnostics {
+  db: "opening" | "open" | "unavailable";
+  read: "idle" | "reading" | "failed";
+  pending: number;
+  oldestAgeMs: number | null;
+  inFlight: number;
+  retries: number;
+  lastHttpStatus: number | null;
+  lastError: string | null;
+  /** Newest first, at most 20. */
+  events: OutboxDiagnosticEvent[];
+}
+
 export interface ConnectionDiagnostics {
   /** The server's setting. */
   setting: BrowserTransport;
@@ -73,6 +99,7 @@ export interface ConnectionDiagnostics {
   effectiveType: string | null;
   windowMs: number;
   stats: DiagnosticStat[];
+  outbox: OutboxDiagnostics;
 }
 
 export const BROWSER_LINK_PATH = "/api/events/link";

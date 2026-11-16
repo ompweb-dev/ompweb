@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Added
+
+- **Connection diagnostics show the browser outbox.** The Connection tab now shows IndexedDB and read state, pending messages, retries, the last HTTP status and error, and the last 20 stage events. Events include ids and modes only, never message text.
+
 ### Fixed
 
 - **GitHub workflow watches no longer regress to stale run states.** Workflow updates retain GitHub's run timestamp and ignore older snapshots for the same or an earlier attempt, so a delayed `queued` response cannot follow a newer `in_progress` delivery.

@@ -41,6 +41,7 @@ const wsDiagnostics = {
   effectiveType: "4g",
   windowMs: 1800000,
   stats: [{ transport: "ws", metric: "transportMs", count: 10, mean: 20.4, p50: 18, p95: 30, p999: null, max: 41 }],
+  outbox: { db: "open", read: "idle", pending: 0, oldestAgeMs: null, inFlight: 0, retries: 0, lastHttpStatus: null, lastError: null, events: [] },
 };
 
 function rightPanelProps(overrides) {
@@ -181,6 +182,32 @@ test("an active visible panel replaces its displayed snapshot on the next poll",
   diagnostics = { ...wsDiagnostics, clockRttMs: 3 };
   await act(async () => t.mock.timers.tick(1000));
   assert.equal(valueOf("Clock RTT").textContent, "3 ms");
+});
+
+test("the Connection tab shows outbox stage diagnostics without message text", async () => {
+  diagnostics = {
+    ...wsDiagnostics,
+    outbox: {
+      db: "open",
+      read: "failed",
+      pending: 1,
+      oldestAgeMs: 12500,
+      inFlight: 0,
+      retries: 2,
+      lastHttpStatus: 503,
+      lastError: "IndexedDB read failed",
+      events: [{ at: 1_700_000_000_000, stage: "retry", id: "m1", sessionId: "session-1", mode: "followUp", status: 503 }],
+    },
+  };
+  await act(async () => render(createElement(ConnectionDiagnosticsPanel, { active: true })));
+  assert.equal(valueOf("Outbox database").textContent, "open");
+  assert.equal(valueOf("Outbox read").textContent, "failed");
+  assert.equal(valueOf("Pending messages").textContent, "1");
+  assert.equal(valueOf("Oldest pending").textContent, "13 s");
+  assert.equal(valueOf("Retries").textContent, "2");
+  assert.equal(valueOf("Last HTTP status").textContent, "503");
+  assert.ok(screen.getByText("retry · followUp · m1 · session-1 · HTTP 503"));
+  assert.equal(document.body.textContent.includes("secret prompt"), false);
 });
 
 test("inactive diagnostics retain the old snapshot, ignore a late response, and refresh on activation", async (t) => {

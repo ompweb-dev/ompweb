@@ -1473,9 +1473,12 @@ during the wait.
   - **Connection tab** (right panel, both layouts, shown while Settings → Interface & Behavior → "Show connection
     diagnostics" is on, `omp-web:connection-diagnostics`, per browser). It polls the worker (`diag` op,
     `requestConnectionDiagnostics`) once a second while visible: the mode in effect, fallback, status (`idle` when
-    no connection is needed, `down` after `SEND_DEADLINE_MS` without a connection), the last reconnect, and
+    no connection is needed, `down` after `SEND_DEADLINE_MS` without a connection), the last reconnect,
     per-transport stats (mean, p50, p95, p99.9 from 1000 values, max) of the worker's last 30 min of samples (at most
-    20 000, kept beside the POST buffer). Command rows include confirmed successful replies only; app ↔ omp and round-trip rows skip commands whose reply does not confirm omp got them (`NO_OMP_REPLY_COMMANDS`: the `NO_SPAWN_REPLIES` the web app answers itself, a test keeps them included, plus the results `dispatchCommand` forwards without awaiting omp). A new command of either kind belongs there. Shared durations
+    20 000, kept beside the POST buffer), and the browser outbox: IndexedDB and read state, pending count, oldest age,
+    in-flight sends, retries, last HTTP status and error, plus the last 20 stage events (`stored`, `read`, `dispatch`,
+    `response`, `accepted`, `retry`, `failed`). Events carry ids and modes only, never message text, attachments or proofs.
+    Command rows include confirmed successful replies only; app ↔ omp and round-trip rows skip commands whose reply does not confirm omp got them (`NO_OMP_REPLY_COMMANDS`: the `NO_SPAWN_REPLIES` the web app answers itself, a test keeps them included, plus the results `dispatchCommand` forwards without awaiting omp). A new command of either kind belongs there. Shared durations
     come from `lib/transport-stats.ts`; one-way estimates use clock correction and assume symmetric latency.
     Without a SharedWorker (Chrome for Android) each tab has its own worker, so the numbers are that tab's.
   - **Worker rules.** Browser code: no `AbortSignal.timeout`/`any` or `Promise.withResolvers` (a test checks

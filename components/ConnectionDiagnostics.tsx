@@ -142,6 +142,25 @@ function DiagnosticsBody({ diagnostics: d, now }: { diagnostics: ConnectionDiagn
         <Row label={t("connectionDiagnostics.rowNetwork")}>{d.effectiveType ?? "—"}</Row>
       </dl>
 
+      <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{t("connectionDiagnostics.outboxTitle")}</div>
+      <dl style={{ margin: 0, display: "flex", flexDirection: "column" }}>
+        <Row label={t("connectionDiagnostics.rowOutboxDb")}>{d.outbox.db}</Row>
+        <Row label={t("connectionDiagnostics.rowOutboxRead")}>{d.outbox.read}</Row>
+        <Row label={t("connectionDiagnostics.rowOutboxPending")}>{d.outbox.pending}</Row>
+        <Row label={t("connectionDiagnostics.rowOutboxOldest")}>{d.outbox.oldestAgeMs === null ? "—" : t("connectionDiagnostics.outboxAgeSeconds", { seconds: Math.round(d.outbox.oldestAgeMs / 1000) })}</Row>
+        <Row label={t("connectionDiagnostics.rowOutboxInFlight")}>{d.outbox.inFlight}</Row>
+        <Row label={t("connectionDiagnostics.rowOutboxRetries")}>{d.outbox.retries}</Row>
+        <Row label={t("connectionDiagnostics.rowOutboxStatus")}>{d.outbox.lastHttpStatus ?? "—"}</Row>
+        <Row label={t("connectionDiagnostics.rowOutboxError")}>{d.outbox.lastError ?? "—"}</Row>
+      </dl>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, color: "var(--text-muted)" }}>
+        {d.outbox.events.length === 0 ? <div>{t("connectionDiagnostics.outboxNoEvents")}</div> : d.outbox.events.map((event, index) => (
+          <div key={`${event.at}-${event.stage}-${event.id}-${index}`}>
+            {t("connectionDiagnostics.outboxEvent", { stage: event.stage, mode: event.mode, id: event.id || "—", session: event.sessionId || "—", status: event.status ?? "—" })}
+          </div>
+        ))}
+      </div>
+
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         {groups.length === 0 && <div style={{ color: "var(--text-dim)" }}>{t("connectionDiagnostics.noSamples")}</div>}
         {groups.map((group) => (
