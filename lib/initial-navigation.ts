@@ -22,3 +22,13 @@ export function initialSessionMatches(
   return session.id === navigation.sessionId
     && (navigation.hostId === undefined || (session.hostId ?? "local") === navigation.hostId);
 }
+
+type SessionTarget = { id: string; hostId?: string };
+
+export function sameSessionTarget(left: SessionTarget, right: SessionTarget): boolean {
+  return left.id === right.id && (left.hostId ?? "local") === (right.hostId ?? "local");
+}
+
+export function sessionNavigationUrl(session: SessionTarget): string {
+  return `?session=${encodeURIComponent(session.id)}&host=${encodeURIComponent(session.hostId ?? "local")}`;
+}

@@ -38,7 +38,7 @@ import { getFileApiUrl, getFileName, getRelativeFilePath, joinFilePath } from "@
 import { normalizeLocalPath } from "@/lib/file-links";
 import type { WorkspaceFileSource } from "@/lib/workspace-types";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
-import { getInitialNavigation } from "@/lib/initial-navigation";
+import { getInitialNavigation, sameSessionTarget, sessionNavigationUrl } from "@/lib/initial-navigation";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { foldedHostProjectKey, hostProjectKey, LOCAL_HOST_ID, remoteHostId, projectIdentity, projectTargetId } from "@/lib/project-ordering";
 import { isClusterTarget } from "@/lib/hosts/cluster";
@@ -1226,7 +1226,7 @@ export function AppShell({ appName }: { appName: string }) {
       setSidebarOpen(false);
       requestAnimationFrame(() => chatInputRef.current?.focus());
     }
-    if (!isRestore && session.id === selectedSession?.id) return;
+    if (!isRestore && selectedSession && sameSessionTarget(session, selectedSession)) return;
     setNewSessionCwd(null);
     setNewSessionPoolProject(null);
     setSelectedSession(session);
@@ -1244,9 +1244,9 @@ export function AppShell({ appName }: { appName: string }) {
     }
     // Skip router.replace when restoring from the URL: the param is already correct.
     if (!isRestore) {
-      router.replace(`?session=${encodeURIComponent(session.id)}`);
+      router.replace(sessionNavigationUrl(session));
     }
-  }, [router, isMobile, selectedSession?.id]);
+  }, [router, isMobile, selectedSession]);
 
   const handleNewSession = useCallback((creationId: string, cwd: string | null, hostId?: string, project?: ManagedProject, initialization?: string) => {
     setSettingsTab(null);
