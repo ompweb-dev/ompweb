@@ -28,7 +28,7 @@ export interface ItemSnapshot {
   threadComments: { id: string; url: string; author: GithubActor; threadId: string; path: string; line: number | null }[];
   /** Checks are lower-cased: `conclusion` "success" | "failure" | ..., `status` "completed" | "in_progress" | ... Commit statuses map to the same words. */
   head?: { sha: string; checks: { name: string; conclusion: string | null; status: string }[] };
-  run?: { id: number; attempt: number; status: string; conclusion: string | null; sha: string };
+  run?: { id: number; attempt: number; status: string; conclusion: string | null; sha: string; updatedAt: string };
   /** The login's GraphQL points left after the last snapshot request, and when they refill. */
   rateLimit?: { remaining: number; resetAt: string };
 }
@@ -325,11 +325,16 @@ const RUN_CONCLUSIONS: Record<string, true> = { success: true, failure: true, ne
 
 function runSnapshot(target: GithubTarget, value: unknown): ItemSnapshot {
   const item = value as Record<string, unknown> | null;
+  const updatedAt = typeof item?.updated_at === "string" ? item.updated_at : "";
+  const updatedAtMs = Date.parse(updatedAt);
+  const normalizedUpdatedAt = updatedAt.includes(".") ? updatedAt : updatedAt.replace(/Z$/, ".000Z");
   if (
     !item || typeof item !== "object" ||
     !Number.isSafeInteger(item.id) || item.id !== target.number || target.number <= 0 ||
     !Number.isSafeInteger(item.run_attempt) || (item.run_attempt as number) <= 0 ||
     typeof item.head_sha !== "string" || !/^[a-fA-F0-9]{40}$/.test(item.head_sha) ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(updatedAt) ||
+    !Number.isFinite(updatedAtMs) || new Date(updatedAtMs).toISOString() !== normalizedUpdatedAt ||
     typeof item.status !== "string" || !Object.hasOwn(RUN_STATUSES, item.status) ||
     (item.conclusion !== null && (typeof item.conclusion !== "string" || !Object.hasOwn(RUN_CONCLUSIONS, item.conclusion))) ||
     (item.status === "completed" && item.conclusion === null)
@@ -338,7 +343,7 @@ function runSnapshot(target: GithubTarget, value: unknown): ItemSnapshot {
     kind: "workflow_run",
     url: formatTarget(target),
     state: item.status === "completed" ? "closed" : "open",
-    run: { id: item.id as number, attempt: item.run_attempt as number, status: item.status, conclusion: item.conclusion as string | null, sha: item.head_sha },
+    run: { id: item.id as number, attempt: item.run_attempt as number, status: item.status, conclusion: item.conclusion as string | null, sha: item.head_sha, updatedAt },
     comments: [], reviews: [], threadComments: [],
   };
 }

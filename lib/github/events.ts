@@ -31,7 +31,7 @@ export interface WatchCursor {
   threadCommentIds: string[];
   reportedHeads: string[];
   final: boolean;
-  run?: { attempt: number; status: string; conclusion: string | null };
+  run?: { attempt: number; status: string; conclusion: string | null; updatedAt?: string };
 }
 
 export type GithubEvent =
@@ -88,7 +88,7 @@ export function baselineCursor(snapshot: ItemSnapshot): WatchCursor {
     threadCommentIds: snapshot.threadComments.map((t) => t.id),
     reportedHeads: settled(head) ? [head.sha] : [],
     final: false,
-    ...(snapshot.run ? { run: { attempt: snapshot.run.attempt, status: snapshot.run.status, conclusion: snapshot.run.conclusion } } : {}),
+    ...(snapshot.run ? { run: { attempt: snapshot.run.attempt, status: snapshot.run.status, conclusion: snapshot.run.conclusion, updatedAt: snapshot.run.updatedAt } } : {}),
   };
 }
 
@@ -103,13 +103,25 @@ export function diffSnapshot(
   postedIds: ReadonlySet<string>,
 ): { events: GithubEvent[]; cursor: WatchCursor } {
   if (snapshot.kind === "workflow_run" && snapshot.run) {
-    const { id, attempt, status, conclusion, sha } = snapshot.run;
+    const { id, attempt, status, conclusion, sha, updatedAt } = snapshot.run;
+    const previous = cursor.run;
+    const previousUpdatedAt = previous?.updatedAt;
+    const previousPhase = previous?.status === "completed" ? 2 : previous?.status === "in_progress" ? 1 : 0;
+    const phase = status === "completed" ? 2 : status === "in_progress" ? 1 : 0;
+    const stale = previous !== undefined && (
+      attempt < previous.attempt ||
+      (attempt === previous.attempt && previousUpdatedAt !== undefined && Date.parse(updatedAt) < Date.parse(previousUpdatedAt)) ||
+      (attempt === previous.attempt && phase < previousPhase && (previousUpdatedAt === undefined || Date.parse(updatedAt) === Date.parse(previousUpdatedAt)))
+    );
+    if (stale) {
+      return { events: [], cursor };
+    }
     const ended = status === "completed";
-    const changed = cursor.run?.attempt !== attempt || cursor.run?.status !== status || cursor.run?.conclusion !== conclusion;
+    const changed = previous?.attempt !== attempt || previous?.status !== status || previous?.conclusion !== conclusion;
     const events: GithubEvent[] = changed || (ended && !cursor.final)
       ? [{ kind: "workflow_run", id: `${id}:${attempt}:${status}:${conclusion}`, url: snapshot.url, attempt, status, conclusion, sha }]
       : [];
-    return { events, cursor: { ...cursor, run: { attempt, status, conclusion }, final: cursor.final || ended } };
+    return { events, cursor: { ...cursor, run: { attempt, status, conclusion, updatedAt }, final: cursor.final || ended } };
   }
   const reviews = snapshot.reviews as ReviewSnapshot[];
   const seenReviews = new Set(cursor.reviewIds);
