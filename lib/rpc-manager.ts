@@ -2626,7 +2626,7 @@ export class AgentSessionWrapper {
         // optimistic turn and lost the message). Degrade into omp's own
         // follow-up queue instead: omp keeps owning the chips and delivers the
         // message once the shell command releases the session.
-        if (this.bashRunning && !this.streaming) return await this.queueWhileShellRunning(command);
+        if (this.bashRunning && !this.streaming) return await this.queueWhileShellRunning(command, correlationKey);
         const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
         if (!streamingBehavior) {
           this.responseObserved = false;
