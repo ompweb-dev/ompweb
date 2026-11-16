@@ -1285,27 +1285,28 @@ export function AppShell({ appName }: { appName: string }) {
   const navViewVersionRef = useRef(0);
   const navSessionId = selectedSession?.id ?? null;
   const navSessionCwd = selectedSession?.cwd ?? null;
+  const navHostId = navSessionId ? remoteHostId(selectedSession?.hostId) : newSessionHostId;
   useEffect(() => {
     navViewVersionRef.current += 1;
     recordNavigationView({
       sessionId: navSessionId,
       cwd: navSessionId ? navSessionCwd : newSessionCwd,
-      ...(!navSessionId && newSessionHostId ? { hostId: newSessionHostId } : {}),
+      ...(navHostId ? { hostId: navHostId } : {}),
       ...(!navSessionId && newSessionPoolProject ? { poolId: newSessionPoolProject.poolId, projectId: newSessionPoolProject.projectId } : {}),
       ...(!navSessionId ? { creationId: newSessionCreationId } : {}),
       ...(!navSessionId && newSessionPoolProject && newSessionCreation.initialization ? { initialization: newSessionCreation.initialization } : {}),
     });
-  }, [navSessionId, navSessionCwd, newSessionCwd, newSessionHostId, newSessionPoolProject, newSessionCreation, newSessionCreationId, recordNavigationView]);
+  }, [navSessionId, navSessionCwd, navHostId, newSessionCwd, newSessionPoolProject, newSessionCreation, newSessionCreationId, recordNavigationView]);
 
   // Resolves a history entry's session id against the live list. `null`
   // means the id is gone (entry should be dropped); "unavailable" means the
   // list itself could not be fetched (keep the entry, abort this navigation).
-  const fetchSessionForNavigation = useCallback(async (sessionId: string): Promise<SessionInfo | null | "unavailable"> => {
+  const fetchSessionForNavigation = useCallback(async (sessionId: string, hostId?: string): Promise<SessionInfo | null | "unavailable"> => {
     try {
       const res = await fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`);
       if (!res.ok) return "unavailable";
       const data = (await res.json()) as { sessions?: SessionInfo[] };
-      return data.sessions?.find((s) => s.id === sessionId) ?? null;
+      return data.sessions?.find((session) => sameSessionTarget(session, { id: sessionId, hostId })) ?? null;
     } catch {
       return "unavailable";
     }
@@ -1329,7 +1330,7 @@ export function AppShell({ appName }: { appName: string }) {
         return;
       }
       const versionAtPress = navViewVersionRef.current;
-      const session = await fetchSessionForNavigation(entry.sessionId);
+      const session = await fetchSessionForNavigation(entry.sessionId, entry.hostId);
       if (navViewVersionRef.current !== versionAtPress) return; // user moved on: do nothing
       if (session === "unavailable") return; // list fetch failed: keep the entry, try again next press
       if (session) {

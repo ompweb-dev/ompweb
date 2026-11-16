@@ -15,7 +15,7 @@ export interface NavigationEntry {
   sessionId: string | null;
   /** The view's cwd — the session's cwd, or the new-chat cwd. */
   cwd: string | null;
-  /** Host of a new-chat view's cwd; absent for this machine. */
+  /** Host of the session or new-chat cwd; absent for this machine. */
   hostId?: string;
   poolId?: string;
   projectId?: string;
@@ -41,12 +41,12 @@ export function createNavigationHistory(): NavigationHistory {
 }
 
 /**
- * Session views compare by id (a session keeps its identity while its cwd
- * metadata refreshes); new-chat views compare by host and cwd.
+ * Session views compare by id and host (a session keeps that identity while
+ * its cwd metadata refreshes); new-chat views compare by host and cwd.
  */
 export function navigationEntriesEqual(a: NavigationEntry, b: NavigationEntry): boolean {
   if (a.sessionId !== b.sessionId) return false;
-  if (a.sessionId !== null) return true;
+  if (a.sessionId !== null) return (a.hostId ?? "local") === (b.hostId ?? "local");
   if (a.poolId || b.poolId) return a.poolId === b.poolId && a.projectId === b.projectId && a.creationId === b.creationId;
   return (a.cwd ?? null) === (b.cwd ?? null) && a.hostId === b.hostId;
 }
