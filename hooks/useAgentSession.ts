@@ -579,6 +579,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     updateQueuedMessages(readQueueSnapshot(value) ?? EMPTY_QUEUE);
   }, [updateQueuedMessages]);
   const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
+  const subagentsRef = useRef(subagents);
+  subagentsRef.current = subagents;
   const [subagentEvents, setSubagentEvents] = useState<Record<string, SubagentActivityEvent[]>>({});
   const [subagentTranscriptVersions, setSubagentTranscriptVersions] = useState<Record<string, number>>({});
   const [todoPhases, setTodoPhases] = useState<TodoPhase[]>([]);
@@ -688,6 +690,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const wasRunningForGaugeRef = useRef(false);
   // so a stale get_subagents cannot target a session that was switched away.
   const rosterRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rosterRefreshInFlightRef = useRef<{ sid: string; runId: number; generation: number } | null>(null);
   const promptRunIdRef = useRef(0);
   // An idle snapshot during local startup is not evidence the new prompt finished.
   const promptDispatchPendingRef = useRef(false);
@@ -1006,6 +1009,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const requestedAt = Date.now();
     const runId = promptRunIdRef.current;
     const generation = subagentRosterGenerationRef.current;
+    const pending = rosterRefreshInFlightRef.current;
+    if (pending?.sid === sid && pending.runId === runId && pending.generation === generation) return;
+    const request = { sid, runId, generation };
+    rosterRefreshInFlightRef.current = request;
     try {
       const result = await sendAgentCommand<{ subagents?: SubagentSnapshotLike[] }>(sid, { type: "get_subagents" });
       // Fence: the request may resolve after the user switched sessions, the
@@ -1027,6 +1034,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // state we got and must survive the prune.
       const liveIds = new Set(snapshots.map((s) => s.id));
       setSubagents((prev) => {
+        if (!hookAliveRef.current || sessionIdRef.current !== sid || promptRunIdRef.current !== runId || subagentRosterGenerationRef.current !== generation) return prev;
         const next = prev.filter((s) => s.source !== "live" || liveIds.has(s.id) || (s.lastUpdate ?? 0) >= requestedAt);
         return next.length === prev.length ? prev : next;
       });
@@ -1036,6 +1044,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       void refreshSubagentHistory(sid);
     } catch {
       // Best effort: subagent_lifecycle/progress frames are the primary source.
+    } finally {
+      if (rosterRefreshInFlightRef.current === request) rosterRefreshInFlightRef.current = null;
     }
   }, [mergeSubagents, refreshSubagentHistory]);
 
@@ -1599,14 +1609,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     catchUp.disconnect();
     const es = openEventStream({ kind: "session", sessionId: sid });
     eventSourceRef.current = es;
-    const runId = promptRunIdRef.current;
 
     return new Promise((resolve) => {
       let settled = false;
       let restored = false;
       const restore = () => {
         if (!restoreWrapper || restored || !hookAliveRef.current || sessionIdRef.current !== sid
-          || promptRunIdRef.current !== runId || eventSourceRef.current !== es) return;
+          || eventSourceRef.current !== es) return;
         restored = true;
         reconnectActionsRef.current?.(sid);
       };
@@ -1694,6 +1703,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
       };
       es.onerror = () => {
+        restored = false;
+        // Even a stream opened for this tab's own send must rehydrate after
+        // reconnect. Wait for connected so a wrapper-less held stream stays passive.
+        restoreWrapper = "connected";
         // The server rejected this chat's pending host tools when its subscription left (rejectPendingHostTools), and
         // the cancel it emitted had no listener: withdraw them here so nothing answers or opens a settled call.
         if (eventSourceRef.current === es) {
@@ -3073,6 +3086,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         const task = typeof payload?.task === "string" && payload.task.trim() ? payload.task : (progress?.task ?? null);
         const assignment = typeof payload?.assignment === "string" ? payload.assignment : progress?.assignment;
         if (!progressId && !task && !parentToolCallId && index < 0) break;
+        // Progress keeps arriving if the start frame was missed or the roster
+        // was cleared while detached children kept running. Recover from omp's
+        // registry, not from this possibly late frame (which may be stale).
+        if (progressId && (progress?.status === "running" || progress?.status === "pending")
+          && !subagentsRef.current.some((subagent) => subagent.id === progressId)) {
+          const sid = sessionIdRef.current;
+          if (sid) void refreshSubagentRoster(sid);
+        }
         // Fence progress frames against roster clear / new run (same as mergeSubagents).
         const progressGeneration = subagentRosterGenerationRef.current;
         const progressRunId = promptRunIdRef.current;

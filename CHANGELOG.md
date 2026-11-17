@@ -8,6 +8,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ### Fixed
 
+- **Running subagents recover without reactivating the chat.** Every event-stream reconnect refreshes the live roster, including reconnects after a new prompt on the same connection. Progress for an unknown running child requests an authoritative roster snapshot instead of silently disappearing; concurrent recovery reads are shared, and responses from a finished run cannot resurrect its children.
 - **GitHub workflow watches no longer regress to stale run states.** Workflow updates retain GitHub's run timestamp and ignore older snapshots for the same or an earlier attempt, so a delayed `queued` response cannot follow a newer `in_progress` delivery.
 
 ## [v0.7.2] - 2026-11-14
