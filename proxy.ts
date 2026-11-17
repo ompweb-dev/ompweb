@@ -18,8 +18,14 @@ import {
 // hashed build output. The icon and sw.js names are exact (anchored), so no path
 // below or beside them skips the gate. /api/hosts/link (exactly, no subpath)
 // authenticates the host's bearer token itself before it upgrades or reads any
-// body (lib/hosts/hub.ts).
-export const UNGATED = /^\/(?:assets\/|(?:favicon\.ico|icon\.svg|icon\.png|icon-192\.png|badge-96\.png|sw\.js)$|api\/hosts\/link$)/;
+// body (lib/hosts/hub.ts); /api/hosts/broker/v1/ (a prefix, so /api/hosts/broker,
+// /api/hosts/broker/updates and any other version stay gated) does the same before
+// it forwards to the auth broker (app/api/hosts/broker/[...path]/route.ts);
+// /api/hosts/cluster-config/manifest and /api/hosts/cluster-config/file/<64 hex digits> (exactly: hosts/[id]/cluster and
+// hosts/[id]/updates answer to id "cluster-config" and stay gated) check it before serving the master's configuration
+// to a cluster member (app/api/hosts/cluster-config/).
+// /api/hosts/maintenance is the independent maintenance API; its bearer gate also covers discovery.
+export const UNGATED = /^\/(?:assets\/|(?:favicon\.ico|icon\.svg|icon\.png|icon-192\.png|badge-96\.png|sw\.js)$|api\/hosts\/(?:link|maintenance)$|api\/hosts\/broker\/v1\/|api\/hosts\/cluster-config\/(?:manifest|file\/[0-9a-f]{64})$)/;
 
 // Relative: request.url is always http:// under Bun, so an absolute Location would leave https behind a TLS proxy.
 const redirect = (location: string) => new Response(null, { status: 307, headers: { location } });

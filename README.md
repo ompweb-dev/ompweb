@@ -1,13 +1,21 @@
-# ompweb
+<div align="center">
 
-[![npm version](https://img.shields.io/npm/v/@kahme247/ompweb.svg?logo=npm&color=e05d44)](https://www.npmjs.com/package/@kahme247/ompweb)
-[![node version](https://img.shields.io/node/v/@kahme247/ompweb.svg?logo=node.js&color=44cc11)](https://nodejs.org)
-[![license](https://img.shields.io/github/license/kahme247/ompweb.svg?color=44cc11)](./LICENSE)
-[![npm downloads](https://img.shields.io/npm/dm/@kahme247/ompweb.svg?color=44cc11)](https://www.npmjs.com/package/@kahme247/ompweb)
-[![GitHub stars](https://img.shields.io/github/stars/kahme247/ompweb.svg?logo=github)](https://github.com/kahme247/ompweb/stargazers)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/kahme247/ompweb/pulls)
+<img src="public/icon.svg" alt="ompweb logo" width="150">
 
-[English](./README.md) | [简体中文](./README.zh-CN.md) | [日本語](./README.ja.md)
+<h1>ompweb</h1>
+
+<p>
+  <a href="https://www.npmjs.com/package/@kahme247/ompweb"><img src="https://img.shields.io/npm/v/@kahme247/ompweb.svg?logo=npm&amp;color=e05d44" alt="npm version"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/@kahme247/ompweb.svg?logo=node.js&amp;color=44cc11" alt="node version"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/github/license/ompweb-dev/ompweb.svg?color=44cc11" alt="license"></a>
+  <a href="https://www.npmjs.com/package/@kahme247/ompweb"><img src="https://img.shields.io/npm/dm/@kahme247/ompweb.svg?color=44cc11" alt="npm downloads"></a>
+  <a href="https://github.com/ompweb-dev/ompweb/stargazers"><img src="https://img.shields.io/github/stars/ompweb-dev/ompweb.svg?logo=github" alt="GitHub stars"></a>
+  <a href="https://github.com/ompweb-dev/ompweb/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
+</p>
+
+</div>
+
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md) | [日本語](./README.ja.md)
 
 Community: [Join the OMPWEB Discord](https://discord.gg/evqgGzRfM5)
 
@@ -26,14 +34,12 @@ A clean, modern web UI for the [oh-my-pi (omp)](https://github.com/can1357/oh-my
 
 ## Requirements
 
-- [omp](https://github.com/can1357/oh-my-pi) installed and available on your `PATH` (or specified via `OMP_WEB_OMP_BIN`)
+- Nothing else for omp: ompweb runs its own [omp](https://github.com/can1357/oh-my-pi) build, `ompweb-omp`, which reads your `~/.omp` settings, auth and sessions. Every install (npm, npx or the single binary) downloads the `ompweb-omp` of its exact version from that version's [GitHub release](https://github.com/ompweb-dev/ompweb/releases) the first time it starts, checks its SHA-256 and keeps it (beside the single binary, otherwise in `~/.omp/agent/omp-web/omp/<version>/`); `ompweb fetch-omp` does the same on demand. Sessions start once it is there. It exists for linux-x64, linux-arm64, darwin-x64, darwin-arm64 and windows-x64; on any other platform (Linux on musl, Windows on Arm, FreeBSD) ompweb cannot start sessions. A machine that cannot reach GitHub needs `OMP_WEB_OMP_BIN` pointing at a copy of that release's `ompweb-omp-<os>-<arch>`
 - Node.js `>= 24`. The server runs on [Bun](https://bun.sh), which installs automatically as a dependency of the npm package (a Bun on your `PATH` is used if the bundled one is missing)
 
-The **Steer** action on a queued follow-up requires an omp runtime with the `promote_queued_message` RPC command (not available in omp 18.1.16). Older runtimes report an error and leave the message queued as a follow-up; ompweb does not send a duplicate steering message.
+The **Steer**, **Delete** and **Edit** actions on a queued message are commands of the `ompweb-omp` channel (`promote_queued_message`, `remove_queued_message`). Deletion is confirmed by omp before the chip disappears; editing recalls text only after cancellation succeeds. A message that is no longer pending leaves the queue unchanged and displays a notice; ompweb does not send a duplicate steering message.
 
-Queue **Delete** and **Edit** additionally require `remove_queued_message`. Deletion is confirmed by OMP before the chip disappears; editing recalls text only after cancellation succeeds. Unsupported runtimes or messages that are no longer pending leave the queue unchanged and display a notice.
-
-The queue panel shows omp's own queue (`queuedMessages` in `get_state` and `queue_update` events, omp 18.4.4 or later), so every device viewing a session sees the same queued messages. **Stop** moves the text of messages still waiting in the queue back into the composer instead of letting the agent run them; a steer the model already picked up through live steering still runs. Older omp runtimes show no queue panel, and Stop cannot take queued messages back.
+The queue panel shows omp's own queue (`queuedMessages` in `get_state` and `queue_update` events), so every device viewing a session sees the same queued messages. **Stop** moves the text of messages still waiting in the queue back into the composer instead of letting the agent run them; a steer the model already picked up through live steering still runs.
 
 ## App installation behind authentication
 
@@ -54,20 +60,6 @@ manifest exception or Access bypass rule is needed. This does not add offline
 support. Local Chromium verification covered cookie-gated metadata with HTTP
 icon URLs blocked (zero installability errors). The owner also confirmed that
 installation on a physical phone works as expected behind Cloudflare Access.
-
-Skill startup notices require an OMP runtime with `get_skill_diagnostics`,
-`set_skill_startup_diagnostics`, and `skill_diagnostics_update`. Conflicts and
-redundant installations appear above the composer when its OMP session starts;
-an empty new-chat page does not start OMP just for diagnostics. **Details** shows
-the resolved default, variants, identical copies, backing paths, sources, and
-selection reason. The **×** button dismisses the notice for that session until
-the diagnostic report changes. **Turn off** and **Settings →
-Interface & Behavior → Skill startup notices** use OMP's persisted
-`skills.showStartupDiagnostics` preference, not a separate browser setting.
-**Settings → Extensions & Tools → Skills → View skill diagnostics** remains
-available for a selected running session when notices are off. Inspection does
-not resume stopped sessions. Missing support or no running session is unavailable,
-not a clean result.
 
 ## Notifications
 
@@ -92,8 +84,46 @@ session you are viewing. Clicking a notification opens its session.
 - Desktop browsers show notifications through the operating system's
   notification center. Push delivery needs the browser process running.
 
-Completion notifications use omp's `prompt_result` and `session_settled` RPC
-frames (omp 18.3.1 or later).
+Completion notifications use the `ompweb-omp` channel's `prompt_result` and
+`session_settled` frames.
+
+## GitHub agent tools
+
+With **Agent tools** enabled and `gh` logged in on the web server, agents can
+watch pull requests, issues and specific GitHub Actions runs. Pass a run URL such
+as `https://github.com/OWNER/REPO/actions/runs/ID` to `watch_github`; status and
+attempt changes arrive in the session, followed by the final conclusion. The
+watch ends after completion. Runs that already completed are not registered.
+Watches survive server restarts and use the existing 20-watch limit per session.
+
+Automatic updates contain metadata only, not workflow names, job names or logs.
+Use `github_read` with the same URL for run details (`include: ["summary"]`) or
+jobs (`include: ["checks"]`), and `unwatch_github` to stop watching. Run comments,
+other read parts, and subscriptions to future runs of a workflow are not supported.
+Remote sessions use the same per-repository read confirmation as PRs and issues.
+
+For manual runs, use `github_workflow_list` to discover workflows and
+`github_workflow_read` with a branch or tag to inspect dispatch inputs.
+`github_workflow_dispatch` takes `repo`, `workflow`, `ref` and optional `inputs`,
+and returns the exact created run ID and URL. Pass that URL to `watch_github`.
+`github_run_list` finds existing runs; `github_run_cancel` requests cancellation;
+`github_run_rerun` requests all or failed jobs, or a specific job and its dependents.
+A rerun retains its run ID: read until the new attempt appears before watching it.
+
+Settings → System controls dispatch, cancellation and rerun independently:
+**Blocked**, **Ask each time** (default), or **Allow without asking**.
+The comment-writing switch does not authorize these operations. These controls
+limit agent actions through omp-web, not the server account's GitHub privileges.
+GitHub refusals retain the reported reason and available permission, SSO or
+rate-limit evidence; a 403 alone is not treated as a missing token scope.
+Fine-grained credentials need Actions write for these mutations; classic/OAuth
+credentials use `repo`. The classic `workflow` scope is for editing workflow
+files, not dispatching them. omp-web does not change credentials automatically.
+
+Mutation requests are recorded before sending and are never automatically
+replayed after an uncertain result. Inspect the existing runs before issuing a
+new dispatch or rerun. Confirmation inputs and explicit workflow reads are not
+secret channels: do not pass credentials as workflow inputs.
 
 ## Quick Start
 
@@ -105,7 +135,7 @@ npx @kahme247/ompweb@latest
 
 or
 ```bash
-nix run github:kahme247/ompweb
+nix run github:ompweb-dev/ompweb
 ```
 
 **Or install globally:**
@@ -125,6 +155,8 @@ Open [http://127.0.0.1:30177](http://127.0.0.1:30177) in your browser.
 ompweb --port 8080                         # Custom port
 ompweb --hostname 0.0.0.0                  # Listen on network
 ompweb hash-password                       # Print the value for OMP_WEB_PASSWORD_HASH
+ompweb fetch-omp                           # Download this version's ompweb-omp from its GitHub release (SHA-256-checked) if it is missing
+ompweb preflight                           # Start the session omp once (as a new session would) and wait for its hello; exit 1 says why it failed
 ompweb --no-open                           # Don't auto-open the browser
 ompweb --install-tray                      # Install Windows System Tray service & Desktop shortcuts
 ompweb --uninstall-tray                    # Uninstall Windows System Tray service & shortcuts
@@ -181,7 +213,11 @@ restart, without signing out of Windows.
 
 ### Behind a reverse proxy
 
-Forward WebSocket upgrades on `/api/events/link` (browsers) and `/api/hosts/link` (hosts); without the upgrade, a browser falls back to server-sent events after a few seconds. In nginx that means `proxy_http_version 1.1;`, `proxy_set_header Upgrade $http_upgrade;`, `proxy_set_header Connection "upgrade";`, and a `proxy_read_timeout` well above 30 s.
+Forward WebSocket upgrades on `/api/events/link` (browsers), `/api/hosts/link` (application traffic) and `/api/hosts/maintenance` (host management and recovery); without the browser upgrade, the browser falls back to server-sent events after a few seconds. In nginx that means `proxy_http_version 1.1;`, `proxy_set_header Upgrade $http_upgrade;`, `proxy_set_header Connection "upgrade";`, and a `proxy_read_timeout` well above 30 s.
+
+Hosts that [use the server's provider logins](#use-the-servers-provider-logins-on-a-host) also call `/api/hosts/broker/`, authenticated by their host token. That path must reach ompweb without the proxy's own authentication (a proxy login page or `auth_request` would block the daemon), without response buffering (it carries a long-lived event stream; in nginx, `proxy_buffering off;`) and without redirects.
+
+Cluster members also fetch this machine's omp configuration from `/api/hosts/cluster-config/manifest` and `/api/hosts/cluster-config/file/<hash>` (exactly these two paths, `<hash>` being 64 hexadecimal digits), authenticated by their host token and answering members only. Unlike the broker's prefix, they must be reachable at exactly these paths, without the proxy's own authentication and without redirects.
 
 ### Two services: the web server and the local daemon
 
@@ -190,23 +226,24 @@ linked to the web server over loopback. The service installers (`ompweb systemd 
 `ompweb launchd install`, `ompweb --install-tray`) install both: the web
 service and `ompweb-host`. Uninstall removes both.
 
-**Running ompweb in the foreground** (`ompweb` in a terminal, or `npx
-@kahme247/ompweb@latest`) installs no service, so nothing runs the daemon: keep
-`ompweb host` (with npx: `npx @kahme247/ompweb@latest host`) running in a
-second terminal. Without it "This machine" stays offline. The web server writes
-the daemon's link when it starts, so start the web server first.
+**Running ompweb in the foreground** (`ompweb` in a terminal, or
+`npx @kahme247/ompweb@latest`) installs no service. The production server prepares
+the local link and starts an independent `ompweb host` if none answers its private
+control endpoint. It reuses an existing daemon, including an older one awaiting
+recovery; concurrent starts cannot create two hosts. A configured native host
+supervisor keeps ownership even when startup is slow: the web server does not
+replace it with an unmanaged daemon after a fixed grace period.
 
 - **Restarting or redeploying the web server does not interrupt runs.** The daemon
   keeps the omp processes running; the restarted web server takes them over, with
   no resume prompt, and dialogs or tool calls omp was waiting on reappear.
 - **Restarting the daemon does end runs** (it owns the omp processes). With auto-resume
   on, sessions that were running resume once. `ompweb systemd restart` restarts the
-  web service only; upgrades restart the daemon only when its link protocol version
-  is outside the range the new release supports.
-- **First start after an upgrade:** if no daemon has linked after about 90 seconds,
-  ompweb shows a banner with the install command for your platform. It never installs
-  services itself. Until the daemon runs, "This machine" shows offline and new
-  sessions on it cannot start.
+  web service only. A coordinated upgrade shows any required daemon restart before
+  asking for approval.
+- **A failed local start stays visible.** The web server never installs services
+  itself. If the daemon cannot start or its endpoint cannot be verified, "This
+  machine" remains offline and the install/start guidance remains available.
 - **It is a host like any other.** Rename "This machine" in **Settings → Hosts**
   (clear the name to reset it); it cannot be revoked. The web server writes the
   daemon's link (`~/.omp/agent/omp-web/host.json`, mode `600`) at startup, only
@@ -214,25 +251,297 @@ the daemon's link when it starts, so start the web server first.
 - **Development:** `npm run dev` does not take the daemon (see
   [Development](#development)).
 
+### Coordinated upgrades
+
+**Settings → System → Update** updates the server, including an owned single-binary
+release. It first prepares a plan showing the target version, required host
+upgrades, affected sessions and any compatibility or recovery blocker. Compatible
+remote hosts keep running; the local host is included when its installation must
+be replaced or its protocol upgraded.
+
+Review the plan, then approve it. An update that must interrupt sessions or use
+legacy recovery requires a separate, unchecked **Force** confirmation. Force may
+terminate sessions and subagents; it never bypasses release digests, installation
+ownership, process identity, service permissions or the update-disable setting.
+An unreachable incompatible host blocks a server-only cutover instead of being
+silently left behind.
+Approval pins the selected release and its artifacts. Changing either requires
+a new plan and approval; a later registry `latest` does not replace an approved
+target. Required service stop/start permissions are checked before any
+incompatible host moves.
+
+**Settings → Hosts** retains per-host Update and offers **Force update** when a
+verified recovery path is available. For old daemons without the maintenance API,
+the server uses an isolated, fixed recovery bootstrap through their existing
+runner command channel. Windows uses native PowerShell and Windows process/service
+APIs; Linux and macOS use their own supervisor controls. A broken legacy runner or
+an uncontrollable service is reported, not treated as an updated host.
+For systemd, verified user units and elevated system-service control are supported.
+A non-root system service with custom polkit grants is refused when its exact
+stop/start authority cannot be proved without changing service state; use a user
+unit rather than relying on an unverifiable grant.
+
+All required participants download, verify and preflight their pinned release
+before the coordinator authorizes any host to stop. A failed preparation cancels
+the other preparations without changing their installations. Host version,
+protocol and session inventory are checked again before committing and before
+server cutover; an unrelated change invalidates the approved plan.
+Progress survives web-server restarts; completion requires the expected release,
+approved protocol receipt and connection to the specific server being upgraded. A failed
+cutover restores the previous installation where possible and reports any
+participant still requiring recovery. An uncertain shutdown or maintenance reply
+retains its update claim and displays the recovery error instead of permitting a
+second update. Closing the dialog does not cancel a committed update.
+
+### Transparent host pools
+
+ompweb has at most one cluster: the first pool in `pools.json`. This machine is its master.
+Creating the cluster adds this machine; an existing first pool that lacks it gains it on the
+next join. The cluster appears in the sidebar as one group with one entry per Git repository.
+Choose the cluster rather than a member; new independent sessions are placed on an eligible
+member and receive an isolated local worktree. Adding a cluster project registers
+its Git origin, not a central clone; adding another URL form of a repository the cluster
+already has returns that project, unhidden, and keeps its stored origin. The selected member
+prepares its checkout when the session starts and reports authentication, preparation, or
+repository conflicts explicitly.
+Standalone hosts, including the Mac, keep their own groups with typed paths and local clone
+progress/cancellation. Resolving the owner for a new chat's attachment does not replace its
+live composer or discard its draft and uploads. Placement and preparation failures are also
+shown when command discovery or system-prompt inspection starts a session lazily; retrying
+remains an explicit user action.
+
+**Joining and leaving.** Each linked host has an **In the cluster** switch in **Settings →
+Hosts**. Turning it on asks for a folder on that host for the checkouts the cluster creates
+(default `<home>/ompweb-cluster`) and shows what changes. It needs the host online, its daemon
+on link protocol 10 with the `gitOrigins` operation, and omp 15.13.1 or newer (a member always
+uses this machine's provider logins); otherwise the disabled switch asks for an update of
+ompweb or omp, or shows the host's unavailable status. While this machine is not a member yet,
+its own daemon needs the same, and the switch asks to restart the host service on this machine
+(or to update its omp).
+
+- **Joining:** the host's Git projects are matched by repository: the same repository on
+  several members is one cluster project, and its sessions are listed together. `git@github.com:a/b.git`
+  and `https://github.com/a/b` are the same repository. Projects without a single Git `origin`,
+  subfolders and linked worktrees stay on their node; the cluster shows them with the node's
+  name, and a new session there starts on that node. No project files on the host change. A
+  cluster project created from a host project keeps the name and alias it showed (the folder
+  name when it had no name of its own). A visible checkout that matches a hidden cluster project
+  makes that project visible again. This machine joins with the first host added while it is
+  not a member (when the cluster is created, or on the next join of an older first pool without
+  it): its Git projects then become cluster projects too, and new sessions in them start on any
+  member with capacity, not in its own checkout.
+  A second checkout of a repository already bound on that host also stays on its node.
+  Projects inside, or containing, the chosen checkout folder stay on their node too; pick an
+  empty folder that is not a parent of existing projects.
+- **Leaving:** the host takes no new cluster sessions. Its matched projects are listed under
+  the host again. Checkouts the cluster created inside the host's folder stay bound, so
+  sessions the cluster started there stay under the cluster's projects. The cluster keeps the
+  projects it gained from the host, so they may now be listed twice; hide any you do not want.
+  This machine cannot leave, and the cluster stays when the last linked host does. Revoking a
+  member removes it from the cluster the same way; while `pools.json` cannot be read, the revoke
+  is refused.
+- **Provider logins:** a member always uses this machine's provider logins, whatever its own
+  [**Use this server's provider logins**](#use-the-servers-provider-logins-on-a-host) setting
+  says; Settings shows it on and disabled. This is computed from membership, so leaving brings
+  the host's own setting back. A member can read this machine's access tokens and stored API
+  keys. Cluster placement skips a member that cannot take these logins (daemon below link
+  protocol 9, or a link that does not share) before preparing a checkout there. The rest of
+  this machine's omp configuration (`models.yml`, settings, MCP servers, skills, plugins and
+  more) is mirrored to members too; see [Cluster members use this machine's omp
+  configuration](#cluster-members-use-this-machines-omp-configuration).
+- **Limits:** a host that is too slow to report its Git remotes within the time limit keeps
+  the remaining projects on its node; leaving and joining again retries them. Only Linux hosts
+  report capacity, so a macOS or Windows master never runs cluster sessions itself: its Git
+  projects start only on other members, and a start fails with "No pool worker currently has
+  eligible capacity" when none has capacity. A pool disabled through the API takes no new
+  sessions, including this machine's Git projects moved into it, which then cannot start
+  anywhere; its members still use this machine's provider logins. Settings cannot enable it
+  again.
+
+**Upgrade note.** After this update, every linked host already in the first pool uses this
+machine's provider logins (it can read their access tokens and stored API keys), without a
+confirmation having been shown. This includes a first pool disabled through the API, and a
+host added to the first pool later through `PUT /api/hosts` or by editing `pools.json`:
+membership, not scheduling, grants the logins. Each linked member needs an updated ompweb host
+daemon (link protocol 9 at that release; cluster members now need link protocol 10, see the next
+note) and omp 15.13.1 or newer; until the daemon is updated, cluster
+placement skips that member, and a start fails when no other member is eligible. Before
+updating, remove a host that should not receive the logins from the first pool using
+`PUT /api/hosts` or editing `~/.omp/agent/omp-web/pools.json`; the old version has no
+membership switch.
+
+**Upgrade note (configuration).** Joining the cluster, and every cluster session on a member,
+now need an ompweb host daemon at link protocol 10 on that member. Until a member's daemon is
+updated, session starts there are refused ("Update ompweb on the host…"), cluster placement
+skips it, and Settings → Hosts says it needs an update. Once its daemon is updated, every host
+already in the first pool receives this machine's configuration, secrets included (API keys,
+MCP environments and headers, tokens), automatically and without a confirmation having been
+shown, within about a minute, and its own configuration is replaced until it leaves (see
+below). To avoid that for a host, remove it from the first pool before updating its daemon,
+using `PUT /api/hosts` or editing `~/.omp/agent/omp-web/pools.json`. Update the web server
+first, then the members.
+
+Creation retries reuse the same intent and creation identity. Once a real session is known,
+its owner remains authoritative for resume, files, terminal, uploads, artifacts, rename, and
+delete, even if pool membership changes. An unavailable owner does not trigger replacement
+on another worker or on the Mac. Dirty files and unpublished work remain on that owner;
+there is no live migration or unpublished-work failover. After an uncertain response,
+inspect the retained session before explicitly retrying a command that may have run.
+
+### Cluster members use this machine's omp configuration
+
+A cluster session can run on any member, and each member runs it with this machine's omp
+configuration: the models, MCP servers, skills, task agents, rules and plugins do not depend on
+the member chosen. A change made here, in Settings or on disk, reaches the members within about
+a minute without any action on them, and before every session start on a member. A host outside
+the cluster keeps its own configuration, managed on that machine.
+
+- **What is mirrored:** from this machine's omp agent directory (`~/.omp/agent`): `config.yml`
+  (without the keys below), `models.yml`, `mcp.json`, `.mcp.json`, `AGENTS.md`, `RULES.md`,
+  `SYSTEM.md`, `APPEND_SYSTEM.md`, `TITLE_SYSTEM.md`, `secrets.yml`, `.env`, and the directories
+  `skills/`, `agents/`, `rules/`, `instructions/`, `commands/`, `prompts/`, `hooks/`,
+  `extensions/` and `tools/`. Also `~/.agents/skills/` (where Settings installs skills), the
+  agent environment variables of **Settings → System**, and the set of installed plugins with
+  whether each is enabled. A mirrored directory becomes equal to this machine's: a file that
+  exists only on the member is removed from it. `node_modules` and `.git` directories are left
+  out. The member's backup holds only what the host had when it joined; a file added or edited
+  on the member afterwards is deleted at the next apply, not backed up.
+- **What is not mirrored:** `lsp.json`, `ssh.json`, themes, key bindings, sessions, history,
+  `agent.db`, caches and `secret-placeholder.key`; configuration inside a repository (`.omp/`
+  travels with the checkout); named omp profiles (a cluster project that names a profile runs
+  with that profile's own files on each member); and programs: an MCP server's command, a
+  language server or a local model engine that exists only on this machine is not installed on
+  members.
+- **Settings that stay the member's own:** `shellPath`, `python.interpreter`, `browser.*`,
+  `worktree.base`, `plan.autosaveDir`, `shellMinimizer.settingsPath`, `mnemopi.dbPath`,
+  `workspace.additionalDirectories`, `skills.customDirectories`, `extensions`, `images.urls.*`,
+  `providers.tinyModelDevice`, `providers.tinyModelDtype`, `tts.*`, `stt.*`, `tui.*`,
+  `terminal.*`, `lsp.*` and `auth.broker.*`. A member keeps its own value for each of them as
+  it was when the host joined, or none; a change made on the member afterwards is reset at the
+  next apply.
+- **Limits:** a file over 5 MiB, a configuration over 50 MiB in all, or so many files that their
+  list is over 5 MiB, is not mirrored at all: this machine serves no configuration, a cluster
+  session start on a member is refused (409 `cluster_config_invalid`), placement skips every
+  member, and **Settings → Hosts** names the file that is over, or says there are too many
+  files. A `config.yml` that is not a YAML map or a file that cannot be read does
+  the same. Each download a member makes (the list of files, and each file) must finish within
+  30 s, body included; a 5 MiB file needs roughly 1.4 Mbit/s, and a member on a slower link
+  does not update.
+- **When a member applies it:** after joining; when it is behind this machine's version
+  (checked every 30 s and at each cluster session start on a member; a new version found
+  either way is sent to every member at once); and before every session start on the member, which waits for it. The
+  files are written whole or not at all: a failure leaves the previous version in place. Every
+  cluster session start carries this machine's version, and a start that must run on that
+  member (a resumed session, a project pinned to its node) is refused with the reason when the
+  files cannot be applied; new cluster sessions are placed only on members that have this
+  machine's current configuration and plugins. A session recovered after a daemon restart, or
+  started by another ompweb server, runs on whatever is on the member's disk at that moment.
+  Sessions already running are not restarted. The applied files are readable by the daemon's
+  user only.
+- **Plugins:** after the files, the member runs `omp plugin` itself to install what it lacks
+  (this needs `bun` and network access on the member), uninstall what this machine does not
+  have, and match each plugin's enabled state. npm plugins
+  are pinned to this machine's version; a marketplace plugin has no version pin in omp, so one
+  already installed counts as matching. A session start does not wait for its own version's
+  plugins, but a start that needs a new version waits behind a plugin job that is still running
+  (up to 5 minutes for each install). A new version with the same plugins keeps the member
+  current while its plugins are checked again. A failed install
+  leaves the member not current, so placement skips it; it is retried about every 30 s and
+  Settings shows omp's message.
+- **Joining:** needs link protocol 10 on the host. Before the first apply, the host's own
+  version of every mirrored file and directory moves to `<agent dir>/omp-web/own-config/` on
+  the host, with its plugin list and agent environment variables; the join dialog says the host
+  receives this machine's configuration, API keys and environment values included, in place of
+  its own until it leaves. A host holds one ompweb server's configuration at
+  a time: a host already in another server's cluster cannot join (409 `host_in_other_cluster`)
+  and must leave that cluster first. If the host also runs sessions for another ompweb server
+  (as a standalone host there), they run on this server's configuration for as long as the host
+  is a member here.
+- **Changes made on a member** to a mirrored file are overwritten at the next apply; change the
+  configuration here. An apply is refused when `~/.agents` is a symbolic link on the member:
+  replace it with a real directory. The
+  mirrored directories, the staging area and the backup must be on one filesystem.
+- **Leaving:** the daemon removes the mirrored files, moves its backup into place, puts back
+  its agent environment variables, and reinstalls its own plugins as far as omp allows. Its own
+  `config.yml` is its own file again. If putting its configuration back fails, Settings says so
+  and the restore is retried while the host is linked, also for a host that was offline when it
+  left. A member that is revoked gets its own omp configuration back from its daemon: at once if
+  the daemon is connected, otherwise the next time it reaches this machine (and is refused). A session start
+  that races a leave is refused. This machine is the master: nothing is
+  mirrored to it and nothing of it is backed up.
+- **Settings:** each member's line in **Settings → Hosts** shows *same as the master*,
+  *updating…*, *failed* with the reason, *held by another ompweb server*, or that the host needs
+  an update, and the MCP server commands in the mirrored files that are not installed there.
+  When this machine's configuration cannot be mirrored, one message names the file, and no
+  member line says *updating…*. For a session or project of the cluster, the Models, settings, MCP, Skills, Plugins and Agents
+  screens say that changes apply to every member, and so does **Settings → System** next to the
+  agent environment variables. For a session on another member they act on
+  this machine's user-level configuration, which the member runs; that session's and project's
+  own configuration is not shown there. MCP shows that session's live status, read from the
+  process where it runs, and cannot change it; MCP toggles, reload and Skills diagnostics for
+  the session are not available there.
+- **API:** `GET /api/plugins`, `POST /api/plugins`, `GET /api/skills`, `POST /api/skills/check`
+  and `POST /api/skills/update` accept a request without `cwd` and then act on the user level
+  only (a project-scope change still needs a `cwd`). `GET /api/mcp?sessionId=…&attach=1` reads
+  the live MCP status of a session that is already running and never starts one.
+- **Security:** the configuration contains secrets: API keys in `models.yml` and `.env`, MCP
+  server environments and headers, tokens in `config.yml` and the values in `secrets.yml`. They
+  are written to every member's disk, readable by the daemon's user only; a member can already
+  read this machine's provider logins, and this adds the rest. Hooks, extensions, custom tools
+  and plugins are code: this machine's code runs on every member; this machine can already
+  start omp with full tool access there. Nothing flows the other way:
+  a member cannot change this machine's configuration, and the routes only serve members,
+  checked on every request, and stop answering a host the moment it leaves or is revoked.
+- **Differences that remain:** a provider in `models.yml` that points at this machine's own
+  address (for example `http://127.0.0.1:11434`) points at the member's own address there, so a
+  local engine has to run on each member or be given an address they can all reach. An API key
+  written as an environment-variable name or as a `!command` resolves on the member: the
+  variable or command must exist there (variables set in Settings → System or in the mirrored
+  `.env` do). MCP servers started by a command need that command on each member.
+
+
+### Local worker maintenance
+
+`ompweb host status` prints daemon PID, native version/protocol, welcomed-link readiness,
+executable/entrypoint identity and maintenance state without credentials.
+`ompweb host drain` synchronously checks children (idle included), preparations,
+uploads/controls, pending operations and reliable results, and closes new-work admission
+only when idle. A busy refusal never kills work or changes admission.
+`ompweb host resume` reopens the live daemon. Controls run inside the existing daemon, not
+TCP or a separate service: a private Unix socket on Linux and macOS, and on Windows a named
+pipe with a random name and a per-start token. Windows keeps both in
+`<agent dir>/omp-web/host-control.json`, which only the daemon's user can read through the
+agent directory; a request without the current token is refused. A disconnected deployer
+cannot release a live drain. Windows hosts report CPU and memory capacity too, so they can be
+pool workers.
+Disable central member admission before worker rollout; native drain is the final race-free guard.
+
+Worker service cutovers can additionally start drained through `OMP_WEB_HOST_DRAINED=1`
+in their protected temporary unit environment. Live resume does not remove that startup
+setting. After a deployer crash or lost final resume reply, verify the selected release,
+PID and welcomed-link health, and remove the known worker maintenance flag before explicit
+resume. Never infer from a missing acknowledgement that admission stayed closed, and never
+stop or roll back a candidate after its deployment commit point.
+
 ### Single binary
 
-Each [release](https://github.com/kahme247/ompweb/releases/latest) also ships
+Each [release](https://github.com/ompweb-dev/ompweb/releases/latest) also ships
 ompweb as one compiled program with the files it serves beside it:
 `ompweb-linux-x64.tar.gz`, `ompweb-linux-arm64.tar.gz`, `ompweb-darwin-x64.tar.gz`,
 `ompweb-darwin-arm64.tar.gz` and `ompweb-windows-x64.zip`. It needs no Node, npm
-or Bun; only omp must be installed. The x64 builds use Bun's baseline runtime, so
+or Bun, and no omp: on its first start it downloads its own omp build, `ompweb-omp`, from the same release
+(SHA-256-checked) and keeps it beside itself (prerelease archives already carry it). The x64 builds use Bun's baseline runtime, so
 they also run on CPUs without AVX2. Each archive carries the licenses of what it
 bundles in `licenses/`. Every commit on `main` that passes CI is also published as a
-[prerelease](https://github.com/kahme247/ompweb/releases) named after the time it was
+[prerelease](https://github.com/ompweb-dev/ompweb/releases) named after the time it was
 built (for example `2026-11-01T10:30:00Z`), with the same five archives.
 
 ```bash
 tar -xzf ompweb-linux-x64.tar.gz -C ~/.local/share   # unpacks ompweb-linux-x64/
 ~/.local/share/ompweb-linux-x64/ompweb               # the web server: same options and environment variables as above
-~/.local/share/ompweb-linux-x64/ompweb host          # the local daemon, in a second terminal
 ```
 
-- **Keep `ompweb` in its directory.** It serves `dist/`, `public/` and the other
+- **Keep `ompweb` in its directory.** It runs the `ompweb-omp` beside it and serves `dist/`, `public/` and the other
   files from the directory it is in (a symlink to it on your `PATH` works), or
   from `OMP_WEB_PACKAGE_DIR` when that is set.
 - **macOS** quarantines downloads: run `xattr -dr com.apple.quarantine ompweb-darwin-arm64`
@@ -242,12 +551,12 @@ tar -xzf ompweb-linux-x64.tar.gz -C ~/.local/share   # unpacks ompweb-linux-x64/
   `curl` reaches it, allow your terminal (or `ompweb`) under System Settings →
   Privacy & Security → Local Network. A server reached over a VPN such as
   Tailscale, or a host started from an SSH session, is not affected.
-- **No tray, service installers or in-app update.** To update, stop `ompweb` and
-  `ompweb host`, replace the directory with the new release, and start both again;
-  **Settings → System** links the release page when a new version is out.
-  Your sessions and settings live in `~/.omp`, not in that directory.
-- **As systemd user services**, write the two units yourself (adjust the paths;
-  add omp's directory to `PATH`, or set `OMP_WEB_OMP_BIN`):
+- **GUI updates, without a tray or service installer.** **Settings → System**
+  prepares and confirms an update of the owned release directory and any required
+  host migration. **Settings → Hosts** manages individual daemons. Keep the release
+  directory writable only by its owner and retain permission to control its service
+  or scheduled task. Sessions and settings live in `~/.omp`, outside that directory.
+- **As systemd user services**, write the two units yourself (adjust the paths):
 
 ```ini
 # ~/.config/systemd/user/ompweb.service
@@ -435,8 +744,9 @@ host (KDE Plasma, and most Wayland/X11 desktops).
 ## Run sessions on another machine
 
 One ompweb can start and watch omp sessions on other machines. Each machine keeps
-its own `omp` install, `~/.omp/agent` directory, sessions, and credentials;
-ompweb only routes. The remote machine needs `omp` and either Node 24 (for `npx`) or
+its own ompweb (with its `ompweb-omp`), `~/.omp/agent` directory, sessions, and credentials (unless you
+[share the server's provider logins](#use-the-servers-provider-logins-on-a-host));
+ompweb only routes. The remote machine needs either Node 24 (for `npx`) or
 the [single binary](#single-binary), and must be able to reach the ompweb server over
 HTTP(S). It dials out, so it can sit behind NAT.
 
@@ -460,20 +770,35 @@ HTTP(S). It dials out, so it can sit behind NAT.
    The host shows **online** in Settings → Hosts, the sidebar gets a group for it,
    and the new-session screen gets a host picker.
 
-**Settings → Hosts** also shows each machine's ompweb daemon and OMP runtime
-versions, available updates and update actions, including **This machine**.
+**Settings → Hosts** also shows each machine's ompweb daemon and omp versions,
+available updates and update actions, including **This machine**.
 Checks and installations run on the selected host, not on the web server. A host
 update whose link protocol is incompatible with the current web app stays visible
 but is blocked with a reason; update the web server first. An unverifiable target
-protocol is blocked too. OMP updates are independent of the link protocol.
+protocol is blocked too. omp is part of each ompweb release and updates with it.
 Before updating a daemon, close its session processes: the updater refuses to
-interrupt sessions or subagents. Updating OMP leaves existing processes on their
-loaded version until they restart. **Settings → System** keeps the web server's
+interrupt sessions or subagents. **Settings → System** keeps the web server's
 own application update and service settings.
-Hosts need a daemon build that supports these update operations; older builds
-show an unsupported message and need one manual update first. If the daemon
-shares its installation with the web server, update the server first, then use
-the host's restart-only update. Unsupported service wrappers and detected restart
+
+**From 0.7.1 onward, maintenance API v1 is separate from application Protocol v12.**
+The daemon connects to `/api/hosts/maintenance` with the same host token; status,
+session inventory and activity, capabilities, update checks and installation do not
+require a compatible application connection. An application mismatch still blocks
+chat, workspace operations and session attachment, not maintenance.
+
+**Upgrading v10 and v11 daemons:** update the web server to 0.7.1 first, then use
+**Settings → Hosts → Update**. An upgrade-only shim welcomes each old daemon using
+its own protocol and speaks only its existing updater's requests. It never adopts
+or stops its sessions, and the old updater still refuses a busy host. Close those
+session processes before the cutover. If server and daemon share an installation,
+the server update puts the new files in place and the host update only restarts
+the daemon. A daemon that already exited after an earlier version rejection needs
+starting once; an exited process cannot be reached by the shim.
+
+Reverse proxies must forward WebSocket upgrades for `/api/hosts/maintenance`
+without an additional authentication prompt, just as for `/api/hosts/link`.
+Daemons below v10 or without the existing update operations need one manual update.
+Unsupported service wrappers and detected restart
 scripts show a manual-update reason. Stop external restart loops before updating
 a foreground daemon.
 
@@ -505,7 +830,7 @@ everything else on it: they resume when it wakes, and the link returns then. A
 docked or no-sleep setup keeps running with the lid closed. Revoking a host in
 Settings closes its link and the daemon stops its omp processes.
 
-A reverse proxy must forward the upgrade on `/api/hosts/link`; see [Behind a reverse proxy](#behind-a-reverse-proxy).
+A reverse proxy must forward the upgrade on `/api/hosts/link`. For hosts that share the server's logins it must also pass `/api/hosts/broker/` without the proxy's own authentication and without response buffering; for cluster members, likewise `/api/hosts/cluster-config/manifest` and `/api/hosts/cluster-config/file/<hash>` without the proxy's own authentication. See [Behind a reverse proxy](#behind-a-reverse-proxy).
 
 Update ompweb on the server before its hosts: a host from before this version shows **needs upgrade** until it is updated.
 
@@ -533,9 +858,11 @@ Notes:
   @-mentions and live file watching use the owning machine's daemon, including
   This machine. Explorer uploads accept up to 2 GiB per file with no 100 MiB batch
   cap; preview limits remain 256 KiB for text and 10 MiB for images/DOCX.
-  File tabs retain their source host when you switch chats. An unavailable or
-  older daemon reports offline or asks for an update; main never substitutes its
-  own filesystem.
+  File tabs retain their source session, host and workspace when you switch chats;
+  paths from another conversation cannot be mentioned into the selected chat.
+  An unavailable or older daemon reports offline or asks for an update; main
+  never substitutes its own filesystem. Unprepared pool chats have no guessed
+  filesystem to browse.
 - **Git and worktrees on every host:** status, diffs, GitHub issue links, and
   worktree creation, selection and removal run on the owning daemon. Dirty
   worktrees still require explicit force confirmation. Switching a worktree
@@ -547,13 +874,30 @@ Notes:
   If the destination changes during cleanup, captured data is preserved in a
   private quarantine and the error gives its location; inspect it before removing
   or restoring anything.
-- **Not available on remote hosts yet:** session archiving and the Skills,
-  Plugins, Agents and MCP settings. Transcript search still scans this machine.
+- **Not available on remote hosts yet:** the Skills,
+  Plugins, Agents and MCP settings, for a host outside the cluster (a cluster member uses
+  this machine's: see [above](#cluster-members-use-this-machines-omp-configuration)).
+  Transcript search still scans this machine.
 - **Agent-started sessions:** with agent tools enabled, an agent can pass a `host`
   to `new_session` (it defaults to the agent's own host). A remote host asks for
   confirmation each time unless **Agents can start sessions here without asking**
   is switched on for it in Settings → Hosts. An agent running on a remote host
   always asks before it starts or messages a session on this machine.
+
+### Use the server's provider logins on a host
+
+By default a host uses its own omp logins. Turn on **Use this server's provider logins** for a host in **Settings → Hosts** and the sessions started there use the logins stored on the ompweb server instead, so you log in to a provider once. The setting is per host and off by default; turning it on asks for confirmation. This machine does not have it, because it already uses the server's logins.
+
+- **What is shared:** the provider logins stored on the server (OAuth logins and stored API keys). The server runs `omp auth-broker serve` for this and starts it on the first request; it stops after 5 minutes without one.
+- **When a change reaches a host:** every omp process started after a login or logout on the server uses it. A running process picks it up the next time it is used, because omp stops listening for updates after 20 seconds without activity and resumes on its next use. A running process keeps the access tokens and API keys it has already loaded until it ends.
+- **What is not shared:** custom providers in `models.yml`, API keys set through environment variables (a host's own environment keys still apply there), and omp settings. A cluster member does get these from this machine: see [Cluster members use this machine's omp configuration](#cluster-members-use-this-machines-omp-configuration).
+- **Requirements:** the server's own `omp` must provide `omp auth-broker`. The host's daemon must speak link protocol 9 and its `omp` must be 15.13.1 or newer; otherwise starting a session on that host is refused with a message naming what to update. It never falls back to the host's own stored logins. Joining a session that is already running is not refused. The setting applies to omp processes started after you change it.
+- **What the host can read:** the current access token of every OAuth login and every stored API key, in full. A process running as the daemon's user can do the same. OAuth refresh tokens never leave the server machine, and the host cannot add or replace a login. It can mark a login disabled or rate-limited for every machine.
+- **Turning it off:** turning sharing off, or revoking the host, aborts the host's open requests to the server and refuses later ones. Access tokens the host already read stay valid until they expire, and API keys until you rotate them at the provider.
+- **Dependence on the server:** a running session asks the server whenever an access token needs a refresh, so it fails to authenticate once its token expires while the server is unreachable. An `omp` you run yourself in the host's terminal is unaffected.
+- **Troubleshooting:** when sessions on a sharing host fail at startup, check the server log for `[omp-web] broker` lines and that the reverse proxy lets `/api/hosts/broker/` through.
+
+The host token is not put in an omp process's environment. The daemon listens on a loopback port with a secret it generates at each start, gives omp that address and secret, and forwards the requests to the server with the host token.
 
 ### Keep a host running as a service
 
@@ -572,7 +916,7 @@ update, stop the service, replace the release directory, and start it again. Aft
 revoking a host, stop and remove its service: it otherwise keeps retrying.
 
 **Linux (systemd user service).** Create `~/.config/systemd/user/ompweb-host.service`
-(adjust the release path, and add omp's directory to `PATH` or set `OMP_WEB_OMP_BIN`):
+(adjust the release path):
 
 ```ini
 [Unit]
@@ -698,7 +1042,7 @@ Stop it with `Stop-ScheduledTask ompweb-host`, then end the running host with
 | `OMP_WEB_NO_OPEN` | Set to `1` to prevent auto-opening browser | `0` |
 | `OMP_WEB_DISABLE_AUTOUPDATE` | Set to `1` to disable update checks and in-app updates; restart after changing | `0` |
 | `OMP_WEB_NAME` | Name shown in browser tabs and installed-app names. `url`, `host` or `domain` (any case) uses the hostname the browser connected to, without port; localhost and IP addresses keep `omp web`. Any other value is used as-is. Restart after changing | `omp web` |
-| `OMP_WEB_OMP_BIN` | Path to `omp` binary if not on `PATH` | _auto-detected_ |
+| `OMP_WEB_OMP_BIN` | Path to an `ompweb-omp` build to use instead of the downloaded one: a copy of the release's `ompweb-omp-<os>-<arch>` on a machine that cannot reach GitHub, or `runner/release/ompweb-omp-<os>-<arch>` from a source checkout. A stock `omp` does not work: it does not speak ompweb's channel. The service installers write it into the service environment only when you set it | _the downloaded `ompweb-omp`_ |
 | `PI_CODING_AGENT_DIR` | Custom omp agent directory | `~/.omp/agent` |
 | `OMP_WEB_STT_ENDPOINT` | OpenAI-compatible transcription endpoint URL. Leave unset to transcribe with `OMP_WEB_STT_MODEL` through omp's own credentials | _None_ |
 | `OMP_WEB_STT_KEY` | Optional API key for the STT endpoint | _None_ |
@@ -818,13 +1162,16 @@ addresses you list in `set_real_ip_from`:
 ## Development
 
 ```bash
-git clone https://github.com/kahme247/ompweb.git
+git clone https://github.com/ompweb-dev/ompweb.git
 cd ompweb
 npm install
+npx bun runner/scripts/use-omp-build.ts && (cd runner && npx bun install --frozen-lockfile)
+npx bun runner/scripts/build-binary.ts   # ompweb's omp build for this machine: runner/release/ompweb-omp-<os>-<arch>
 npm run dev
 ```
 
-The dev server runs at [http://127.0.0.1:30178](http://127.0.0.1:30178).
+The dev server runs at [http://127.0.0.1:30178](http://127.0.0.1:30178). It finds the runner in
+`runner/release/` by itself; `npm test` and `npm run build:binary` need the runner set up too.
 
 A dev server does not take over the local daemon: only the production web
 server writes the daemon's `host.json`, so "This machine" shows offline in dev

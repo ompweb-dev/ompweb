@@ -17,6 +17,7 @@ import { ContextDetailPanel } from "./ComposerPanels";
 import { RecordingDeck } from "./RecordingDeck";
 import { beginDraftSubmission, clearDraft, consumeDraft, endDraftSubmission, getDraft, getDraftRevision, isSameDraft, markDraftEdited, mergeRecoveredText, moveDraftSubmissions, recoverDraft, requiresPromptMode, setDraft, subscribeDraftConsumption, subscribeDraftRecovery, type ChatDraft, type ChatDraftImage } from "@/lib/draft-store";
 import { expandWebSlashCommand } from "@/lib/web-slash-commands";
+import { WorkspaceFileContext } from "@/lib/workspace-file-context";
 import type { AttachedImage, AttachedTextFile } from "./ChatInput-draft-attachments";
 import {
   draftFilesToAttachedFiles,
@@ -35,7 +36,8 @@ import {
   uploadRecovery,
   type AttachedUpload,
 } from "./ChatInput-uploads";
-import { discardUpload, newUploadId, uploadFile, UploadFailedError, type UploadHandle } from "@/lib/event-stream";
+import { discardUpload, uploadFile, UploadFailedError, type UploadHandle } from "@/lib/event-stream";
+import { randomUUID } from "@/lib/random-uuid";
 import { MAX_UPLOAD_BYTES, MAX_UPLOADS_PER_MESSAGE } from "@/lib/upload-limits";
 import { hostProjectKey, LOCAL_HOST_ID } from "@/lib/project-ordering";
 import {
@@ -254,6 +256,8 @@ interface Props {
   draftKey?: string;
   /** Owning host for file uploads and the @ file index (this machine when absent). */
   uploadHostId?: string;
+  /** Lazily bind a pool's real owner before staging any file bytes. Failure never falls back locally. */
+  resolveUploadHost?: () => Promise<string>;
   /** Backend-confirmed ownership relocation, distinct from navigating to a draft. */
   draftIdentityMove?: { from: string; to: string; sourceDraft?: ChatDraft };
   /** Session working directory — enables the @ file autocomplete menu */
@@ -381,6 +385,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   onPromoteQueuedToSteer,
   draftKey = "new:unassigned",
   uploadHostId = LOCAL_HOST_ID,
+  resolveUploadHost,
   draftIdentityMove,
   cwd,
   activeGoal,
@@ -475,6 +480,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const bashExcluded = bashMode && trimmedValue.startsWith("!!");
   // "!" shares output with the model (riskier, root-style warning); "!!" stays local (plain terminal).
   const shellMode = bashMode ? (bashExcluded ? "local" : "model") : undefined;
+  // Side questions stay separate from the main run's queue and Stop action. Without builtin dispatch `/btw` is
+  // ordinary text, so the composer keeps its Queue fallback.
+  const btwMode = Boolean(onBuiltinCommand) && /^\/btw(\s|$)/.test(trimmedValue);
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
   const [slashMatch, setSlashMatch] = useState<SlashQueryMatch | null>(null);
@@ -522,7 +530,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const historyItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fileIndexMetaRef = useRef<{ workspaceKey: string; fetchedAt: number } | null>(null);
   const fileIndexFetchingRef = useRef<{ workspaceKey: string; controller: AbortController } | null>(null);
-  const fileIndexOwner = hostProjectKey(uploadHostId, cwd ?? "");
+  const fileSource = React.useContext(WorkspaceFileContext);
+  const sourceSessionId = fileSource?.sessionId;
+  const fileIndexOwner = `${sourceSessionId ?? ""}:${hostProjectKey(uploadHostId, cwd ?? "")}`;
   const fileIndexOwnerRef = useRef(fileIndexOwner);
   fileIndexOwnerRef.current = fileIndexOwner;
   const draftKeyRef = useRef(draftKey);
@@ -568,12 +578,14 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   /** Uploads in flight, by id: a chip's removal aborts its handle. */
   const uploadHandlesRef = useRef(new Map<string, UploadHandle>());
   const uploadHostIdRef = useRef(uploadHostId);
+  const resolveUploadHostRef = useRef(resolveUploadHost);
   submissionBlockedRef.current = submissionBlocked;
   valueRef.current = value;
   attachedImagesRef.current = attachedImages;
   attachedTextFilesRef.current = attachedTextFiles;
   attachedUploadsRef.current = attachedUploads;
   uploadHostIdRef.current = uploadHostId;
+  resolveUploadHostRef.current = resolveUploadHost;
 
   const captureDraft = useCallback((): ChatDraft => {
     const uploads = attachedUploadsRef.current;
@@ -684,13 +696,24 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     if (!upload.file) return;
     const { id, size } = upload;
     let shownPercent = -1;
-    const handle = uploadFile(upload.file, upload.hostId, (received) => {
-      // One render per whole percent: the host acks up to every 16 ms.
-      const percent = Math.floor((received * 100) / Math.max(1, size));
-      if (percent === shownPercent) return;
-      shownPercent = percent;
-      patchUpload(id, { received });
-    }, id, (error) => patchUpload(id, { error: error === null ? null : uploadErrorMessage(error) }));
+    let active: UploadHandle | undefined;
+    let aborted = false;
+    const resolveOwner = resolveUploadHostRef.current;
+    const promise = (async () => {
+      const hostId = upload.hostId || (resolveOwner ? await resolveOwner() : uploadHostIdRef.current);
+      if (aborted) throw new DOMException("Upload cancelled", "AbortError");
+      if (!hostId) throw new Error(t("agentSession.uploadOwnerUnavailable"));
+      patchUpload(id, { hostId });
+      active = uploadFile(upload.file!, hostId, (received) => {
+        // One render per whole percent: the host acks up to every 16 ms.
+        const percent = Math.floor((received * 100) / Math.max(1, size));
+        if (percent === shownPercent) return;
+        shownPercent = percent;
+        patchUpload(id, { received });
+      }, id, (error) => patchUpload(id, { error: error === null ? null : uploadErrorMessage(error) }));
+      return await active.promise;
+    })();
+    const handle: UploadHandle = { id, promise, abort() { aborted = true; active?.abort(); } };
     uploadHandlesRef.current.set(id, handle);
     const settle = (patch: Partial<AttachedUpload>) => {
       // Removed or switched meanwhile: its abort ended it.
@@ -702,9 +725,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       ({ proof }) => settle({ status: "done", received: size, error: null, proof }),
       // 410: the worker already cancelled it on its host (the page went into the back/forward cache). A Retry under a
       // new id starts over, so the cancel still pending for this one can never reach it.
-      (error: unknown) => settle({ status: "error", error: uploadErrorMessage(error), ...(error instanceof UploadFailedError && error.status === 410 ? { id: newUploadId(), proof: undefined } : {}) }),
+      (error: unknown) => settle({ status: "error", error: uploadErrorMessage(error), ...(error instanceof UploadFailedError && error.status === 410 ? { id: randomUUID(), proof: undefined } : {}) }),
     );
-  }, [patchUpload]);
+  }, [patchUpload, t]);
 
   /** Attaches files As file and starts their uploads: up to MAX_UPLOAD_BYTES each, MAX_UPLOADS_PER_MESSAGE in all
    *  (the only refusals left, spec U2). `previewUrls[i]`: an image's thumbnail, made here when missing. Returns how
@@ -713,10 +736,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const room = Math.max(0, MAX_UPLOADS_PER_MESSAGE - attachedUploadsRef.current.length);
     const fitting = files.flatMap((file, i) => (file.size <= MAX_UPLOAD_BYTES ? [{ file, previewUrl: previewUrls[i] }] : []));
     const added = fitting.slice(0, room).map(({ file, previewUrl }): AttachedUpload => ({
-      id: newUploadId(),
+      id: randomUUID(),
       name: file.name,
       size: file.size,
-      hostId: uploadHostIdRef.current,
+      hostId: resolveUploadHostRef.current ? "" : uploadHostIdRef.current,
       file,
       received: 0,
       status: "uploading",
@@ -928,7 +951,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     uploadHandlesRef.current.delete(id);
     const hostId = attachedUploadsRef.current.find((upload) => upload.id === id)?.hostId;
     if (handle) handle.abort();
-    else if (hostId !== undefined) discardUpload(id, hostId);
+    else if (hostId) discardUpload(id, hostId);
     setAttachedUploads((prev) => {
       const removed = prev.find((upload) => upload.id === id);
       if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
@@ -971,7 +994,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       const handle = uploadHandlesRef.current.get(id);
       uploadHandlesRef.current.delete(id);
       if (handle) handle.abort();
-      else discardUpload(id, upload.hostId);
+      else if (upload.hostId) discardUpload(id, upload.hostId);
       setAttachedUploads((prev) => prev.filter((each) => each.id !== id));
       setAttachedImages((prev) => [...prev, { data, mimeType: file.type, previewUrl, file }]);
     } catch {
@@ -1264,9 +1287,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     if (!msg && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length) return;
     // `!cmd` runs right away during a run too, as in omp's terminal; it is never queued as text.
     const shellCommand = !promptOnlyRef.current && msg.startsWith("!") && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length;
-    if (submissionBlockedRef.current || holdingRef.current || (isStreaming && !shellCommand)) return;
+    if (submissionBlockedRef.current || holdingRef.current) return;
     onAudioUnlock?.();
     if (sendSideQuestion(msg, overrideText)) return;
+    if (isStreaming && !shellCommand) return;
     if (rejectsPendingUploads()) return;
     const files = attachedTextFilesRef.current;
     const composedMessage = composeMessageWithTextAttachments(msg, files);
@@ -1351,7 +1375,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         toast.success(t("chatInput.dictationSuccess"));
         return;
       }
-      if (after && onFollowUp) {
+      if (after && sendSideQuestion(finalText.trim(), finalText)) {
+        return;
+      } else if (after && onFollowUp) {
         sendQueued(after === "send" ? "followup" : after, finalText);
       } else if (after && !isStreaming) {
         void handleSend(finalText);
@@ -1483,7 +1509,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
           return modelCollator.compare(a.name, b.name);
         });
     }
-    const commands = [...(isStreaming ? [] : builtinSlashCommands), ...externalSlashCommands];
+    // During a run the other builtins would only be queued as text; /btw runs beside the main run.
+    const commands = [...(isStreaming ? builtinSlashCommands.filter((command) => command.name === "btw") : builtinSlashCommands), ...externalSlashCommands];
     return [...commands]
       .filter((command) => {
         const name = command.name.toLowerCase();
@@ -1548,7 +1575,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const controller = new AbortController();
     const query = atQueryText;
     const timer = setTimeout(() => {
-      fetch(`/api/file-index?cwd=${encodeURIComponent(cwd)}&hostId=${encodeURIComponent(uploadHostId)}&q=${encodeURIComponent(query)}`, { signal: controller.signal })
+      const params = new URLSearchParams({ cwd, hostId: uploadHostId, q: query });
+      if (sourceSessionId) params.set("sessionId", sourceSessionId);
+      fetch(`/api/file-index?${params}`, { signal: controller.signal })
         .then((res) => {
           if (!res.ok) throw new Error(`file search failed: ${res.status}`);
           return res.json() as Promise<{ matches?: FileIndexEntry[] }>;
@@ -1561,7 +1590,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         .catch(() => {});
     }, 150);
     return () => { clearTimeout(timer); controller.abort(); };
-  }, [needsServerSearch, atQueryText, cwd, uploadHostId, fileIndexOwner]);
+  }, [needsServerSearch, atQueryText, cwd, uploadHostId, sourceSessionId, fileIndexOwner]);
 
   const serverResultInUse = needsServerSearch
     && atServerResult !== null
@@ -1612,7 +1641,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const request = { workspaceKey, controller };
     fileIndexFetchingRef.current = request;
     setFileIndexLoading(true);
-    fetch(`/api/file-index?cwd=${encodeURIComponent(cwd)}&hostId=${encodeURIComponent(uploadHostId)}`, { signal: controller.signal })
+    const params = new URLSearchParams({ cwd, hostId: uploadHostId });
+    if (sourceSessionId) params.set("sessionId", sourceSessionId);
+    fetch(`/api/file-index?${params}`, { signal: controller.signal })
       .then((res) => {
         if (!res.ok) throw new Error(`file index failed: ${res.status}`);
         return res.json() as Promise<{ files?: string[]; truncated?: boolean }>;
@@ -1635,7 +1666,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       controller.abort();
       if (fileIndexFetchingRef.current === request) fileIndexFetchingRef.current = null;
     };
-  }, [atTokenActive, cwd, uploadHostId, fileIndexOwner]);
+  }, [atTokenActive, cwd, uploadHostId, sourceSessionId, fileIndexOwner]);
 
   const applyAtCompletion = useCallback((entry: FileIndexEntry) => {
     if (!atQuery) return;
@@ -1836,7 +1867,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const imageUploads = attachedUploads.filter((upload) => upload.previewUrl !== null);
   const fileUploads = attachedUploads.filter((upload) => upload.previewUrl === null);
   const primaryActionQueuesMessage =
-    isStreaming
+    isStreaming && !btwMode
     && (Boolean(value.trim()) || hasAttachments || dictationCapturing)
     && Boolean(onFollowUp);
   // The button follows the same Settings choice as Enter: soft keyboards have no
@@ -1848,8 +1879,16 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   // ── Queued follow-up bar ────────────────────────────────────────────────
   // Texts are mirrored locally; mutations wait for native acknowledgement.
   const queuedEntries = [
-    ...(queuedMessages?.followUp ?? []).map((text) => ({ kind: "follow-up" as const, text })),
-    ...(queuedMessages?.steering ?? []).map((text) => ({ kind: "steer" as const, text })),
+    ...(queuedMessages?.followUp ?? []).map((text, index) => ({
+      kind: "follow-up" as const,
+      text,
+      origin: queuedMessages?.messageOrigins?.followUp[index] ?? null,
+    })),
+    ...(queuedMessages?.steering ?? []).map((text, index) => ({
+      kind: "steer" as const,
+      text,
+      origin: queuedMessages?.messageOrigins?.steering[index] ?? null,
+    })),
   ];
   const firstQueued = queuedEntries[0] ?? null;
   const queuedCount = queuedEntries.length;
@@ -2987,6 +3026,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     color: "var(--text-muted)",
                   }}
                 >
+                  {firstQueued?.origin?.kind === "session" && firstQueued.origin.session
+                    ? `[From ${firstQueued.origin.session.name?.trim() || "Untitled session"}] `
+                    : firstQueued?.origin?.kind === "github" && firstQueued.origin.github
+                      ? `[${firstQueued.origin.github.repo}#${firstQueued.origin.github.number}] `
+                      : ""}
                   {firstQueued?.text}
                 </span>
                 <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={handleQueuedEdit} title={t("chatInput.queuedEditTitle")}>
@@ -3059,6 +3103,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                           textTransform: "none",
                         }}
                       >
+                        {firstQueued.origin?.kind === "session" && firstQueued.origin.session
+                          ? `[From ${firstQueued.origin.session.name?.trim() || "Untitled session"}] `
+                          : firstQueued.origin?.kind === "github" && firstQueued.origin.github
+                            ? `[${firstQueued.origin.github.repo}#${firstQueued.origin.github.number}] `
+                            : ""}
                         {firstQueued.kind === "steer" ? `[${t("chatInput.queuedSteer")}] ` : ""}{firstQueued.text}
                       </span>
                     )}
@@ -3116,6 +3165,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                         }}>
                           {entry.kind === "steer" ? t("chatInput.queuedSteer") : t("chatInput.queuedFollowUp")}
                         </span>
+                        {entry.origin?.kind === "session" && entry.origin.session ? (
+                          <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>
+                            From {entry.origin.session.name?.trim() || "Untitled session"}
+                          </span>
+                        ) : entry.origin?.kind === "github" && entry.origin.github ? (
+                          <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>
+                            {entry.origin.github.repo}#{entry.origin.github.number}
+                          </span>
+                        ) : null}
                         <span
                           title={entry.text}
                           style={{
@@ -3157,7 +3215,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             aria-live="polite"
             data-shell={shellMode}
             style={{
-              border: "1px solid var(--shell-border, color-mix(in srgb, var(--border) 70%, transparent))",
+              border: btwMode ? "1px solid var(--accent)" : "1px solid var(--shell-border, color-mix(in srgb, var(--border) 70%, transparent))",
               borderBottom: "none",
               borderRadius: queuedCount > 0 ? 0 : "var(--radius-card) var(--radius-card) 0 0",
               background: "var(--bg-panel)",
@@ -3182,8 +3240,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             style={{
               display: "flex",
               flexDirection: "column",
-              background: "var(--shell-bg, var(--bg))",
-              border: "1px solid var(--shell-border, color-mix(in srgb, var(--border) 70%, transparent))",
+              background: btwMode ? "color-mix(in srgb, var(--accent) 8%, var(--bg))" : "var(--shell-bg, var(--bg))",
+              border: btwMode ? "1px solid var(--accent)" : "1px solid var(--shell-border, color-mix(in srgb, var(--border) 70%, transparent))",
               borderRadius: (queuedCount > 0 || Boolean(statusText)) ? "0 0 var(--radius-card) var(--radius-card)" : "var(--radius-card)",
               padding: "12px 12px 10px",
               boxShadow: "var(--shadow-card)",
@@ -3937,7 +3995,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   : <ListChecks size={13} strokeWidth={2} aria-hidden="true" />}
                 {t(primaryActionRunsShell ? "chatInput.runShell" : primaryActionMode === "steer" ? "chatInput.steer" : "chatInput.queue")}
               </button>
-            ) : isStreaming ? (
+            ) : isStreaming && !btwMode ? (
               <button
                 type="button"
                 className="composer-primary-action"
@@ -3965,8 +4023,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 type="button"
                 className="composer-primary-action"
                 onClick={isRecording || isPaused || isReviewing ? () => stopAndFinishDictation("send") : () => void handleSend()}
-                disabled={submissionBlocked || isTranscribing || uploadsBlockSend || !(isRecording || isPaused || isReviewing || value.trim() || hasAttachments)}
-                title={uploadsBlockSend
+                disabled={submissionBlocked || isTranscribing || (!btwMode && uploadsBlockSend) || !(isRecording || isPaused || isReviewing || value.trim() || hasAttachments)}
+                title={!btwMode && uploadsBlockSend
                   ? (failedUploadCount > 0 ? t("chatInput.uploadsFailedBlock", { count: failedUploadCount }) : t("chatInput.uploadsWaiting", { count: uploadingCount }))
                   : isRecording || isPaused || isReviewing ? t("chatInput.sendDictation") : t("chatInput.send")}
                 style={{
@@ -3975,14 +4033,14 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   border: "none",
                   borderRadius: 8,
                   color: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || hasAttachments) ? "var(--on-accent)" : "var(--text-dim)",
-                  cursor: submissionBlocked || uploadsBlockSend ? "not-allowed" : isTranscribing ? "wait" : (isRecording || isPaused || isReviewing || value.trim() || hasAttachments) ? "pointer" : "not-allowed",
+                  cursor: submissionBlocked || (!btwMode && uploadsBlockSend) ? "not-allowed" : isTranscribing ? "wait" : (isRecording || isPaused || isReviewing || value.trim() || hasAttachments) ? "pointer" : "not-allowed",
                   fontSize: 12,
                   fontWeight: 600,
                   boxShadow: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || hasAttachments) ? "var(--shadow-card)" : "none",
                   transition: "background var(--dur-fast) var(--ease-out-warm), box-shadow var(--dur-fast) var(--ease-out-warm)",
                 }}
               >
-                {isTranscribing || uploadingCount > 0 ? (
+                {isTranscribing || (!btwMode && uploadingCount > 0) ? (
                   <Loader2 size={12} strokeWidth={2} className="animate-spin" aria-hidden="true" />
                 ) : (
                   <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -3990,7 +4048,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     <polyline points="7.5 3 12 7 7.5 11" />
                   </svg>
                 )}
-                {uploadingCount > 0 ? t("chatInput.uploadsPending", { count: uploadingCount }) : t("chatInput.send")}
+                {!btwMode && uploadingCount > 0 ? t("chatInput.uploadsPending", { count: uploadingCount }) : t("chatInput.send")}
               </button>
             )}
           </div>

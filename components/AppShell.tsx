@@ -16,6 +16,7 @@ import { ToastProvider } from "./ui/toast";
 import { toast } from "./ui/toast";
 import { notificationHistory, useUnreadNotificationCount } from "@/lib/notification-history";
 import { ConfirmDialog } from "./ui/field";
+import { ThemedSelect } from "./ui/primitives";
 import { ChatWindow } from "./ChatWindow";
 import { type Tab } from "./TabBar";
 import { type FileExplorerHandle } from "./FileExplorer";
@@ -37,13 +38,13 @@ import { getFileApiUrl, getFileName, getRelativeFilePath, joinFilePath } from "@
 import { normalizeLocalPath } from "@/lib/file-links";
 import type { WorkspaceFileSource } from "@/lib/workspace-types";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
-import { getInitialNavigation } from "@/lib/initial-navigation";
+import { findSessionTarget, getInitialNavigation, sameSessionTarget, sessionNavigationUrl } from "@/lib/initial-navigation";
 import { comparableProjectPath } from "@/lib/comparable-path";
-import { hostProjectKey, LOCAL_HOST_ID, remoteHostId } from "@/lib/project-ordering";
-import { isLinkUp } from "@/lib/hosts/host";
+import { foldedHostProjectKey, hostProjectKey, LOCAL_HOST_ID, remoteHostId, projectIdentity, projectTargetId } from "@/lib/project-ordering";
+import { isClusterTarget } from "@/lib/hosts/cluster";
 import { useHostRows } from "@/hooks/useHostRows";
 import { LocalDaemonBanner } from "./LocalDaemonBanner";
-import { hostName, hostStatusText } from "./host-status";
+import { hostName } from "./host-status";
 import { clearDraft } from "@/lib/draft-store";
 import { useNotifications } from "@/hooks/useNotifications";
 import {
@@ -56,8 +57,12 @@ import {
   AppUpdateTransportError,
   COMPLETED_APP_UPDATE_KEY,
   DISMISSED_APP_UPDATE_KEY,
+  commitAppUpdate,
   fetchAppUpdateJson,
+  isAwaitingAppUpdateApproval,
   isExactLegacyTargetCompletion,
+  isStaleAppUpdatePlanError,
+  prepareAppUpdate,
   readDismissedVersion,
   rememberDismissedVersion,
   sanitizeAppUpdateError,
@@ -80,6 +85,7 @@ import type { CrossSessionHostToolCall, ManagedProject, SessionInfo, SessionTree
 import { runHostTool } from "@/hooks/useAgentSession-stream";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { openEventStream } from "@/lib/event-stream";
+import { randomUUID } from "@/lib/random-uuid";
 import type { ChatInputHandle } from "./ChatInput";
 import type { SessionStatsInfo, GenerationSpeedInfo } from "@/lib/pi-types";
 import type { SettingsTab } from "./SettingsTabs";
@@ -91,8 +97,10 @@ import {
   getMonotonicAppUpdateStage,
   type AppUpdateInfo,
   type AppUpdatePhase,
+  type AppUpdatePlanStatus,
   type AppUpdateStage,
 } from "./AppUpdateDialog";
+import type { UpgradeApproval, UpgradePlan } from "@/lib/upgrade-types";
 import { UpdateToastBody } from "./UpdateToast";
 import { ArchiveBrowser } from "./ArchiveBrowser";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
@@ -129,11 +137,17 @@ export function AppShell({ appName }: { appName: string }) {
   const isMobile = useIsMobile();
   const isCompactOverlay = useIsCompactOverlay();
   const [selectedSession, setSelectedSession] = useState<SessionInfo | null>(null);
-  // When user clicks +, we only store the cwd — no fake session id
+  // The transient identity belongs to one intentional new chat, not one request attempt.
   const [newSessionCwd, setNewSessionCwd] = useState<string | null>(null);
   // Host of newSessionCwd; undefined is this machine. Every host-aware state
   // here uses that form (see remoteHostId).
   const [newSessionHostId, setNewSessionHostId] = useState<string | undefined>(undefined);
+  const [newSessionCreation, setNewSessionCreation] = useState<{ id?: string; initialization?: string }>({});
+  const newSessionCreationId = newSessionCreation.id;
+  const handleNewSessionInitialization = useCallback((initialization: string) => {
+    setNewSessionCreation((current) => current.id === newSessionCreationId && current.initialization === undefined ? { ...current, initialization } : current);
+  }, [newSessionCreationId]);
+  const [newSessionPoolProject, setNewSessionPoolProject] = useState<ManagedProject | null>(null);
   const [workspaceOptions, setWorkspaceOptions] = useState<{ projects: ManagedProject[]; selectedProject: string | null; cwd: string | null; hostId: string }>({ projects: [], selectedProject: null, cwd: null, hostId: LOCAL_HOST_ID });
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const [addProjectHostId, setAddProjectHostId] = useState<string>(LOCAL_HOST_ID);
@@ -141,7 +155,7 @@ export function AppShell({ appName }: { appName: string }) {
     setAddProjectHostId(hostId);
     setAddProjectOpen(open);
   }, []);
-  const { hosts } = useHostRows();
+  const { hosts, pools, poolsLoaded } = useHostRows();
   const handleWorkspaceOptionsChange = useCallback((projects: ManagedProject[], selectedProject: string | null, cwd: string | null, hostId: string) => {
     setWorkspaceOptions({ projects, selectedProject, cwd, hostId });
   }, []);
@@ -301,6 +315,21 @@ export function AppShell({ appName }: { appName: string }) {
   const appUpdateRecoveryCommitAttemptRef = useRef<string | null>(null);
   const appUpdateStageFlowRef = useRef(0);
   const appUpdateAcknowledgementsRef = useRef<Map<string, Promise<boolean>>>(new Map());
+  const appUpdateStalledRef = useRef<{ attemptId: string; targetVersion: string } | null>(null);
+  // A prepared plan is only a proposal; `appUpdateApprovalRef` is set solely by an explicit user approval.
+  const [appUpdatePlan, setAppUpdatePlan] = useState<UpgradePlan | null>(null);
+  const [appUpdatePlanStatus, setAppUpdatePlanStatus] = useState<AppUpdatePlanStatus>("idle");
+  const appUpdatePlanRequestRef = useRef<number | null>(null);
+  const appUpdatePlanSeqRef = useRef(0);
+  const appUpdatePlanAttemptRef = useRef<{ attemptId: string; targetVersion: string } | null>(null);
+  const appUpdateApprovalRef = useRef<{ attemptId: string; approval: UpgradeApproval } | null>(null);
+  const discardAppUpdatePlan = useCallback(() => {
+    appUpdatePlanRequestRef.current = null;
+    appUpdatePlanAttemptRef.current = null;
+    appUpdateApprovalRef.current = null;
+    setAppUpdatePlan(null);
+    setAppUpdatePlanStatus("idle");
+  }, []);
   const advanceAppUpdateVisibleStage = useCallback((next: AppUpdateStage) => {
     const visible = getMonotonicAppUpdateStage(appUpdateVisibleStageRef.current, next);
     if (visible === appUpdateVisibleStageRef.current) return;
@@ -374,7 +403,7 @@ export function AppShell({ appName }: { appName: string }) {
 
     setAppUpdate(data);
 
-    if (autoOpen && !data.selfUpdateStatus && data.updateAvailable && data.availableVersion) {
+    if (autoOpen && (!data.selfUpdateStatus || isAwaitingAppUpdateApproval(data)) && data.updateAvailable && data.availableVersion) {
       if (data.selfUpdateSupported === true) {
         if (readDismissedVersion(DISMISSED_APP_UPDATE_KEY) !== data.availableVersion) {
           setAppUpdatePhase("idle");
@@ -442,13 +471,17 @@ export function AppShell({ appName }: { appName: string }) {
     setAppUpdateDialogOpen(true);
   }, []);
 
-  const submitAppUpdateCommit = useCallback((attemptId: string) => {
-    void fetchAppUpdateJson<{ error?: string }>("/api/app-update", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "commit", attemptId }),
-      keepalive: true,
-    }, 202).then(() => {
+  const reviewChangedAppUpdatePlan = useCallback(() => {
+    appUpdateAttemptRef.current = null;
+    appUpdateStartInFlightRef.current = false;
+    resetAppUpdateVisibleStage();
+    discardAppUpdatePlan();
+    setAppUpdateError(t("appUpdateDialog.planChanged"));
+    setAppUpdatePhase("idle");
+  }, [discardAppUpdatePlan, resetAppUpdateVisibleStage, t]);
+
+  const submitAppUpdateCommit = useCallback((attemptId: string, approval: UpgradeApproval) => {
+    void commitAppUpdate(attemptId, approval).then(() => {
       if (appUpdateAttemptRef.current === attemptId) {
         appUpdateCommittedAttemptRef.current = attemptId;
       }
@@ -460,9 +493,14 @@ export function AppShell({ appName }: { appName: string }) {
         return;
       }
       if (appUpdateAttemptRef.current !== attemptId) return;
+      // The plan or hosts changed after approval: show a fresh plan; the old approval is never reused.
+      if (isStaleAppUpdatePlanError(error)) {
+        reviewChangedAppUpdatePlan();
+        return;
+      }
       showAppUpdateFailure(error);
     });
-  }, [showAppUpdateFailure]);
+  }, [reviewChangedAppUpdatePlan, showAppUpdateFailure]);
 
   const recoverPreparedAppUpdate = useCallback((data: AppUpdateInfo, attemptId: string) => {
     const status = data.selfUpdateStatus;
@@ -471,9 +509,14 @@ export function AppShell({ appName }: { appName: string }) {
       || status.state !== "prepared"
       || (status.stage !== "preparing" && status.stage !== "stopping")
     ) return;
+    // Only a recorded approval may be redelivered; an unapproved prepared attempt stays a proposal.
+    const recorded = appUpdateApprovalRef.current?.attemptId === attemptId ? appUpdateApprovalRef.current.approval : null;
+    const approved = data.upgradePlan?.approved;
+    const approval = recorded ?? (approved && data.upgradePlan ? { planId: data.upgradePlan.id, force: approved.force } : null);
+    if (!approval) return;
     if (appUpdateRecoveryCommitAttemptRef.current === attemptId) return;
     appUpdateRecoveryCommitAttemptRef.current = attemptId;
-    submitAppUpdateCommit(attemptId);
+    submitAppUpdateCommit(attemptId, approval);
   }, [submitAppUpdateCommit]);
 
   const completeAppUpdate = useCallback(async (targetVersion: string) => {
@@ -553,10 +596,23 @@ export function AppShell({ appName }: { appName: string }) {
         return;
       }
     }
+    // The backend keeps the update alive past this deadline: report "still running" and let the user re-read status. Never fail, resubmit or force.
     if (appUpdateAttemptRef.current === attemptId) {
-      showAppUpdateFailure(t("appUpdateDialog.timeout"));
+      appUpdateStalledRef.current = { attemptId, targetVersion };
+      setAppUpdateError(null);
+      setAppUpdatePhase("stalled");
     }
-  }, [advanceAppUpdateVisibleStage, completeAppUpdate, handleTerminalAppUpdate, recoverPreparedAppUpdate, refreshAppUpdate, showAppUpdateFailure, showAppUpdateStagesThrough, t]);
+  }, [advanceAppUpdateVisibleStage, completeAppUpdate, handleTerminalAppUpdate, recoverPreparedAppUpdate, refreshAppUpdate, showAppUpdateFailure, showAppUpdateStagesThrough]);
+
+  // Reads status again for the same attempt; it submits nothing.
+  const checkStalledAppUpdate = useCallback(() => {
+    const stalled = appUpdateStalledRef.current;
+    if (!stalled) return;
+    appUpdateStalledRef.current = null;
+    appUpdateAttemptRef.current = null;
+    setAppUpdatePhase("restarting");
+    void monitorAppUpdate(stalled.attemptId, stalled.targetVersion);
+  }, [monitorAppUpdate]);
 
   useEffect(() => {
     try {
@@ -572,7 +628,7 @@ export function AppShell({ appName }: { appName: string }) {
     void refreshAppUpdate(false, true)
       .then(async (data) => {
         const status = data?.selfUpdateStatus;
-        if (!data || !status) return;
+        if (!data || !status || isAwaitingAppUpdateApproval(data)) return;
         const recoveredStage = status.stage ?? "stopping";
         const initialStage = recoveredStage === "preparing" ? "preparing" : "stopping";
         if (initialStage === "stopping") appUpdateCommittedAttemptRef.current = status.attemptId;
@@ -587,24 +643,25 @@ export function AppShell({ appName }: { appName: string }) {
       .catch(() => {});
   }, [advanceAppUpdateVisibleStage, handleTerminalAppUpdate, monitorAppUpdate, recoverPreparedAppUpdate, refreshAppUpdate, showAppUpdateStagesThrough, t]);
 
-  const proceedWithAppUpdate = useCallback(async () => {
-    if (appUpdateStartInFlightRef.current) return;
+  const proceedWithAppUpdate = useCallback(async (approval: UpgradeApproval) => {
+    const prepared = appUpdatePlanAttemptRef.current;
+    if (
+      appUpdateStartInFlightRef.current
+      || appUpdateAttemptRef.current !== null
+      || !prepared
+      || appUpdatePlan === null
+      || approval.planId !== appUpdatePlan.id
+      || (appUpdatePlan.requiresForce && !approval.force)
+    ) return;
     appUpdateStartInFlightRef.current = true;
     appUpdateCompletingRef.current = false;
     resetAppUpdateVisibleStage();
+    appUpdateApprovalRef.current = { attemptId: prepared.attemptId, approval };
     advanceAppUpdateVisibleStage("preparing");
     setAppUpdatePhase("preparing");
     setAppUpdateError(null);
     try {
-      const prepared = await fetchAppUpdateJson<{ attemptId?: string; targetVersion?: string }>("/api/app-update", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "prepare" }),
-      });
-      if (!prepared.attemptId || !prepared.targetVersion) {
-        throw new Error("Invalid update response");
-      }
-      submitAppUpdateCommit(prepared.attemptId);
+      submitAppUpdateCommit(prepared.attemptId, approval);
       void monitorAppUpdate(prepared.attemptId, prepared.targetVersion);
       await showAppUpdateStagesThrough("stopping");
       if (appUpdateAttemptRef.current !== prepared.attemptId) return;
@@ -612,7 +669,27 @@ export function AppShell({ appName }: { appName: string }) {
     } catch (error) {
       showAppUpdateFailure(error);
     }
-  }, [advanceAppUpdateVisibleStage, monitorAppUpdate, resetAppUpdateVisibleStage, showAppUpdateFailure, showAppUpdateStagesThrough, submitAppUpdateCommit]);
+  }, [advanceAppUpdateVisibleStage, appUpdatePlan, monitorAppUpdate, resetAppUpdateVisibleStage, showAppUpdateFailure, showAppUpdateStagesThrough, submitAppUpdateCommit]);
+
+  // Prepare a plan whenever the dialog is open and idle without one. Preparing never commits.
+  useEffect(() => {
+    if (!appUpdateDialogOpen || appUpdatePhase !== "idle" || appUpdateStartInFlightRef.current || appUpdateAttemptRef.current !== null || appUpdatePlanStatus !== "idle" || appUpdatePlanRequestRef.current !== null) return;
+    const request = ++appUpdatePlanSeqRef.current;
+    appUpdatePlanRequestRef.current = request;
+    setAppUpdatePlanStatus("loading");
+    void prepareAppUpdate().then((prepared) => {
+      if (appUpdatePlanRequestRef.current !== request) return;
+      appUpdatePlanRequestRef.current = null;
+      appUpdatePlanAttemptRef.current = { attemptId: prepared.attemptId, targetVersion: prepared.targetVersion };
+      setAppUpdatePlan(prepared.plan);
+      setAppUpdatePlanStatus("ready");
+    }, (error: unknown) => {
+      if (appUpdatePlanRequestRef.current !== request) return;
+      appUpdatePlanRequestRef.current = null;
+      setAppUpdateError(sanitizeAppUpdateError(error) || null);
+      setAppUpdatePlanStatus("failed");
+    });
+  }, [appUpdateDialogOpen, appUpdatePhase, appUpdatePlanStatus]);
 
   const dismissAppUpdate = useCallback(() => {
     if (appUpdatePhase === "idle" && appUpdate?.availableVersion) {
@@ -620,19 +697,39 @@ export function AppShell({ appName }: { appName: string }) {
       toast.info(t("appUpdateDialog.settingsLater"));
     }
     setAppUpdateDialogOpen(false);
+    if (appUpdateStalledRef.current !== null) return;
     setAppUpdatePhase("idle");
     setAppUpdateError(null);
     appUpdateAttemptRef.current = null;
+    appUpdateStalledRef.current = null;
+    discardAppUpdatePlan();
     resetAppUpdateVisibleStage();
-  }, [appUpdate?.availableVersion, appUpdatePhase, resetAppUpdateVisibleStage, t]);
+  }, [appUpdate?.availableVersion, appUpdatePhase, discardAppUpdatePlan, resetAppUpdateVisibleStage, t]);
+
+  // Retry after a failure, an expired plan or a failed prepare: always a fresh plan, never a resumed approval.
+  const refreshAppUpdatePlan = useCallback(() => {
+    appUpdateAttemptRef.current = null;
+    appUpdateStartInFlightRef.current = false;
+    appUpdateCompletingRef.current = false;
+    discardAppUpdatePlan();
+    resetAppUpdateVisibleStage();
+    setAppUpdateError(null);
+    setAppUpdatePhase("idle");
+  }, [discardAppUpdatePlan, resetAppUpdateVisibleStage]);
 
   const requestAppUpdateFromSettings = useCallback(() => {
     setSettingsTab(null);
+    if (appUpdateStalledRef.current !== null) {
+      checkStalledAppUpdate();
+      window.requestAnimationFrame(() => setAppUpdateDialogOpen(true));
+      return;
+    }
+    discardAppUpdatePlan();
     resetAppUpdateVisibleStage();
     setAppUpdateError(null);
     setAppUpdatePhase("idle");
     window.requestAnimationFrame(() => setAppUpdateDialogOpen(true));
-  }, [resetAppUpdateVisibleStage]);
+  }, [checkStalledAppUpdate, discardAppUpdatePlan, resetAppUpdateVisibleStage]);
   const chatInputRef = useRef<ChatInputHandle | null>(null);
   const topBarRef = useRef<HTMLDivElement>(null);
   const [sessionInfoContainer, setSessionInfoContainer] = useState<HTMLDivElement | null>(null);
@@ -672,14 +769,20 @@ export function AppShell({ appName }: { appName: string }) {
   const [sessionStats, setSessionStats] = useState<SessionStatsInfo | null>(null);
   const [autoNameStatus, setAutoNameStatus] = useState<AutoNameStatus>({ kind: "idle" });
   const autoNameTimerRef = useRef<TimerHandle | undefined>(undefined);
-  const activeSessionIdRef = useRef<string | null>(selectedSession?.id ?? null);
+  const activeSelectedSessionId = selectedSession?.id ?? null;
+  const activeSelectedSessionHostId = selectedSession?.hostId;
+  const activeSessionIdRef = useRef<string | null>(activeSelectedSessionId);
+  const activeSessionTargetRef = useRef<{ id: string; hostId?: string } | null>(
+    activeSelectedSessionId ? { id: activeSelectedSessionId, hostId: activeSelectedSessionHostId } : null,
+  );
   const activeSettingsTabRef = useRef(settingsTab);
   const archiveRetryTimerRef = useRef<TimerHandle | undefined>(undefined);
   useEffect(() => () => clearTimeout(archiveRetryTimerRef.current), []);
   useLayoutEffect(() => {
-    activeSessionIdRef.current = selectedSession?.id ?? null;
+    activeSessionIdRef.current = activeSelectedSessionId;
+    activeSessionTargetRef.current = activeSelectedSessionId ? { id: activeSelectedSessionId, hostId: activeSelectedSessionHostId } : null;
     activeSettingsTabRef.current = settingsTab;
-  }, [selectedSession?.id, settingsTab]);
+  }, [activeSelectedSessionId, activeSelectedSessionHostId, settingsTab]);
   const handleSessionStatsChange = useCallback((stats: SessionStatsInfo | null) => {
     setSessionStats(stats);
   }, []);
@@ -879,8 +982,7 @@ export function AppShell({ appName }: { appName: string }) {
     // Live rect, not state: it always reflects the committed width (custom or
     // fluid default), and keeps this callback above the state declarations
     // without a TDZ cycle. The handle only exists while the panel is open.
-    const startWidth = rightPanelRef.current?.getBoundingClientRect().width
-      ?? RIGHT_PANEL_MIN_WIDTH;
+    const measuredWidth = rightPanelRef.current?.getBoundingClientRect().width;
     // Same --ui-scale ground truth as the left sidebar handle: clientX is in
     // viewport pixels while the panel width is zoomed layout pixels.
     let uiScale = 1;
@@ -891,18 +993,27 @@ export function AppShell({ appName }: { appName: string }) {
     } catch {
       // SSR/unavailable: fall back to unscaled math.
     }
+    const startWidth = measuredWidth === undefined ? RIGHT_PANEL_MIN_WIDTH : measuredWidth / uiScale;
     setRightPanelResizing(true);
+    let frame: number | null = null;
+    const cancelFrame = () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = null;
+    };
+    const applyWidth = () => {
+      frame = null;
+      rightPanelRef.current?.style.setProperty("--right-panel-width", `${pendingRightPanelWidthRef.current}px`);
+    };
     const onMove = (ev: MouseEvent) => {
       // Dragging the left edge left grows the panel: inverse of the sidebar.
-      const next = clampRightPanelWidth(startWidth - (ev.clientX - startX) / uiScale);
-      // Write the CSS variable straight to the DOM: the flex row follows the
-      // pointer without re-rendering the whole AppShell on every mousemove.
-      rightPanelRef.current?.style.setProperty("--right-panel-width", `${next}px`);
-      pendingRightPanelWidthRef.current = next;
+      pendingRightPanelWidthRef.current = clampRightPanelWidth(startWidth - (ev.clientX - startX) / uiScale);
+      if (frame === null) frame = requestAnimationFrame(applyWidth);
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      cancelFrame();
+      applyWidth();
       rightResizeHandlersRef.current = null;
       setRightPanelResizing(false);
       // Commit the final width so state and the persisted value agree with
@@ -914,7 +1025,7 @@ export function AppShell({ appName }: { appName: string }) {
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
     pendingRightPanelWidthRef.current = startWidth;
-    rightResizeHandlersRef.current = { onMove, onUp };
+    rightResizeHandlersRef.current = { onMove, onUp, cancelFrame };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }, [isMobile]);
@@ -926,6 +1037,7 @@ export function AppShell({ appName }: { appName: string }) {
     if (!handlers) return;
     window.removeEventListener("mousemove", handlers.onMove);
     window.removeEventListener("mouseup", handlers.onUp);
+    handlers.cancelFrame();
     rightResizeHandlersRef.current = null;
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
@@ -1021,7 +1133,7 @@ export function AppShell({ appName }: { appName: string }) {
     onRightOpenChange: setRightPanelOpen,
   });
   const pendingRightPanelWidthRef = useRef<number | null>(null);
-  const rightResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void } | null>(null);
+  const rightResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void; cancelFrame: () => void } | null>(null);
   useEffect(() => {
     setRightPanelWidth(loadRightPanelWidth());
   }, []);
@@ -1090,6 +1202,7 @@ export function AppShell({ appName }: { appName: string }) {
   const initialSessionId = initialNavigation.sessionId;
   const [activeCwd, setActiveCwd] = useState<string | null>(null);
   const [activeHostId, setActiveHostId] = useState<string | undefined>(undefined);
+  const [activePoolProject, setActivePoolProject] = useState<ManagedProject | null>(null);
   // Owned by the sidebar; rendered by the file panel's Worktrees tab.
   const [worktreeCtx, setWorktreeCtx] = useState<WorktreeContext | null>(null);
   // True once the initial ?session= URL param has been resolved (or confirmed absent)
@@ -1139,11 +1252,30 @@ export function AppShell({ appName }: { appName: string }) {
     return () => controller.abort();
   }, [initialNavigation]);
 
-  const handleCwdChange = useCallback((cwd: string | null, projectRoot: string | null, hostId: string) => {
-    setActiveCwd(cwd);
-    setActiveHostId(remoteHostId(hostId));
-    // Skip if cwd is null (initial mount) or during the initial URL restore.
+  const handleCwdChange = useCallback((cwd: string | null, projectRoot: string | null, hostId: string, project?: ManagedProject) => {
+    setActivePoolProject(project?.poolId ? project : null);
+    setActiveCwd(project?.poolId ? null : cwd);
+    setActiveHostId(project?.poolId ? undefined : remoteHostId(hostId));
+    if (project?.poolId) {
+      if (selectedSession?.poolId === project.poolId && selectedSession.projectId === project.projectId) return;
+      if (newSessionPoolProject?.poolId === project.poolId && newSessionPoolProject.projectId === project.projectId) return;
+      setNewSessionPoolProject(project);
+      setNewSessionCreation({ id: randomUUID() });
+      setNewSessionCwd(null);
+      setNewSessionHostId(undefined);
+      setSelectedSession(null);
+      setSessionKey((key) => key + 1);
+      setBranchTree([]);
+      setBranchActiveLeafId(null);
+      setSystemPrompt(null);
+      setSystemPromptLoading(false);
+      setActiveTopPanel(null);
+      router.replace("/");
+      return;
+    }
+    // A standalone path is never a fallback for a pending pool placement.
     if (!cwd) return;
+    setNewSessionPoolProject(null);
     // Skip only when the notification matches the cwd we're suppressing for.
     if (suppressCwdRef.current !== null && suppressCwdRef.current === cwd) {
       suppressCwdRef.current = null;
@@ -1168,6 +1300,7 @@ export function AppShell({ appName }: { appName: string }) {
       return prev;
     });
     setNewSessionHostId(remoteHostId(hostId));
+    setNewSessionCreation({ id: randomUUID() });
     setSessionKey((k) => k + 1);
     setBranchTree([]);
     setBranchActiveLeafId(null);
@@ -1175,7 +1308,7 @@ export function AppShell({ appName }: { appName: string }) {
     setSystemPromptLoading(false);
     setActiveTopPanel(null);
     router.replace("/");
-  }, [router, selectedSession]);
+  }, [router, selectedSession, newSessionPoolProject]);
 
   const handleSelectSession = useCallback((session: SessionInfo, isRestore = false) => {
     // Re-picking the already-open session (sidebar double-click, palette
@@ -1188,8 +1321,9 @@ export function AppShell({ appName }: { appName: string }) {
       setSidebarOpen(false);
       requestAnimationFrame(() => chatInputRef.current?.focus());
     }
-    if (!isRestore && session.id === selectedSession?.id) return;
+    if (!isRestore && selectedSession && sameSessionTarget(session, selectedSession)) return;
     setNewSessionCwd(null);
+    setNewSessionPoolProject(null);
     setSelectedSession(session);
     setSessionKey((k) => k + 1);
     setSystemPrompt(null);
@@ -1205,15 +1339,18 @@ export function AppShell({ appName }: { appName: string }) {
     }
     // Skip router.replace when restoring from the URL: the param is already correct.
     if (!isRestore) {
-      router.replace(`?session=${encodeURIComponent(session.id)}`);
+      router.replace(sessionNavigationUrl(session));
     }
-  }, [router, isMobile, selectedSession?.id]);
+  }, [router, isMobile, selectedSession]);
 
-  const handleNewSession = useCallback((_sessionId: string, cwd: string | null, hostId?: string) => {
+  const handleNewSession = useCallback((creationId: string, cwd: string | null, hostId?: string, project?: ManagedProject, initialization?: string) => {
     setSettingsTab(null);
     setSelectedSession(null);
-    setNewSessionCwd(cwd);
-    setNewSessionHostId(remoteHostId(hostId));
+    const target = project ?? (cwd === activeCwd ? activePoolProject : null);
+    setNewSessionCreation({ id: creationId || randomUUID(), initialization });
+    setNewSessionPoolProject(target?.poolId ? target : null);
+    setNewSessionCwd(target?.poolId ? null : cwd);
+    setNewSessionHostId(target?.poolId ? undefined : remoteHostId(hostId));
     setSessionKey((k) => k + 1);
     setBranchTree([]);
     setBranchActiveLeafId(null);
@@ -1225,7 +1362,7 @@ export function AppShell({ appName }: { appName: string }) {
       requestAnimationFrame(() => chatInputRef.current?.focus());
     }
     router.replace("/");
-  }, [router, isMobile]);
+  }, [router, isMobile, activeCwd, activePoolProject]);
 
   // ---- In-app Navigate back / forward over visited chat views ----
   // Own stack, not the browser History API (that one belongs to the mobile
@@ -1243,24 +1380,28 @@ export function AppShell({ appName }: { appName: string }) {
   const navViewVersionRef = useRef(0);
   const navSessionId = selectedSession?.id ?? null;
   const navSessionCwd = selectedSession?.cwd ?? null;
+  const navHostId = navSessionId ? remoteHostId(selectedSession?.hostId) : newSessionHostId;
   useEffect(() => {
     navViewVersionRef.current += 1;
     recordNavigationView({
       sessionId: navSessionId,
       cwd: navSessionId ? navSessionCwd : newSessionCwd,
-      ...(!navSessionId && newSessionHostId ? { hostId: newSessionHostId } : {}),
+      ...(navHostId ? { hostId: navHostId } : {}),
+      ...(!navSessionId && newSessionPoolProject ? { poolId: newSessionPoolProject.poolId, projectId: newSessionPoolProject.projectId } : {}),
+      ...(!navSessionId ? { creationId: newSessionCreationId } : {}),
+      ...(!navSessionId && newSessionPoolProject && newSessionCreation.initialization ? { initialization: newSessionCreation.initialization } : {}),
     });
-  }, [navSessionId, navSessionCwd, newSessionCwd, newSessionHostId, recordNavigationView]);
+  }, [navSessionId, navSessionCwd, navHostId, newSessionCwd, newSessionPoolProject, newSessionCreation, newSessionCreationId, recordNavigationView]);
 
   // Resolves a history entry's session id against the live list. `null`
   // means the id is gone (entry should be dropped); "unavailable" means the
   // list itself could not be fetched (keep the entry, abort this navigation).
-  const fetchSessionForNavigation = useCallback(async (sessionId: string): Promise<SessionInfo | null | "unavailable"> => {
+  const fetchSessionForNavigation = useCallback(async (sessionId: string, hostId?: string): Promise<SessionInfo | null | "unavailable"> => {
     try {
-      const res = await fetch("/api/sessions");
+      const res = await fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`);
       if (!res.ok) return "unavailable";
       const data = (await res.json()) as { sessions?: SessionInfo[] };
-      return data.sessions?.find((s) => s.id === sessionId) ?? null;
+      return data.sessions?.find((session) => sameSessionTarget(session, { id: sessionId, hostId })) ?? null;
     } catch {
       return "unavailable";
     }
@@ -1278,11 +1419,13 @@ export function AppShell({ appName }: { appName: string }) {
       if (entry.sessionId === null) {
         if (direction === -1) navigationHistory.commitBack();
         else navigationHistory.commitForward();
-        handleNewSession("navigate-history", entry.cwd, entry.hostId);
+        const project = entry.poolId ? workspaceOptions.projects.find((candidate) => candidate.poolId === entry.poolId && candidate.projectId === entry.projectId) : undefined;
+        if (entry.poolId && !project) { toast.error(translate("errors.generic")); return; }
+        handleNewSession(entry.creationId ?? randomUUID(), entry.cwd, entry.hostId, project, entry.initialization);
         return;
       }
       const versionAtPress = navViewVersionRef.current;
-      const session = await fetchSessionForNavigation(entry.sessionId);
+      const session = await fetchSessionForNavigation(entry.sessionId, entry.hostId);
       if (navViewVersionRef.current !== versionAtPress) return; // user moved on: do nothing
       if (session === "unavailable") return; // list fetch failed: keep the entry, try again next press
       if (session) {
@@ -1294,7 +1437,7 @@ export function AppShell({ appName }: { appName: string }) {
       if (direction === -1) navigationHistory.dropPeekedBack();
       else navigationHistory.dropPeekedForward();
     }
-  }, [navigationHistory, peekNavigationBack, peekNavigationForward, fetchSessionForNavigation, handleNewSession, handleSelectSession]);
+  }, [navigationHistory, peekNavigationBack, peekNavigationForward, fetchSessionForNavigation, handleNewSession, handleSelectSession, workspaceOptions.projects]);
 
   // Shared by the sidebar buttons and the global shortcuts. The keyboard
   // layer always swallows the keystroke, so both directions stop dead at the
@@ -1321,10 +1464,10 @@ export function AppShell({ appName }: { appName: string }) {
 
   // Global keyboard shortcuts (handles Esc, Ctrl+Alt+N etc.)
   useGlobalKeyboardShortcuts({
-    onNewSession: (cwd: string) => handleNewSession(`kb-${Date.now()}`, cwd, activeHostId),
+    onNewSession: (cwd: string) => handleNewSession(randomUUID(), activePoolProject ? null : cwd, activeHostId, activePoolProject ?? undefined),
     onNavigateBack: handleNavigateBack,
     onNavigateForward: handleNavigateForward,
-    activeCwd,
+    activeCwd: activePoolProject ? projectIdentity(activePoolProject) : activeCwd,
     scopeNativeSelectAll,
   });
 
@@ -1332,13 +1475,14 @@ export function AppShell({ appName }: { appName: string }) {
   // server-computed projectRoot, which the same-project check in
   // handleCwdChange relies on. Hydrate it from the session list so switching
   // worktrees right after creating a session doesn't close the chat.
-  const hydrateSelectedSession = useCallback((sessionId: string) => {
+  const hydrateSelectedSession = useCallback((sessionId: string, hostId?: string) => {
+    const target = { id: sessionId, hostId };
     void fetch("/api/sessions")
       .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[] }>) : null))
       .then((d) => {
-        const full = d?.sessions.find((s) => s.id === sessionId);
+        const full = findSessionTarget(d?.sessions ?? [], target);
         if (!full) return;
-        setSelectedSession((prev) => (prev && prev.id === sessionId && (!prev.projectRoot || prev.path === "") ? full : prev));
+        setSelectedSession((prev) => (prev && sameSessionTarget(prev, target) && (!prev.projectRoot || prev.path === "") ? full : prev));
       })
       .catch(() => {});
   }, []);
@@ -1346,37 +1490,40 @@ export function AppShell({ appName }: { appName: string }) {
   // Called by ChatWindow when a new session gets its real id from pi
   const handleSessionCreated = useCallback((session: SessionInfo) => {
     setNewSessionCwd(null);
+    setNewSessionPoolProject(null);
     setSelectedSession(session);
     setRefreshKey((k) => k + 1);
-    hydrateSelectedSession(session.id);
-    router.replace(`?session=${encodeURIComponent(session.id)}`);
+    hydrateSelectedSession(session.id, session.hostId);
+    router.replace(sessionNavigationUrl(session));
   }, [router, hydrateSelectedSession]);
 
   const handleSessionMoved = useCallback((oldId: string, newId: string) => {
     if (activeSessionIdRef.current !== oldId) return;
+    const hostId = activeSelectedSessionHostId;
     activeSessionIdRef.current = newId;
-    setSelectedSession((current) => current?.id === oldId ? { ...current, id: newId, path: "" } : current);
+    activeSessionTargetRef.current = { id: newId, hostId };
+    setSelectedSession((current) => current && sameSessionTarget(current, { id: oldId, hostId }) ? { ...current, id: newId, path: "" } : current);
     setRefreshKey((key) => key + 1);
-    hydrateSelectedSession(newId);
+    hydrateSelectedSession(newId, hostId);
     // This is the same conversation. Preserve ChatWindow's run/edit fences
     // and its mounted composer, including unfinished attachments and audio.
-    router.replace(`?session=${encodeURIComponent(newId)}`);
-  }, [router, hydrateSelectedSession]);
+    router.replace(sessionNavigationUrl({ id: newId, hostId }));
+  }, [router, hydrateSelectedSession, activeSelectedSessionHostId]);
 
   const handleAgentEnd = useCallback(() => {
     setRefreshKey((k) => k + 1);
     setExplorerRefreshKey((k) => k + 1);
   }, []);
 
-  // Notification clicks name a session id; the session list carries its cwd
-  // and project, which selecting needs. When the list cannot be read (the
-  // sign-in expired), load the session URL: sign-in carries it through.
-  const openSessionById = useCallback((sessionId: string) => {
+  // Session links and notification clicks name a session id; links may also
+  // carry its host so copied IDs on different machines stay distinct.
+  const openSessionById = useCallback((sessionId: string, hostId?: string) => {
     window.focus();
     // On narrow screens the file panel covers the chat it is about to show.
     if (isCompactOverlay) setRightPanelOpen(false);
     // A full load (not router navigation) so an expired sign-in reaches proxy.ts and the login page.
-    const sessionUrl = new URL(`/?session=${encodeURIComponent(sessionId)}`, window.location.origin).href;
+    const query = `/?session=${encodeURIComponent(sessionId)}${hostId ? `&host=${encodeURIComponent(hostId)}` : ""}`;
+    const sessionUrl = new URL(query, window.location.origin).href;
     void fetch("/api/sessions")
       .then((r) => {
         if (!r.ok) {
@@ -1384,7 +1531,8 @@ export function AppShell({ appName }: { appName: string }) {
           return;
         }
         return (r.json() as Promise<{ sessions: SessionInfo[] }>).then((d) => {
-          const session = d.sessions.find((s) => s.id === sessionId);
+          const session = d.sessions.find((candidate) => candidate.id === sessionId
+            && (!hostId || (candidate.hostId ?? "local") === hostId));
           if (session) handleSelectSession(session);
           else toast.error(translate("notifications.sessionNotFound"));
         });
@@ -1396,8 +1544,9 @@ export function AppShell({ appName }: { appName: string }) {
   useNotifications({ sessionId: settingsTab ? null : selectedSession?.id ?? null, locale, onOpenSession: openSessionById });
 
   const handleAutoName = useCallback(async () => {
-    const sessionId = selectedSession?.id;
-    if (!sessionId || autoNameStatus.kind === "naming") return;
+    if (!activeSelectedSessionId || autoNameStatus.kind === "naming") return;
+    const sessionId = activeSelectedSessionId;
+    const sessionTarget = { id: sessionId, hostId: activeSelectedSessionHostId };
     clearTimeout(autoNameTimerRef.current);
     setActiveTopPanel(null);
     setAutoNameStatus({ kind: "naming" });
@@ -1412,24 +1561,24 @@ export function AppShell({ appName }: { appName: string }) {
       }
 
       const title = body.title.trim();
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (!activeSessionTargetRef.current || !sameSessionTarget(activeSessionTargetRef.current, sessionTarget)) return;
       setRefreshKey((key) => key + 1);
-      setSelectedSession((current) => current?.id === sessionId ? { ...current, name: title } : current);
+      setSelectedSession((current) => current && sameSessionTarget(current, sessionTarget) ? { ...current, name: title } : current);
       setSessionStats((current) => current?.sessionId === sessionId ? { ...current, sessionName: title } : current);
       setAutoNameStatus({ kind: "success" });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 1800);
     } catch (error) {
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (!activeSessionTargetRef.current || !sameSessionTarget(activeSessionTargetRef.current, sessionTarget)) return;
       const message = error instanceof Error ? error.message : String(error);
       setAutoNameStatus({ kind: "error", message });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 5000);
     }
-  }, [autoNameStatus.kind, selectedSession?.id]);
+  }, [autoNameStatus.kind, activeSelectedSessionId, activeSelectedSessionHostId]);
 
   useEffect(() => {
     clearTimeout(autoNameTimerRef.current);
     setAutoNameStatus({ kind: "idle" });
-  }, [selectedSession?.id]);
+  }, [activeSelectedSessionId, activeSelectedSessionHostId]);
 
   const handleExplorerRefresh = useCallback(() => {
     setExplorerRefreshing(true);
@@ -1441,9 +1590,11 @@ export function AppShell({ appName }: { appName: string }) {
   }, []);
 
   const handleSessionForked = useCallback((newSessionId: string) => {
+    const hostId = activeSelectedSessionHostId;
     setRefreshKey((k) => k + 1);
     setSessionKey((k) => k + 1);
     setNewSessionCwd(null);
+    setNewSessionPoolProject(null);
     setSelectedSession((prev) => ({
       ...(prev ?? { path: "", cwd: "", created: "", modified: "", messageCount: 0, firstMessage: "" }),
       id: newSessionId,
@@ -1451,9 +1602,9 @@ export function AppShell({ appName }: { appName: string }) {
       // fork shows up immediately instead of waiting for a refresh.
       path: "",
     }));
-    hydrateSelectedSession(newSessionId);
-    router.replace(`?session=${encodeURIComponent(newSessionId)}`);
-  }, [router, hydrateSelectedSession]);
+    hydrateSelectedSession(newSessionId, hostId);
+    router.replace(sessionNavigationUrl({ id: newSessionId, hostId }));
+  }, [router, hydrateSelectedSession, activeSelectedSessionHostId]);
 
   const handleSessionDeleted = useCallback((sessionId: string) => {
     // The composer for this session can never be reopened, so its draft would
@@ -1463,7 +1614,10 @@ export function AppShell({ appName }: { appName: string }) {
     if (selectedSession?.id === sessionId) {
       const cwd = selectedSession.cwd;
       setSelectedSession(null);
-      setNewSessionCwd(cwd ?? null);
+      setNewSessionCwd(selectedSession.poolId ? null : cwd ?? null);
+      setNewSessionCreation({ id: randomUUID() });
+      setNewSessionPoolProject(selectedSession.poolId ? workspaceOptions.projects.find((project) => project.poolId === selectedSession.poolId && project.projectId === selectedSession.projectId) ?? null : null);
+      setNewSessionHostId(remoteHostId(selectedSession.hostId));
       setSessionKey((k) => k + 1);
       setBranchTree([]);
       setBranchActiveLeafId(null);
@@ -1471,7 +1625,7 @@ export function AppShell({ appName }: { appName: string }) {
       setActiveTopPanel(null);
       router.replace("/");
     }
-  }, [selectedSession, router]);
+  }, [selectedSession, router, workspaceOptions.projects]);
   const handleInitialRestoreDone = useCallback(() => {
     setInitialSessionRestored(true);
   }, []);
@@ -1533,14 +1687,10 @@ export function AppShell({ appName }: { appName: string }) {
     const absolute = filePath.startsWith("/") || filePath.startsWith("~/") || filePath.startsWith("\\\\") || /^[a-zA-Z]:[\\/]/.test(filePath);
     const rooted = !absolute && source.cwd ? joinFilePath(source.cwd, filePath) : filePath;
     const target = filePath.startsWith("~/") ? filePath : normalizeLocalPath(rooted);
-    const tabId = `file:${hostProjectKey(source.hostId, target)}`;
-    setFileTabs((prev) => {
-      const existing = prev.find((tab) => tab.id === tabId);
-      const sourceSessionId = source.sessionId ?? existing?.sourceSessionId;
-      if (!existing) return [...prev, { id: tabId, label: fileName, filePath: target, hostId: source.hostId, sourceCwd: source.cwd, sourceSessionId }];
-      if (existing.sourceSessionId === sourceSessionId && existing.sourceCwd === source.cwd) return prev;
-      return prev.map((tab) => tab.id === tabId ? { ...tab, sourceSessionId, sourceCwd: source.cwd } : tab);
-    });
+    const tabId = `file:${source.sessionId ?? hostProjectKey(source.hostId, source.cwd ?? "")}:${target}`;
+    setFileTabs((prev) => prev.some((tab) => tab.id === tabId)
+      ? prev
+      : [...prev, { id: tabId, label: fileName, filePath: target, hostId: source.hostId, sourceCwd: source.cwd, sourceSessionId: source.sessionId }]);
     setActiveFileTabId(tabId);
     setRightView("file");
     setRightPanelOpen(true);
@@ -1653,15 +1803,17 @@ export function AppShell({ appName }: { appName: string }) {
   const remoteHost = currentHostId !== undefined;
   const workspaceHostId = currentHostId ?? LOCAL_HOST_ID;
   const sidebarCwd = (activeHostId ?? LOCAL_HOST_ID) === workspaceHostId ? activeCwd : null;
-  const explorerCwd = selectedSession ? (sessionWorktreeRemoved ? sidebarCwd : sessionCwd) : newSessionCwd ?? sidebarCwd;
+  const explorerCwd = selectedSession
+    ? (sessionWorktreeRemoved ? sidebarCwd : sessionCwd)
+    : newSessionPoolProject || activePoolProject ? null : newSessionCwd ?? sidebarCwd;
 
   // File-panel integrations: every action works on the active tab so the right
   // panel behaves like an editor toolbar, not just a tab strip.
   const handleMentionActiveFile = useCallback(() => {
-    if (!activeFileTab) return;
+    if (!activeFileTab || activeFileTab.sourceSessionId !== (selectedSession?.id ?? null)) return;
     if (activeFileTab.hostId !== workspaceHostId) { toast.info(t("hosts.fileOtherHost")); return; }
-    handleAtMention(getRelativeFilePath(activeFileTab.filePath, explorerCwd ?? undefined), false);
-  }, [activeFileTab, explorerCwd, handleAtMention, workspaceHostId, t]);
+    handleAtMention(getRelativeFilePath(activeFileTab.filePath, activeFileTab.sourceCwd ?? undefined), false);
+  }, [activeFileTab, selectedSession?.id, handleAtMention, workspaceHostId, t]);
 
   const handleCopyActiveFilePath = useCallback(() => {
     if (!activeFileTab) return;
@@ -1683,11 +1835,15 @@ export function AppShell({ appName }: { appName: string }) {
   }, [activeFileTab]);
   const handleRevealActiveFile = useCallback(() => {
     if (!activeFileTab) return;
+    if (activeFileTab.sourceSessionId !== (selectedSession?.id ?? null)) {
+      toast.info(t("appShell.revealSourceSession"));
+      return;
+    }
     if (activeFileTab.hostId !== workspaceHostId) { toast.info(t("hosts.fileOtherHost")); return; }
     setRevealTarget({ path: activeFileTab.filePath, hostId: activeFileTab.hostId });
     setRightView("explorer");
     setRightPanelOpen(true);
-  }, [activeFileTab, workspaceHostId, t]);
+  }, [activeFileTab, selectedSession?.id, workspaceHostId, t]);
 
   const handleSelectFileTab = useCallback((tabId: string) => {
     setActiveFileTabId(tabId);
@@ -1728,14 +1884,25 @@ export function AppShell({ appName }: { appName: string }) {
   }, [selectedSession]);
 
   // Show chat area if a session is selected, or if we have a cwd to start a new session in
-  const effectiveNewSessionCwd = newSessionCwd ?? (selectedSession === null && activeCwd ? activeCwd : null);
-  const newSessionHost = newSessionCwd !== null ? newSessionHostId : activeHostId;
-  const newSessionHostKey = newSessionHost ?? LOCAL_HOST_ID;
-  const newSessionProject = (workspaceOptions.cwd === effectiveNewSessionCwd && workspaceOptions.hostId === newSessionHostKey ? workspaceOptions.selectedProject : null) ?? effectiveNewSessionCwd ?? "";
-  const hostProjects = workspaceOptions.projects.filter((project) => (project.hostId ?? LOCAL_HOST_ID) === newSessionHostKey);
+  const effectivePoolProject = selectedSession ? null : newSessionPoolProject ?? activePoolProject;
+  const effectiveNewSessionCwd = effectivePoolProject ? null : newSessionCwd ?? (selectedSession === null && activeCwd ? activeCwd : null);
+  const newSessionHost = effectivePoolProject ? undefined : newSessionCwd !== null ? newSessionHostId : activeHostId;
+  const newSessionHostKey = effectivePoolProject ? projectTargetId(effectivePoolProject) : newSessionHost ?? LOCAL_HOST_ID;
+  const newSessionProject = effectivePoolProject ? projectIdentity(effectivePoolProject) : (workspaceOptions.cwd === effectiveNewSessionCwd && workspaceOptions.hostId === newSessionHostKey ? workspaceOptions.selectedProject : null) ?? effectiveNewSessionCwd ?? "";
+  // The panel's target is the group the sidebar lists the project under: the cluster for a member's pinned project. The real host (above) is where the session runs.
+  const newSessionGroupKey = projectTargetId(effectivePoolProject ?? { hostId: newSessionHostKey }, pools);
+  // Pool projects first (stable), as in the sidebar's cluster group.
+  const hostProjects = workspaceOptions.projects.filter((project) => projectTargetId(project, pools) === newSessionGroupKey).sort((a, b) => Number(Boolean(b.poolId)) - Number(Boolean(a.poolId)));
+  // Two members' projects can share a path, so a non-pool option's value carries its host.
+  const newSessionWorkspaceValue = effectivePoolProject ? projectIdentity(effectivePoolProject) : effectiveNewSessionCwd ? hostProjectKey(newSessionHost, effectiveNewSessionCwd) : "";
+  const memberIds = new Set(pools.flatMap((pool) => pool.members.map((member) => member.hostId)));
+  const creationTargets = [...(hosts ?? []).filter((host) => !memberIds.has(host.id) && (poolsLoaded || host.id === LOCAL_HOST_ID)).map((host) => ({ id: host.id, label: hostName(t, host) })), ...pools.map((pool) => ({ id: `pool:${pool.id}`, label: pool.label }))];
   const chatHost = remoteHost ? hosts?.find((host) => host.id === currentHostId) : undefined;
   const settingsHostId = activeCwd ? activeHostId : currentHostId;
-  const showChat = selectedSession !== null || effectiveNewSessionCwd !== null;
+  // What Settings act for, as settingsHostId picks it: the sidebar's project, else the open session, the new chat, the pool project.
+  const settingsTarget = activeCwd ? { hostId: activeHostId } : selectedSession ?? (newSessionCwd !== null ? { hostId: newSessionHostId } : effectivePoolProject);
+  const clusterSettings = isClusterTarget(settingsTarget, settingsHostId, pools);
+  const showChat = selectedSession !== null || effectiveNewSessionCwd !== null || effectivePoolProject !== null;
   const currentRate = generationSpeed?.current;
   const rate = currentRate ?? generationSpeed?.average;
   const speed = showChat ? formatGenerationSpeed(rate) : null;
@@ -1810,6 +1977,8 @@ export function AppShell({ appName }: { appName: string }) {
     ready: mobileSidebarReady,
     sidebarOpen,
     setSidebarOpen,
+    panelOpen: rightPanelIsModal,
+    closePanel: closeRightPanel,
     url: searchParams.toString(),
   });
   useEffect(() => {
@@ -1854,12 +2023,14 @@ export function AppShell({ appName }: { appName: string }) {
       onSelectSession={handleSelectSession}
       onNewSession={handleNewSession}
       initialSessionId={initialSessionId}
+      initialSessionHostId={initialNavigation.hostId}
       skipInitialProjectSelection={initialNavigation.requestedCwd !== null}
       onInitialRestoreDone={handleInitialRestoreDone}
       refreshKey={refreshKey}
       onSessionDeleted={handleSessionDeleted}
       selectedCwd={selectedSession?.cwd ?? newSessionCwd ?? null}
       selectedHostId={selectedSession ? selectedSession.hostId ?? LOCAL_HOST_ID : newSessionHostId ?? LOCAL_HOST_ID}
+      selectedLogicalProjectKey={selectedSession?.poolId ? selectedSession.projectKey : effectivePoolProject ? projectIdentity(effectivePoolProject) : null}
       onCwdChange={handleCwdChange}
       onWorkspaceOptionsChange={handleWorkspaceOptionsChange}
       onWorktreeContextChange={setWorktreeCtx}
@@ -1914,8 +2085,8 @@ export function AppShell({ appName }: { appName: string }) {
           // An empty cwd is truthy, so showChat would render the shell while
           // useAgentSession refuses to start — every send a silent no-op.
           // Fall back to the server's default cwd (~/omp-cwd-<date>) instead.
-          if (activeCwd) {
-            handleNewSession(`palette-${Date.now()}`, activeCwd, activeHostId);
+          if (activeCwd || activePoolProject) {
+            handleNewSession(randomUUID(), activeCwd, activeHostId, activePoolProject ?? undefined);
             return;
           }
           const targetHost = currentHostId ?? LOCAL_HOST_ID;
@@ -1929,7 +2100,7 @@ export function AppShell({ appName }: { appName: string }) {
             })
             .then((data) => {
               if (!data.cwd) throw new Error("Empty cwd returned");
-              if (navViewVersionRef.current === sourceVersion) handleNewSession(`palette-${Date.now()}`, data.cwd, targetHost);
+              if (navViewVersionRef.current === sourceVersion) handleNewSession(randomUUID(), data.cwd, targetHost);
             })
             .catch(() => toast.error(translate("errors.generic")));
         }}
@@ -2074,6 +2245,7 @@ export function AppShell({ appName }: { appName: string }) {
             onOpenUrlAutomaticallyChange={handleOpenUrlAutomaticallyChange}
             cwd={activeCwd ?? selectedSession?.cwd ?? newSessionCwd}
             remoteHost={settingsHostId !== undefined}
+            cluster={clusterSettings}
             sessionId={selectedSession?.id ?? null}
             onModelsSaved={() => setModelsRefreshKey((k) => k + 1)}
             onPluginsReloaded={() => setSessionKey((k) => k + 1)}
@@ -2479,11 +2651,16 @@ export function AppShell({ appName }: { appName: string }) {
               session={selectedSession}
               newSessionCwd={effectiveNewSessionCwd}
               newSessionHostId={newSessionHost}
+              newSessionCreationId={effectivePoolProject ? newSessionCreationId : undefined}
+              newSessionPoolId={effectivePoolProject?.poolId}
+              newSessionProjectId={effectivePoolProject?.projectId}
+              newSessionInitialization={effectivePoolProject ? newSessionCreation.initialization : undefined}
+              onNewSessionInitialization={handleNewSessionInitialization}
               hostStatus={chatHost?.status}
               hostLabel={chatHost ? hostName(t, chatHost) : undefined}
-              newSessionWorkspace={effectiveNewSessionCwd && (
+              newSessionWorkspace={(effectiveNewSessionCwd || effectivePoolProject) && (
                 <div className="new-session-workspace">
-                  {hosts && hosts.length > 1 && (
+                  {creationTargets.length > 1 && (
                     <>
                       <label htmlFor="new-session-host" className="new-session-workspace-label">
                         {t("hosts.pickerLabel")}
@@ -2492,28 +2669,26 @@ export function AppShell({ appName }: { appName: string }) {
                         <span className="new-session-workspace-icon" aria-hidden="true">
                           <Server size={17} strokeWidth={1.8} />
                         </span>
-                        <select
+                        <ThemedSelect
+                          className="workspace-select-trigger"
                           id="new-session-host"
-                          value={newSessionHostKey}
-                          onChange={(event) => {
-                            // Workspaces belong to one host: land on its first one.
-                            const first = workspaceOptions.projects.find((project) => (project.hostId ?? LOCAL_HOST_ID) === event.target.value);
-                            if (!first || event.target.value === newSessionHostKey) return;
+                          value={newSessionGroupKey}
+                          onChange={(key) => {
+                            const matches = workspaceOptions.projects.filter((project) => projectTargetId(project, pools) === key);
+                            const first = matches.find((project) => project.poolId) ?? matches[0];
+                            if (!first || key === newSessionGroupKey) return;
                             suppressCwdRef.current = first.path;
-                            setActiveCwd(first.path);
-                            setActiveHostId(remoteHostId(event.target.value));
-                            handleNewSession("", first.path, event.target.value);
+                            setActivePoolProject(first.poolId ? first : null);
+                            setActiveCwd(first.poolId ? null : first.path);
+                            setActiveHostId(first.poolId ? undefined : remoteHostId(first.hostId));
+                            handleNewSession(randomUUID(), first.poolId ? null : first.path, first.hostId, first);
                           }}
-                        >
-                          {hosts.map((host) => {
-                            const hasProjects = workspaceOptions.projects.some((project) => (project.hostId ?? LOCAL_HOST_ID) === host.id);
-                            return (
-                              <option key={host.id} value={host.id} disabled={host.id !== newSessionHostKey && (!isLinkUp(host.status) || !hasProjects)}>
-                                {isLinkUp(host.status) ? hostName(t, host) : `${hostName(t, host)} — ${hostStatusText(t, host)}`}
-                              </option>
-                            );
-                          })}
-                        </select>
+                          options={creationTargets.map((target) => ({
+                            value: target.id,
+                            label: target.label,
+                            disabled: !workspaceOptions.projects.some((project) => projectTargetId(project, pools) === target.id),
+                          }))}
+                        />
                         <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
                       </div>
                     </>
@@ -2525,37 +2700,36 @@ export function AppShell({ appName }: { appName: string }) {
                     <span className="new-session-workspace-icon" aria-hidden="true">
                       <Folder size={17} strokeWidth={1.8} />
                     </span>
-                    <select
+                    <ThemedSelect
+                      className="workspace-select-trigger"
                       id="new-session-workspace"
                       aria-describedby="new-session-workspace-path"
-                      value={effectiveNewSessionCwd}
-                      onChange={(event) => {
-                        const cwd = event.target.value;
-                        if (!cwd) {
-                          openAddProject(true, newSessionHostKey);
-                          return;
-                        }
-                        if (cwd === effectiveNewSessionCwd) return;
-                        suppressCwdRef.current = cwd;
-                        setActiveCwd(cwd);
-                        handleNewSession("", cwd, newSessionHostKey);
+                      value={newSessionWorkspaceValue}
+                      onChange={(key) => {
+                        if (!key) { openAddProject(true, newSessionGroupKey); return; }
+                        const project = hostProjects.find((candidate) => projectIdentity(candidate) === key || (!candidate.poolId && hostProjectKey(candidate.hostId, candidate.path) === key));
+                        if (!project) return;
+                        suppressCwdRef.current = project.path;
+                        setActivePoolProject(project.poolId ? project : null);
+                        setActiveCwd(project.poolId ? null : project.path);
+                        setActiveHostId(project.poolId ? undefined : remoteHostId(project.hostId));
+                        handleNewSession(randomUUID(), project.poolId ? null : project.path, project.hostId, project);
                       }}
-                    >
-                      {!hostProjects.some((project) => comparableProjectPath(project.path) === comparableProjectPath(newSessionProject)) && (
-                        <option value={effectiveNewSessionCwd}>{projectLabel(effectiveNewSessionCwd)}</option>
-                      )}
-                      {hostProjects.map((project) => {
-                        const current = comparableProjectPath(project.path) === comparableProjectPath(newSessionProject);
-                        const label = project.alias ?? projectLabel(project.path);
-                        const duplicate = hostProjects.some((other) => other.path !== project.path && (other.alias ?? projectLabel(other.path)) === label);
-                        return (
-                          <option key={project.path} value={current ? effectiveNewSessionCwd : project.path}>
-                            {duplicate ? `${label} — ${project.path}` : label}
-                          </option>
-                        );
-                      })}
-                      <option value="">+ {t("projects.add")}</option>
-                    </select>
+                      options={[
+                        ...(!effectivePoolProject && effectiveNewSessionCwd && !hostProjects.some((project) => foldedHostProjectKey(project.hostId, project.path) === foldedHostProjectKey(newSessionHost, newSessionProject))
+                          ? [{ value: newSessionWorkspaceValue, label: projectLabel(effectiveNewSessionCwd) }] : []),
+                        ...hostProjects.map((project) => {
+                          const name = project.alias ?? project.name ?? projectLabel(project.path);
+                          // A member's pinned project: its option names the node.
+                          const node = !project.poolId && projectTargetId(project, pools) !== (project.hostId ?? LOCAL_HOST_ID) ? hosts?.find((host) => host.id === (project.hostId ?? LOCAL_HOST_ID)) : undefined;
+                          return {
+                            value: project.poolId ? projectIdentity(project) : hostProjectKey(project.hostId, foldedHostProjectKey(project.hostId, project.path) === foldedHostProjectKey(newSessionHost, newSessionProject) ? effectiveNewSessionCwd ?? project.path : project.path),
+                            label: node ? t("hosts.projectOnNode", { name, node: hostName(t, node) }) : name,
+                          };
+                        }),
+                        { value: "", label: t("projects.add"), action: true },
+                      ]}
+                    />
                     <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
                   </div>
                   {/* The workspace's worktrees: picking one sets where the new
@@ -2566,21 +2740,19 @@ export function AppShell({ appName }: { appName: string }) {
                       <span className="new-session-workspace-icon" aria-hidden="true">
                         <GitBranch size={17} strokeWidth={1.8} />
                       </span>
-                      <select
+                      <ThemedSelect
+                        className="workspace-select-trigger"
                         aria-label={t("sessionSidebar.switchWorktree")}
                         aria-describedby="new-session-workspace-path"
                         value={worktreeCtx.currentPath}
-                        onChange={(event) => worktreeCtx.select(event.target.value)}
-                      >
-                        {worktreeCtx.worktrees.map((wt) => (
-                          <option key={wt.path} value={wt.path}>{wt.branch ?? getFileName(wt.path)}</option>
-                        ))}
-                      </select>
+                        onChange={(path) => worktreeCtx.select(path)}
+                        options={worktreeCtx.worktrees.map((wt) => ({ value: wt.path, label: wt.branch ?? getFileName(wt.path) }))}
+                      />
                       <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
                     </div>
                   )}
-                  <div id="new-session-workspace-path" className="new-session-workspace-path" title={effectiveNewSessionCwd}>
-                    {effectiveNewSessionCwd}
+                  <div id="new-session-workspace-path" className="new-session-workspace-path" title={effectivePoolProject?.origin ?? effectiveNewSessionCwd ?? undefined}>
+                    {effectivePoolProject?.origin ?? effectiveNewSessionCwd}
                   </div>
                 </div>
               )}
@@ -2590,7 +2762,7 @@ export function AppShell({ appName }: { appName: string }) {
               onSessionMoved={handleSessionMoved}
               modelsRefreshKey={modelsRefreshKey}
               chatInputRef={chatInputRef}
-              onOpenFile={handleOpenFile}
+              onOpenFile={selectedSession || !effectivePoolProject ? handleOpenFile : undefined}
               onOpenUrl={handleSessionOpenUrl}
               onBranchDataChange={handleBranchDataChange}
               onSystemPromptChange={handleSystemPromptChange}
@@ -2695,6 +2867,7 @@ export function AppShell({ appName }: { appName: string }) {
         revealPath={revealTarget?.hostId === workspaceHostId ? revealTarget.path : null}
         onRevealDone={handleRevealDone}
         explorerCwd={explorerCwd}
+        sourceSessionId={selectedSession?.id ?? null}
         hostId={workspaceHostId}
         worktrees={worktreeCtx}
         connectionDiagnosticsOn={connectionDiagnosticsOn}
@@ -2732,7 +2905,7 @@ export function AppShell({ appName }: { appName: string }) {
 
     </div>
     <LocalDaemonBanner />
-    <AppUpdateDialog open={appUpdateDialogOpen} update={appUpdate} phase={appUpdatePhase} visibleStage={appUpdateVisibleStage} error={appUpdateError} onProceed={() => void proceedWithAppUpdate()} onNotNow={dismissAppUpdate} />
+    <AppUpdateDialog open={appUpdateDialogOpen} update={appUpdate} phase={appUpdatePhase} visibleStage={appUpdateVisibleStage} error={appUpdateError} plan={appUpdatePlan} planStatus={appUpdatePlanStatus} onRefreshPlan={refreshAppUpdatePlan} onCheckStatus={checkStalledAppUpdate} onProceed={(approval) => void proceedWithAppUpdate(approval)} onNotNow={dismissAppUpdate} />
     {archiveBrowserOpen && (
       <ArchiveBrowser
         open={archiveBrowserOpen}

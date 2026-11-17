@@ -5,28 +5,37 @@
 import { isValidSessionId } from "../session-file-references-core";
 import { UPLOAD_ID_RE } from "../upload-limits";
 import type { SessionOps } from "./session-ops";
+import type { HostCapacity } from "./capacity";
+import type { ConfigState } from "./daemon-cluster-config";
 import type { SpawnRequest } from "./host";
 import { isWorkspaceOp, WORKSPACE_OP_PARAMS } from "../workspace-types";
 import type { WorkspaceFileEvent } from "../workspace-types";
 
-/** 7: several server links share host-owned channels, lifecycle, dialogs and callbacks. 6: composer uploads
+/** Application Protocol v12 uses maintenance API v1 on a separate authenticated connection.
+ * v10/v11 application links are accepted only by the upgrade shim, never by the session runtime. */
+/** 11: the same wire as 10, renumbered: prerelease daemons already sent 10 with omp RPC channel lines, which this
+ * server cannot read. 10: channel stdin/stdout lines are the runner's `{t}` frames (`cmd`/`res`/`hello`/…), no longer omp RPC frames;
+ * `open.launch.configVersion`, the `config_state` report and the `clusterConfig` op.
+ * 9: `open.launch.shareCredentials`. 8: pool capacity reports, creation identity and project preparation. 7: shared host-owned channels, lifecycle,
+ * dialogs and callbacks. 6: composer uploads
  * `upload_ack` up message, the `uploadStart`/`uploadAbort`/`uploadAttach` ops. 5: a line over `pieceBytes` goes as
  * `part` messages and a large result as several binary frames, both sent fair across channels
  * (docs/specs/2026-10-31-websocket-link-design.md, D7). 4: the link is one WebSocket: text frames carry the messages,
  * binary frames large results, `ack` messages replace the ack header and the POST answer.
  * Rules for changing it: docs/specs/2026-10-28-remote-hosts-design.md, "Protocol versions and compatibility". */
-export const LINK_PROTOCOL_VERSION = 7;
-/** The first daemon link version that takes uploads: main answers 426 below it (host_upgrade_required, or
- * host_restart_required on this machine, whose daemon an in-place upgrade leaves running). */
-export const UPLOADS_SINCE_VERSION = 6;
-/** The oldest daemon protocol the server still links (older ones get close 4426). Dropping one is an explicit decision. */
-export const MIN_LINK_PROTOCOL_VERSION = 4;
+export const LINK_PROTOCOL_VERSION = 12;
+/** Oldest full application protocol; the v10/v11 update-only shim is outside this range. */
+export const MIN_LINK_PROTOCOL_VERSION = 12;
+/** A configuration version: the manifest's SHA-256, in lowercase hex. */
+export const CONFIG_VERSION_RE = /^[0-9a-f]{64}$/;
+/** Safe identity shared by spawn requests and reconnect channel metadata. */
+export const CREATION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 export const LINK_LIMITS = {
   pingMs: 15_000,
   offlineMs: 30_000,
   // One prompt's two echoes (message_start, message_end) must fit with no ack on a
-  // slow link: each is up to the 8 MiB command body as base64 rpc_chunk lines
+  // slow link: each can carry the 8 MiB command body's images as base64
   // (~10.7 MiB), and the rest is room for the streamed reply.
   channelBufferBytes: 32 * 1024 * 1024,
   flushMs: 16,
@@ -68,6 +77,9 @@ export const HISTORY_MUTATING_COMMANDS = new Set([
 export const MESSAGE_COMMANDS = new Set(["prompt", "steer", "follow_up", "followUp", "abort_and_prompt"]);
 /** Shared-channel marker a daemon puts in the other members' output when one link writes a message command. */
 export const PEER_MESSAGE_FRAME = "peer_message_command";
+/** Shared-channel frame `{t, outcome}` a daemon puts in the other members' output for one link's `prompt_result` or
+ * `prompt_error` (its command id dropped): the elected notifier must hear a run failed whichever server prompted it. */
+export const PEER_PROMPT_OUTCOME_FRAME = "peer_prompt_outcome";
 export type HostUriScheme = { scheme: string; writable: boolean };
 
 /** Named `req.args` keys for each session op, in parameter order. Named, not
@@ -95,17 +107,17 @@ export const SESSION_OP_PARAMS: { readonly [K in keyof SessionOps]: readonly str
   updateProject: ["updates"],
   hideProject: ["path"],
   validateCwd: ["path"],
+  preparePoolProject: ["input"],
 };
 
-/** Every op a daemon answers. Older daemons refuse newer ops with unknown_op; upload ops require v6, `setUploadRetention`
- * (docs/specs/2026-11-02-file-uploads-design.md, U6) is a compatible addition that older daemons answer 501. */
-export const HOST_OP_NAMES = [...(Object.keys(SESSION_OP_PARAMS) as (keyof SessionOps)[]), ...Object.keys(WORKSPACE_OP_PARAMS) as (keyof typeof WORKSPACE_OP_PARAMS)[], "spawn", "open", "close", "editLease", "sessionFileExists", "invalidateSessionLists", "checkUpdates", "updateSoftware", "uploadStart", "uploadAbort", "uploadAttach", "setUploadRetention"] as const;
+/** Unknown additions are answered with 501; pool preparation needs a v8 peer. */
+export const HOST_OP_NAMES = [...(Object.keys(SESSION_OP_PARAMS) as (keyof SessionOps)[]), ...Object.keys(WORKSPACE_OP_PARAMS) as (keyof typeof WORKSPACE_OP_PARAMS)[], "open", "close", "editLease", "sessionFileExists", "invalidateSessionLists", "checkUpdates", "updateSoftware", "uploadStart", "uploadAbort", "uploadAttach", "setUploadRetention", "clusterConfig"] as const;
 
 export type HostOpName = (typeof HOST_OP_NAMES)[number];
 
 export type OpenChannelRequest = { sessionId: string | null; launch: SpawnRequest; replaceAdvisor?: boolean; preparing?: boolean; expectedChannel?: string };
-/** `supportsBashExcludeFromContext`: exact true only when the child's ready advertised it; an older daemon omits it, which is false. */
-export type OpenChannelResult = { ch: string; joined: boolean; pending: string[] | null; streaming: string | null; cwd: string; fellBack: boolean; launchAdvisor: boolean; advisorSpawned: boolean; autoApproveExtension: boolean; supportsBashExcludeFromContext?: boolean };
+/** `continuous`: the opening link was already a member and got every output line in order, so `streaming` repeats lines it has. */
+export type OpenChannelResult = { ch: string; joined: boolean; pending: string[] | null; streaming: string | null; cwd: string; fellBack: boolean; launchAdvisor: boolean; advisorSpawned: boolean; autoApproveExtension: boolean; continuous?: boolean };
 
 /** A failed host op, as carried by `res {ok: false, error}`. */
 export class HostOpError extends Error {
@@ -140,7 +152,7 @@ export type DownMessage =
 
 /** `sessionId`: the session the child last reported (null before it named one); `cwd`: where the
  * daemon spawned it; `pending`: raw stdout lines of its open blocking requests, or null when over `pendingBytes`. */
-export type HelloChannel = { ch: string; sessionId: string | null; cwd: string; pending: string[] | null };
+export type HelloChannel = { ch: string; sessionId: string | null; cwd: string; pending: string[] | null; creationId?: string };
 
 /** One uplink message the daemon measured: enqueued at `at` (its wall clock) with `bytesAhead` bytes unacked ahead of
  * it (messages and result blobs), `bytes` its own size (with its blob), acked by the hub `ackMs` later (a monotonic
@@ -174,6 +186,12 @@ export type UpMessage =
   /** The daemon's link samples, at most LINK_LIMITS.statsSamples; a hub that predates it skips the type. Advisory: the
    * receiver keeps the valid ones and counts the rest in `invalid` (decodeUp only; a sender leaves it out). */
   | { type: "stats"; seq: number; samples: LinkStatSample[]; invalid?: number }
+  /** v8: a fresh resource sample; unsequenced and never retained for replay. */
+  | { type: "capacity"; sample: HostCapacity }
+  /** v10: the daemon's cluster configuration state, at link up, on each change and after each host.json reload, and
+   * whether the configuration it holds is this link's server's (`owned`); unsequenced and never retained for replay,
+   * but the latest one that found the send window full goes once there is room. */
+  | { type: "config_state"; state: ConfigState; owned: boolean }
   /** v6: the daemon has written `received` bytes of upload `id` for this start `attempt`, `done` once all of them are
    * written and synced; with `error` the upload failed and its staged file is gone. */
   | { type: "upload_ack"; seq: number; id: string; attempt: string; received: number; done: boolean; error?: { status: number; code: string; message: string } }
@@ -286,7 +304,7 @@ export function isHostOp(name: string): name is HostOpName {
 }
 
 const DOWN_TYPES: readonly string[] = ["welcome", "stdin", "kill", "interest", "host_tools", "req", "ping", "pong", "ack"];
-const UP_TYPES: readonly string[] = ["hello", "stdout", "stderr", "exit", "resync", "notifier", "sessions_changed", "channels_changed", "stats", "res", "upload_ack", "workspace_file", "ping", "pong", "ack"];
+const UP_TYPES: readonly string[] = ["hello", "stdout", "stderr", "exit", "resync", "notifier", "sessions_changed", "channels_changed", "stats", "capacity", "config_state", "res", "upload_ack", "workspace_file", "ping", "pong", "ack"];
 
 /** `otherDirection`: the types only the other direction decodes; one of those arrived on the wrong way. */
 function unknownMessage(o: Obj, otherDirection: readonly string[]): UnknownMessage {
@@ -384,8 +402,39 @@ function channels(o: Obj): HelloChannel[] {
   if (!Array.isArray(list)) fail("channels must be an array");
   return list.map((c: unknown) => {
     if (!isObj(c)) fail("channel must be an object");
-    return { ch: str(c, "ch"), sessionId: nullable(c, "sessionId", str), cwd: str(c, "cwd"), pending: nullable(c, "pending", strings) };
+    const creationId = c.creationId;
+    if (creationId !== undefined && (typeof creationId !== "string" || !CREATION_ID_RE.test(creationId))) fail("Invalid creation identity");
+    return { ch: str(c, "ch"), sessionId: nullable(c, "sessionId", str), cwd: str(c, "cwd"), pending: nullable(c, "pending", strings), ...(creationId === undefined ? {} : { creationId }) };
   });
+}
+
+const CONFIG_FILES: readonly string[] = ["none", "current", "failed"];
+const CONFIG_PLUGINS: readonly string[] = ["none", "pending", "current", "failed"];
+
+/** A daemon's ConfigState (`config_state`, the `clusterConfig` result). Throws LinkProtocolError. */
+export function decodeConfigState(value: unknown): ConfigState {
+  if (!isObj(value)) fail("config state must be an object");
+  const { files, plugins } = value;
+  if (typeof files !== "string" || !CONFIG_FILES.includes(files)) fail("Invalid files state");
+  if (typeof plugins !== "string" || !CONFIG_PLUGINS.includes(plugins)) fail("Invalid plugins state");
+  return { version: nullable(value, "version", str), files: files as ConfigState["files"], plugins: plugins as ConfigState["plugins"], error: nullable(value, "error", str), missingCommands: strings(value, "missingCommands") };
+}
+
+function capacitySample(value: unknown): HostCapacity {
+  if (!isObj(value)) fail("capacity sample must be an object");
+  const nonnegative = (key: string): number => {
+    const n = value[key];
+    if (typeof n !== "number" || !Number.isFinite(n) || n < 0) fail(`${key} must be finite and non-negative`);
+    return n;
+  };
+  const effectiveCpus = nonnegative("effectiveCpus");
+  const load1 = nonnegative("load1");
+  const busyFraction = nonnegative("busyFraction");
+  const stealFraction = nonnegative("stealFraction");
+  const availableMemoryBytes = nonnegative("availableMemoryBytes");
+  const activeSessions = seqNum(value, "activeSessions");
+  if (effectiveCpus === 0 || busyFraction + stealFraction > 1) fail("Invalid capacity CPU values");
+  return { effectiveCpus, load1, busyFraction, stealFraction, availableMemoryBytes, activeSessions };
 }
 
 /** One sample's fixed fields, or null when one is missing or out of range. Extra fields are dropped. */
@@ -478,6 +527,10 @@ export function decodeUp(line: string): UpMessage | UnknownMessage {
       return { type: "channels_changed", seq: seqNum(o, "seq"), channels: channels(o) };
     case "stats":
       return stats(o);
+    case "capacity":
+      return { type: "capacity", sample: capacitySample(o.sample) };
+    case "config_state":
+      return { type: "config_state", state: decodeConfigState(o.state), owned: bool(o, "owned") };
     case "upload_ack": {
       const attempt = str(o, "attempt");
       if (!UPLOAD_ID_RE.test(attempt)) fail("attempt must be a UUIDv4");
@@ -602,18 +655,13 @@ function cutPart(line: string, at: number, seq: number): { line: string; at: num
 /** The sending side of one link direction (spec D7): FIFO per key, keys served round-robin (Map order: a key that
  * sent goes to the back), each turn one whole line, one `part` or one result piece. Lines are numbered as they go
  * out, so wire order is `seq` order. One key at a time may be part-way through a multi-part line, so the receiver
- * holds at most one partial line. `parts`: false for a v4 peer, which gets every line whole. */
+ * holds at most one partial line. */
 export class LinkSender<T extends SendItem> {
-  parts: boolean;
   /** `at`: how far the item has gone out (UTF-16 units of `line`, bytes of `blob`); `line`: set while it goes in parts;
    * `left`: its bytes still counted in queuedBytes. */
   private readonly queues = new Map<string, { item: T; at: number; line: string | null; left: number }[]>();
   private active: string | null = null;
   private queued = 0;
-
-  constructor(parts: boolean) {
-    this.parts = parts;
-  }
 
   /** Bytes queued and not sent yet (a line's `size`, a result's bytes; a line going in parts less the parts sent). */
   get queuedBytes(): number {
@@ -685,9 +733,7 @@ export class LinkSender<T extends SendItem> {
         head.at += piece.byteLength;
         unit = { key, item, done: head.at >= item.blob.byteLength, frame: encodeBlobFrame(item.id, piece) };
         this.sent(head, unit.done, piece.byteLength);
-      } else if (!this.parts || item.size <= LINK_LIMITS.pieceBytes) {
-        // A line part-way out in parts when the peer turned out to be v4 goes whole from the start.
-        if (this.active === key) this.active = null;
+      } else if (item.size <= LINK_LIMITS.pieceBytes) {
         const seq = nextSeq();
         unit = { key, item, done: true, seq, line: withSeq(item.line, seq), part: false, messageBytes: numberedBytes(item.size, seq) };
         this.sent(head, true, 0);

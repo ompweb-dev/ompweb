@@ -3,7 +3,7 @@ import { sendAgentCommand } from "@/lib/agent-client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
 import { ArrowDown, ChevronDown, ChevronUp, Paperclip, Square } from "lucide-react";
-import type { AgentMessage, AssistantMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
+import type { AgentMessage, AssistantMessage, SessionInfo, SessionTreeNode, ToolResultMessage, UiCustomFrame } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
 import { collectToolResults, isGroupAnchor, planTranscriptRows, type TranscriptRow } from "@/lib/chat-transcript-plan";
 import { isReplyBlock } from "@/lib/message-display";
@@ -16,7 +16,6 @@ import { ExtensionDialog } from "./ExtensionDialog";
 import { SubagentTranscriptDialog } from "./SubagentTranscriptDialog";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { ComposerPanels } from "./ComposerPanels";
-import { SkillDiagnosticsNotice } from "./SkillDiagnostics";
 import { BtwHistoryDialog, type BtwPanelProps } from "./BtwPanel";
 import OmpWebLogo from "./OmpWebLogo";
 import { CHAT_COLUMN_MAX_WIDTH, MINIMAP_WIDTH } from "@/lib/chat-layout";
@@ -54,6 +53,11 @@ interface Props {
   newSessionCwd: string | null;
   /** Host a fresh chat starts on (this machine when absent). */
   newSessionHostId?: string;
+  newSessionCreationId?: string;
+  newSessionPoolId?: string;
+  newSessionProjectId?: string;
+  newSessionInitialization?: string;
+  onNewSessionInitialization?: (body: string) => void;
   /** The chat's host from the `hosts` channel: the source of truth until a
    *  `host_status` frame reports a change, and for a chat opened mid-outage. */
   hostStatus?: HostStatus;
@@ -393,7 +397,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
   );
 });
 
-export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
+export function ChatWindow({ session, newSessionCwd, newSessionHostId, newSessionCreationId, newSessionPoolId, newSessionProjectId, newSessionInitialization, onNewSessionInitialization, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
   const { t, tn } = useI18n();
   const fileSource = useMemo<WorkspaceFileSource>(() => ({
     hostId: session?.hostId ?? newSessionHostId ?? "local",
@@ -450,7 +454,6 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     isCompacting, compactResult, tokensPerSecond, displayModel: displayModelValue, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages, advisorActive, advisorEnabled, handleAdvisorChange,
     notices, dismissNotice, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
-    skillDiagnostics, setSkillStartupDiagnostics,
     isAutoModelSelection,
     agentPhase, activeGoal, activePlan,
     liveToolResults,
@@ -459,14 +462,15 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     sessionIdRef, messagesEndRef, scrollContainerRef, holdScrollPosition,
     handleSend, handleAbort, handleFork, handleEdit, handleModelChange, retrySession,
     handleSteer, handleFollowUp, handleAbortCompaction, handleCompact,
-    heldMessages, deleteHeldMessage,
+    heldMessages, deleteHeldMessage, retryHeldMessage,
     removeQueuedMessage, promoteQueuedToSteer,
     handleBuiltinSlashCommand, togglePreCompactionHistory,
     handleThinkingLevelChange, handleFastModeChange, handleSlowModeChange, handleCycleModel, handleCycleThinkingLevel, handleAbortRetry, loadSlashCommands,
     handleToolPresetChange,
     btw, askBtw,
+    resolveUploadHost,
   } = useAgentSession({
-    session, newSessionCwd, newSessionHostId, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked, onSessionMoved: handleSessionMoved,
+    session, newSessionCwd, newSessionHostId, newSessionCreationId, newSessionPoolId, newSessionProjectId, newSessionInitialization, onNewSessionInitialization, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked, onSessionMoved: handleSessionMoved,
     modelsRefreshKey, chatInputRef: composerRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
     onOpenFile: onOpenWorkspaceFile, onOpenUrl,
   });
@@ -599,7 +603,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   // top, load another page while keeping the scroll position stable.
   const [visibleCount, setVisibleCount] = useState(VISIBLE_PAGE_SIZE);
   const prevSessionKeyForPagingRef = useRef<string | null>(null);
-  const draftKey = session?.id ?? (newSessionCwd ? newChatDraftKey(newSessionCwd, newSessionHostId) : undefined);
+  const draftKey = session?.id ?? (newSessionPoolId && newSessionProjectId ? `new:pool:${newSessionPoolId}:${newSessionProjectId}` : newSessionCwd ? newChatDraftKey(newSessionCwd, newSessionHostId) : undefined);
   const sessionKeyForPaging = draftKey ?? "empty";
   useEffect(() => {
     if (prevSessionKeyForPagingRef.current !== sessionKeyForPaging) {
@@ -886,6 +890,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     onFollowUp: (question) => askBtw(question, activeBtwRecord.id),
     onClose: () => btw.setActiveId(null),
     cwd: messageCwd,
+    sourceSessionId: session?.id ?? sessionIdRef.current,
     onOpenFile,
   } : null;
 
@@ -993,7 +998,10 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     return null;
   }, [bashRunning, pendingBash, isCompacting, agentRunning, streamState.streamingMessage, pendingToolHeaders.length, agentPhase, activeSubagentCount, currentTodoPhase, t, tn]);
 
-  const askOpen = extensionDialog?.method === "ask";
+  // omp's ask tool uses formDialog whenever the UI has one; askDialog is its per-question fallback.
+  // Like omp's TUI, which swaps its editor for the ask, nothing is sent while either is open:
+  // a steer would interrupt the ask ("Ask interrupted by message").
+  const askOpen = extensionDialog?.method === "askDialog" || extensionDialog?.method === "formDialog";
   const hiddenComposerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     // A hidden composer that keeps focus keeps the phone keyboard up: the
@@ -1072,7 +1080,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       onAudioUnlock={unlockAudio}
       draftKey={draftKey}
       uploadHostId={session ? session.hostId : newSessionHostId}
-      cwd={session?.cwd ?? newSessionCwd}
+      resolveUploadHost={!session && newSessionPoolId ? resolveUploadHost : undefined}
+      cwd={!session && newSessionPoolId ? null : session?.cwd ?? newSessionCwd}
       /* The pill bar and chevron only render in the non-empty layout; don't
          accept Escape-to-minimize in the fresh-chat branch where there is
          nothing to collapse. */
@@ -1165,6 +1174,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
         records={btw.records}
         onFollowUp={(recordId) => { btw.setActiveId(recordId); btw.setHistoryOpen(false); }}
         cwd={messageCwd}
+        sourceSessionId={session?.id ?? sessionIdRef.current}
         onOpenFile={onOpenFile}
       />
 
@@ -1209,7 +1219,6 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
             {newSessionWorkspace}
             {hostBanner}
             <NoticeShelf notices={notices} onDismiss={dismissNotice} align="right" />
-            <SkillDiagnosticsNotice snapshot={skillDiagnostics} onDisable={() => setSkillStartupDiagnostics(false)} />
             <ComposerPanels todoPhases={[]} subagents={[]} onSelectSubagent={setSelectedSubagent} btw={btwPanel} />
             {/* ChatInput insets itself by CHAT_COLUMN_PADDING; cancel this column's
                 padding so the composer matches its in-session width. */}
@@ -1331,7 +1340,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
 
             {/* After the live turn, in submission order: what omp does not have yet. */}
             {heldMessages.map((held) => (
-              <HeldMessageView key={held.id} held={held} hostLabel={hostLabel} onDelete={deleteHeldMessage} />
+              <HeldMessageView key={held.id} held={held} hostLabel={hostLabel} onDelete={deleteHeldMessage} onRetry={retryHeldMessage} />
             ))}
 
             <div ref={messagesEndRef} />
@@ -1423,7 +1432,6 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
                 />
               </div>
             )}
-            <SkillDiagnosticsNotice snapshot={skillDiagnostics} onDisable={() => setSkillStartupDiagnostics(false)} />
             <ComposerPanels
               todoPhases={todoPhases}
               subagents={subagents}
@@ -1626,8 +1634,6 @@ function NoticeShelf({ notices, onDismiss, floating = false, align = "left" }: {
   );
 }
 
-type ExtensionCustomRequest = Extract<ExtensionUiRequest, { method: "custom" }>;
-
 function renderAnsiLine(line: string, keyPrefix: string): ReactNode[] {
   return parseAnsiLine(line).map((segment, index) => (
     Object.keys(segment.style).length > 0
@@ -1640,8 +1646,8 @@ function ExtensionCustomPanel({
   request,
   onInput,
 }: {
-  request: ExtensionCustomRequest;
-  onInput: (request: ExtensionCustomRequest, data: string) => void;
+  request: UiCustomFrame;
+  onInput: (request: UiCustomFrame, data: string) => void;
 }) {
   const { t } = useI18n();
   const inputRef = useRef<HTMLTextAreaElement>(null);

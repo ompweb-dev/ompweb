@@ -6,9 +6,8 @@ import { isValidSubagentId } from "@/lib/hosts/session-ops";
  * GET /api/sessions/[id]/subagents/[subagentId]?fromByte=N
  *
  * Default: paged transcript of one subagent, read directly from the parent
- * session's sibling artifacts dir. Mirrors the RPC get_subagent_messages
- * response shape so the dialog can fall back to it when no live RPC process
- * knows the file.
+ * session's sibling artifacts dir through the owning host. Mirrors the
+ * get_subagent_messages response shape without waiting for a live process.
  *
  * ?mode=completion: the subagent's final output (`<id>.md`), without loading
  * the transcript — works even for transcripts beyond the readable size cap.

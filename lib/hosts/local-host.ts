@@ -1,7 +1,5 @@
 import { existsSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
-import { fileURLToPath } from "url";
 import { comparableProjectPath } from "../comparable-path";
 import { isValidOmpProfile } from "../omp-profile";
 import { getAgentEnvOverrides } from "../omp/agent-env";
@@ -11,16 +9,10 @@ import { isReservedLaunchArg, loadProjectRegistry } from "../project-registry";
 import { invalidateSessionEntriesCache, invalidateSessionListCache, invalidateSessionListMeta } from "../session-reader";
 import { PRESET_FULL } from "../tool-presets";
 import type { ProjectLaunchConfig } from "../types";
-import type { Host } from "./host";
+import { resolveProject } from "../worktree";
 import { HostOpError } from "./link-protocol";
+import type { Host } from "./host";
 import { sessionOps } from "./session-ops";
-
-const EXTENSION_BESIDE_MODULE = fileURLToPath(new URL("../omp/session-edit-extension.mjs", import.meta.url));
-/** omp loads it for history edits (#278). Next to this module, not in the cwd: the daemon runs in HOME. In the compiled
- * binary this module lives in Bun's virtual filesystem, which omp cannot read, so the file ships in its static root. */
-export const SESSION_EDIT_EXTENSION_PATH = existsSync(EXTENSION_BESIDE_MODULE)
-  ? EXTENSION_BESIDE_MODULE
-  : join(process.env.OMP_WEB_PACKAGE_DIR ?? process.cwd(), "lib", "omp", "session-edit-extension.mjs");
 
 // omp aliases "find"->"glob" and has no "ls" tool; the web UI presets still use
 // the pi names (lib/tool-presets.ts), so translate before building --tools.
@@ -41,7 +33,7 @@ export function mapPresetToolNames(toolNames: string[]): string[] {
 
 const FULL_PRESET_KEY = [...PRESET_FULL].map((n) => n.toLowerCase()).sort().join(",");
 
-/** Extra CLI args for spawning `omp --mode rpc-ui` for a session. */
+/** Extra CLI args for spawning `ompweb-omp --headless` for a session. */
 export function buildSessionSpawnArgs(sessionFile: string, toolNames?: string[], advisor = false, launchConfig?: ProjectLaunchConfig, modelOverride?: string): string[] {
   const args: string[] = [];
   if (sessionFile) {
@@ -127,14 +119,18 @@ export function resolveSpawnCwdResult(recordedCwd?: string | null): { cwd: strin
 }
 
 /** Look up the workspace-registered launch config; unregistered projects attach none. */
-export function launchConfigForCwd(cwd: string): ProjectLaunchConfig | undefined {
+export async function launchConfigForCwd(cwd: string): Promise<ProjectLaunchConfig | undefined> {
   let canonical = cwd;
   try { canonical = realpathSync(cwd); } catch {}
+  const projects = loadProjectRegistry().projects.filter((project) => !project.hidden);
   const key = comparableProjectPath(canonical);
-  return loadProjectRegistry().projects.find((project) => {
-    if (project.hidden) return false;
+  const direct = projects.find((project) => comparableProjectPath(project.path) === key);
+  if (direct) return direct.launchConfig;
+  const { projectRoot } = await resolveProject(canonical);
+  const rootKey = comparableProjectPath(projectRoot);
+  return projects.find((project) => {
     const projectKey = comparableProjectPath(project.path);
-    return projectKey === key || key.startsWith(`${projectKey}-worktrees/`);
+    return projectKey === rootKey || key.startsWith(`${projectKey}-worktrees/`);
   })?.launchConfig;
 }
 
@@ -145,16 +141,22 @@ export const localHost: Omit<Host, "workspaceOps" | "supportsWorkspaceOp"> = {
   sessionOps,
   status: () => "online",
   onStatus: () => () => {},
-  async spawnRpc(request) {
-    // Callers already resolved request.cwd on this machine (resolveSpawnCwdResult).
+  async spawnRpc(request, _sessionId, options) {
     const { cwd } = request;
-    const launchConfig = launchConfigForCwd(cwd);
+    const launchConfig = await launchConfigForCwd(cwd);
+    if (request.creationId !== undefined) {
+      try {
+        if (!statSync(cwd).isDirectory() || comparableProjectPath(realpathSync(cwd)) !== comparableProjectPath(cwd)) throw new Error("Prepared cwd changed");
+      } catch {
+        throw new HostOpError(409, "prepared_cwd_changed", "The prepared worktree is no longer available");
+      }
+    }
     const transport = spawnOmpTransport({
       cwd,
       // Re-read per spawn so a respawn picks up environment values the user
       // added in Settings after the session was created (#104).
-      env: getAgentEnvOverrides(),
-      extraArgs: [...buildSessionSpawnArgs(request.sessionFile, request.toolNames, request.advisor, launchConfig, request.spawnModel), "--extension", SESSION_EDIT_EXTENSION_PATH],
+      env: { ...getAgentEnvOverrides(), ...options?.env },
+      extraArgs: [...buildSessionSpawnArgs(request.sessionFile, request.toolNames, request.advisor, launchConfig, request.spawnModel)],
     });
     return {
       transport,

@@ -12,6 +12,7 @@ import { containsMathSyntax, normalizeDisplayMath } from "./markdown";
 import { compileSearchQuery, findSearchMatches, type CompiledSearchQuery } from "./session-search";
 import { SEARCH_MATCH_PAGE_SIZE, type SessionSearchMatchPage } from "./session-search-matches";
 import type { AgentMessage } from "./types";
+import { splitOriginHeader } from "./message-origin";
 
 // Short lead-in: the sidebar row is narrow and the hit must stay visible.
 const SNIPPET_BEFORE = 16;
@@ -36,7 +37,9 @@ function textBlocks(content: unknown): string[] {
 function messageTextBlocks(message: AgentMessage): string[] {
   if (message.role === "user") {
     const texts = textBlocks(message.content);
-    return texts.length > 0 ? [texts.join("\n")] : [];
+    if (texts.length === 0) return [];
+    const text = texts.join("\n");
+    return [message.origin?.kind === "session" ? splitOriginHeader(text)?.body ?? text : text];
   }
   return message.role === "assistant" ? textBlocks(message.content) : [];
 }

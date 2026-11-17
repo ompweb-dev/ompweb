@@ -244,11 +244,22 @@ test("renders single queued prompt in compact bar", () => {
       queuedMessages: {
         followUp: ["First follow-up task"],
         steering: [],
+        messageOrigins: {
+          followUp: [{
+            v: 1, kind: "session", sentAt: "2026-11-15T12:41:00.000Z",
+            session: {
+              id: "source", name: "Build session", hostId: "local", hostLabel: "This machine",
+              tool: "send_to_session", delivery: "followUp",
+            },
+          }],
+          steering: [],
+        },
       },
     }),
   );
 
   assert.match(html, /First follow-up task/);
+  assert.match(html, /\[From Build session\]/);
   assert.match(html, />(Edit|chatInput\.queuedEdit)</);
   assert.match(html, />(Delete|chatInput\.queuedDelete)</);
   assert.match(html, />(Steer|chatInput\.queuedSteerAction)</);

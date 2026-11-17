@@ -14,6 +14,10 @@ import type {
   SessionInfo,
   SessionTreeNode,
   ToolResultMessage,
+  UiCustomFrame,
+  UiDialogRequest,
+  UiDialogValue,
+  UiPresentationFrame,
   UserMessage,
 } from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
@@ -23,7 +27,6 @@ import { HostOfflineError, TransportLostError, getOutboxScope, rememberOutboxSco
 import type { HostStatus } from "@/lib/hosts/host";
 import type { WorkspaceFileSource } from "@/lib/workspace-types";
 import { newChatDraftKey, remoteHostId } from "@/lib/project-ordering";
-import { parseSkillDiagnosticsSnapshot, type SkillDiagnosticsSnapshot } from "@/lib/skill-diagnostics";
 import { clearDraft, getDraft, mergeRecoveredText, recoverDraft, setDraft, toDraftImages, type ChatDraft, type ChatDraftImage } from "@/lib/draft-store";
 import { formatExitedSessionNotice, translate } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
@@ -40,10 +43,10 @@ import { toast } from "@/components/ui/toast";
 import { expandWebSlashCommand } from "@/lib/web-slash-commands";
 import { validateOutgoingPrompt } from "@/lib/image-attachments";
 import { createActiveGoal, parseActiveGoal, type ActiveGoal, type ActivePlan } from "@/lib/web-mode-state";
-import type { HostToolDefinition, HostUriSchemeDefinition, RpcAskDialogAnswer, RpcAvailableSlashCommand, SessionStatsInfo, SlowModeScope, TodoPhase, UsageLimitState } from "@/lib/pi-types";
+import type { HostToolDefinition, HostUriSchemeDefinition, RpcAvailableSlashCommand, SessionStatsInfo, SlowModeScope, TodoPhase, UsageLimitState } from "@/lib/pi-types";
 import { isRecord } from "@/lib/type-guards";
 import { subscribeSessionsChanged } from "@/lib/session-change-bus";
-import { EVENT_STREAM_CLOSED, EVENT_STREAM_OPEN, addToOutbox, dropFromOutbox, newOutboxId, openEventStream, subscribeOutbox, type EventStream, type LocalOutboxEntry } from "@/lib/event-stream";
+import { EVENT_STREAM_CLOSED, EVENT_STREAM_OPEN, addToOutbox, dropFromOutbox, newOutboxId, openEventStream, reconcileOutbox, subscribeOutbox, type EventStream, type LocalOutboxEntry } from "@/lib/event-stream";
 import { createSessionCatchUp, type SessionCatchUp, type SessionLiveFields } from "./useAgentSession-sync";
 import type { SessionLiveSnapshot } from "@/lib/session-sync";
 import {
@@ -98,7 +101,6 @@ import {
   extractMessageText,
   historyEntryToSubagentInfo,
   isQuotaLikeError,
-  isSafeOpenUrl,
   runHostTool,
   normalizeThinkingLevel,
   pruneSubagentIdMap,
@@ -120,9 +122,6 @@ import type {
   CompactResultInfo,
   EventStreamConnectionResult,
   EventStreamConnectionStatus,
-  ExtensionUiCustomRequest,
-  ExtensionUiDialogRequest,
-  IncomingExtensionUiRequest,
   LastAssistantTextResponse,
   ModelEntry,
   ModelsResponse,
@@ -230,6 +229,12 @@ export interface UseAgentSessionOptions {
   newSessionCwd: string | null;
   /** Host a fresh chat is created on; a started session carries its own `hostId`. This machine when absent. */
   newSessionHostId?: string;
+  newSessionCreationId?: string;
+  newSessionPoolId?: string;
+  newSessionProjectId?: string;
+  /** Frozen ensure_session configuration retained by the existing navigation view. */
+  newSessionInitialization?: string;
+  onNewSessionInitialization?: (body: string) => void;
   advisorEnabled?: boolean;
   onAgentEnd?: () => void;
   onSessionCreated?: (session: SessionInfo) => void;
@@ -310,15 +315,20 @@ function unrecordedHeldBash<T extends { command: string; after: number }>(messag
     return !run;
   });
 }
+function reconcileConfirmedLocalOutbox(sessionId: string, localEntries: LocalOutboxEntry[], confirmedIds: ReadonlySet<string>): Promise<void> {
+  const ids = localEntries.filter((entry) => entry.sessionId === sessionId && entry.replaces !== undefined && confirmedIds.has(entry.id)).map((entry) => entry.id);
+  return ids.length ? reconcileOutbox(sessionId, ids) : Promise.resolve();
+}
 
 export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
-    session, newSessionCwd, newSessionHostId, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved,
+    session, newSessionCwd, newSessionHostId, newSessionCreationId, newSessionPoolId, newSessionProjectId, newSessionInitialization, onNewSessionInitialization, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved,
     modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
     onOpenFile, onOpenUrl,
   } = opts;
   const reducedMotion = usePrefersReducedMotion();
-  const isNew = session === null && newSessionCwd !== null;
+  const pooled = Boolean(newSessionPoolId && newSessionProjectId && newSessionCreationId);
+  const isNew = session === null && (newSessionCwd !== null || Boolean(newSessionCreationId || newSessionPoolId || newSessionProjectId));
 
   const [data, setData] = useState<SessionData | null>(null);
   const [loading, setLoading] = useState(!isNew);
@@ -385,6 +395,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // event-stream worker's), the server's for this one (`outbox_update`, or the state route's until the first frame),
   // and server confirmations no snapshot has covered yet (the command's answer and the frame race).
   const [localOutbox, setLocalOutbox] = useState<LocalOutboxEntry[]>([]);
+  const localOutboxRef = useRef(localOutbox);
   const [serverOutbox, setServerOutbox] = useState<ServerOutbox>(EMPTY_SERVER_OUTBOX);
   const serverOutboxRef = useRef(EMPTY_SERVER_OUTBOX);
   const [storedOutbox, setStoredOutbox] = useState<OutboxEntry[]>([]);
@@ -465,7 +476,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [retryInfo, setRetryInfo] = useState<{ attempt: number; maxAttempts: number; delayMs?: number; startedAt?: number; errorMessage?: string } | null>(null);
   const [contextUsage, setContextUsage] = useState<{ percent: number | null; contextWindow: number; tokens: number | null } | null>(null);
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
-  const [skillDiagnostics, setSkillDiagnostics] = useState<SkillDiagnosticsSnapshot | null>(null);
   const [forkingEntryId, setForkingEntryId] = useState<string | null>(null);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
   const [currentModelOverride, setCurrentModelOverride] = useState<{ provider: string; modelId: string } | null>(null);
@@ -492,10 +502,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const knownSlashCommandNamesRef = useRef<string[]>([]);
   const warnedSlashCommandsRef = useRef(new Set<string>());
   const [noticeState, dispatchNotice] = useReducer(noticeReducer, { visible: [], pending: [] });
+  const addNotice = useCallback((notice: { id?: string; message: string; type?: NoticeType }) => {
+    const message = notice.message.trim();
+    if (!message) return;
+    dispatchNotice({
+      type: "add",
+      notice: {
+        id: notice.id ?? createNoticeId(),
+        message,
+        type: notice.type ?? "info",
+      },
+    });
+  }, []);
   const [sessionStatsOverride, setSessionStatsOverride] = useState<SessionStatsInfo | null>(null);
-  const [extensionDialog, setExtensionDialog] = useState<ExtensionUiDialogRequest | null>(null);
+  const [extensionDialog, setExtensionDialog] = useState<UiDialogRequest | null>(null);
   const extensionDialogClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const locallyAnsweredDialogRef = useRef<string | null>(null);
+  const locallyAnsweredDialogRef = useRef<UiDialogRequest["id"] | null>(null);
   useEffect(() => () => {
     if (extensionDialogClearTimerRef.current) clearTimeout(extensionDialogClearTimerRef.current);
   }, []);
@@ -531,7 +553,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // a prompt increment runId before the stale pre-prompt state arrives and
   // clobbers the new run's derived state (model/fast-mode).
   const initialHydrationPendingRef = useRef(false);
-  const [extensionCustomUi, setExtensionCustomUi] = useState<ExtensionUiCustomRequest | null>(null);
+  const [extensionCustomUi, setExtensionCustomUi] = useState<UiCustomFrame | null>(null);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
   const [queuedMessages, setQueuedMessagesState] = useState<QueuedMessages>(EMPTY_QUEUE);
@@ -556,21 +578,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     queueAppliedSeqRef.current = seq;
     updateQueuedMessages(readQueueSnapshot(value) ?? EMPTY_QUEUE);
   }, [updateQueuedMessages]);
-  // Orders get_state responses, the setter reply, and SSE updates so a response
-  // started before a newer frame cannot overwrite it.
-  const skillDiagnosticsSeqRef = useRef(0);
-  const skillDiagnosticsAppliedSeqRef = useRef(0);
-  // What the view shows now, for a setter reply that a newer frame overtook.
-  const skillDiagnosticsRef = useRef<SkillDiagnosticsSnapshot | null>(null);
-  const publishSkillDiagnostics = useCallback((seq: number, snapshot: SkillDiagnosticsSnapshot | null) => {
-    skillDiagnosticsAppliedSeqRef.current = seq;
-    skillDiagnosticsRef.current = snapshot;
-    setSkillDiagnostics(snapshot);
-  }, []);
-  const applySkillDiagnosticsSnapshot = useCallback((seq: number, value: unknown) => {
-    if (seq <= skillDiagnosticsAppliedSeqRef.current) return;
-    publishSkillDiagnostics(seq, parseSkillDiagnosticsSnapshot(value) ?? null);
-  }, [publishSkillDiagnostics]);
   const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
   const [subagentEvents, setSubagentEvents] = useState<Record<string, SubagentActivityEvent[]>>({});
   const [subagentTranscriptVersions, setSubagentTranscriptVersions] = useState<Record<string, number>>({});
@@ -588,8 +595,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // must therefore be settled by the same owner that replaces/unmounts it.
   const cancelEventConnectionRef = useRef<(() => void) | null>(null);
   const reconnectTimerRef = useRef<NodeJS.Timeout | undefined>(undefined);
+  const reportedCreationErrorsRef = useRef(new WeakSet<Error>());
   const eventStreamRetryMsRef = useRef<number>(EVENT_STREAM_RETRY_MIN_MS);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
+  const creationBodyRef = useRef<{ json: string; advisor: boolean } | null>(null);
+  const createdOwnerRef = useRef<{ cwd: string; hostId?: string } | null>(null);
   const btw = useBtw(sessionIdRef);
   const { applyEvent: applyBtwFrame, refreshHistory: refreshBtwHistory, reconcile: reconcileBtw, openHistory: openBtwHistory, ask: sendBtw } = btw;
   // A btw ask can wait seconds on spawn + SSE attach: a second Enter must not send it twice.
@@ -1077,13 +1087,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // must reach the composer so the ladder/active level match reality.
   const refreshLiveModelState = useCallback(async (sid: string) => {
     const token = beginAuthoritativeModelSync();
-    const skillDiagnosticsRevision = ++skillDiagnosticsSeqRef.current;
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
       if (!res.ok) return;
       const agentState = await res.json() as { running: boolean; state?: AgentStateResponse };
       if (!hookAliveRef.current || sessionIdRef.current !== sid) return;
-      applySkillDiagnosticsSnapshot(skillDiagnosticsRevision, agentState.state?.skillDiagnostics);
       const applied = applyAuthoritativeModel(toThinkingModelMeta(agentState.state?.model), token);
       if (!applied) return; // stale snapshot — drop its thinking level too
       if (agentState.state?.thinkingLevel !== undefined) {
@@ -1109,7 +1117,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch {
       // Best effort; the next loadSession/reconcile re-syncs.
     }
-  }, [applyAuthoritativeModel, applySkillDiagnosticsSnapshot, beginAuthoritativeModelSync]);
+  }, [applyAuthoritativeModel, beginAuthoritativeModelSync]);
 
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, fenceRunId?: number) => {
     const requestSeq = ++contextRequestSeqRef.current;
@@ -1125,7 +1133,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const stateRequest = includeState ? {
       token: beginAuthoritativeModelSync(),
       queueRevision: ++queueSeqRef.current,
-      skillDiagnosticsRevision: ++skillDiagnosticsSeqRef.current,
       response: fetch(`/api/sessions/${encodeURIComponent(sid)}/state`).then(async (stateRes) => {
         const agentState = await stateRes.json().catch(() => ({})) as { running: boolean; state?: AgentStateResponse; exited?: ExitedRpcSession; outbox?: OutboxEntry[]; outboxScope?: string; outboxSettledIds?: string[]; nativeSettledIds?: string[] };
         if (hookAliveRef.current && sessionIdRef.current === sid && contextRequestSeqRef.current === requestSeq
@@ -1186,7 +1193,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
 
       try {
-        const { token, queueRevision, skillDiagnosticsRevision } = stateRequest;
+        const { token, queueRevision } = stateRequest;
         const reply = await stateRequest.response;
         if (!reply) {
           if (showLoading) setLoading(false);
@@ -1208,7 +1215,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
 
         const liveState = agentState.state;
-        applySkillDiagnosticsSnapshot(skillDiagnosticsRevision, liveState?.skillDiagnostics);
         const modelApplied = applyAuthoritativeModel(toThinkingModelMeta(liveState?.model), token);
         if (liveState) {
           if (liveState.contextUsage !== undefined) setContextUsage(liveState.contextUsage ?? null);
@@ -1256,7 +1262,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // Ensure the flag is cleared even if the pre-state early-return path was taken
       if (showLoading && includeState && !messagesLoaded) initialHydrationPendingRef.current = false;
     }
-  }, [catchUp, refreshSubagentHistory, applyAuthoritativeModel, beginAuthoritativeModelSync, applyQueueStateSnapshot, applySkillDiagnosticsSnapshot]);
+  }, [catchUp, refreshSubagentHistory, applyAuthoritativeModel, beginAuthoritativeModelSync, applyQueueStateSnapshot]);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null, includePreCompaction = false): Promise<boolean> => {
     const seq = ++contextRequestSeqRef.current;
@@ -1314,20 +1320,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const promoteNewSession = useCallback((messageCount = 0, firstMessage?: string) => {
     firstMessage ??= translate("agentSession.noMessages");
     const sid = sessionIdRef.current;
-    if (!isNew || !newSessionCwd || !sid || newSessionPromotedRef.current) return;
+    if (!isNew || !sid || newSessionPromotedRef.current) return;
+    if (pooled && (!createdOwnerRef.current?.hostId || !createdOwnerRef.current.cwd)) return;
     newSessionPromotedRef.current = true;
     onSessionCreated?.({
       id: sid,
       path: "",
-      cwd: newSessionCwd,
+      cwd: createdOwnerRef.current?.cwd ?? newSessionCwd ?? "",
       name: undefined,
       created: new Date().toISOString(),
       modified: new Date().toISOString(),
       messageCount,
       firstMessage,
-      ...(newSessionHostId ? { hostId: newSessionHostId } : {}),
+      ...(createdOwnerRef.current?.hostId ? { hostId: createdOwnerRef.current.hostId } : newSessionHostId ? { hostId: newSessionHostId } : {}),
+      ...(pooled ? { poolId: newSessionPoolId, projectId: newSessionProjectId, projectKey: `pool:${newSessionPoolId}:${newSessionProjectId}` } : {}),
     });
-  }, [isNew, newSessionCwd, newSessionHostId, onSessionCreated]);
+  }, [isNew, newSessionCwd, newSessionHostId, newSessionPoolId, newSessionProjectId, pooled, onSessionCreated]);
 
   // Assigned after connectEvents is defined. A runtime created for an empty
   // chat emits its startup frames before any stream exists, so it must be
@@ -1336,29 +1344,41 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const ensureNewSession = useCallback(async () => {
     if (sessionIdRef.current) return sessionIdRef.current;
-    if (!isNew || !newSessionCwd) return sessionIdRef.current;
+    if (!isNew) return sessionIdRef.current;
+    if ((newSessionCreationId || newSessionPoolId || newSessionProjectId) && !pooled) throw new Error(translate("agentSession.invalidPoolTarget"));
     if (ensuringNewSessionRef.current) return ensuringNewSessionRef.current;
 
     const promise = (async () => {
       const selectedModel = newSessionModel ?? newSessionDefaultModel;
       if (selectedModel) setPendingModel(selectedModel);
       const toolNames = getToolNamesForPreset(toolPreset);
+      const request = {
+        ...(pooled
+          ? { creationId: newSessionCreationId, poolId: newSessionPoolId, projectId: newSessionProjectId }
+          : { cwd: newSessionCwd, ...(newSessionHostId ? { hostId: newSessionHostId } : {}) }),
+        type: "ensure_session",
+        toolNames,
+        ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
+        ...(thinkingLevel !== "auto" ? { thinkingLevel } : {}),
+        ...(advisorEnabled ? { advisor: true } : {}),
+      };
+      // A journal ID describes one immutable initialization, even after a lost answer.
+      if (pooled && creationBodyRef.current === null) {
+        const initialization: unknown = newSessionInitialization ? JSON.parse(newSessionInitialization) : request;
+        if (!isRecord(initialization) || initialization.type !== "ensure_session" || initialization.creationId !== newSessionCreationId || initialization.poolId !== newSessionPoolId || initialization.projectId !== newSessionProjectId || "cwd" in initialization || "hostId" in initialization || "message" in initialization) {
+          throw new Error(translate("agentSession.invalidPoolTarget"));
+        }
+        creationBodyRef.current = { json: newSessionInitialization ?? JSON.stringify(request), advisor: initialization.advisor === true };
+        onNewSessionInitialization?.(creationBodyRef.current.json);
+      }
       const res = await fetch("/api/agent/new", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cwd: newSessionCwd,
-          ...(newSessionHostId ? { hostId: newSessionHostId } : {}),
-          type: "ensure_session",
-          toolNames,
-          ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
-          ...(thinkingLevel !== "auto" ? { thinkingLevel } : {}),
-          ...(advisorEnabled ? { advisor: true } : {}),
-        }),
+        body: pooled ? creationBodyRef.current!.json : JSON.stringify(request),
       });
-      const body = await res.json().catch(() => ({})) as { sessionId?: unknown; error?: string; code?: string; hostOffline?: boolean; delivery?: string };
-      const offline = res.status === 503 && body.hostOffline === true;
-      if (!res.ok && !offline) throw new Error(body.error || body.code ? formatApiError(body) : `HTTP ${res.status}`);
+      const body = await res.json().catch(() => ({})) as { sessionId?: unknown; hostId?: string; cwd?: string; error?: string; code?: string; hostOffline?: boolean; delivery?: string };
+      const offline = res.status === 503 && (body.hostOffline === true || typeof body.sessionId === "string");
+      if (!res.ok && !offline) throw new Error(formatApiError({ ...body, error: body.error ?? `HTTP ${res.status}` }));
       // A host that dropped after the spawn keeps the session (503 with its id):
       // adopt it, so a retry sends there instead of starting a second session.
       const realId = typeof body.sessionId === "string" && body.sessionId ? body.sessionId : null;
@@ -1367,9 +1387,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
       sessionIdRef.current = realId;
+      createdOwnerRef.current = { cwd: body.cwd ?? (pooled ? "" : newSessionCwd ?? ""), hostId: body.hostId ?? (pooled ? undefined : newSessionHostId) };
+      if (pooled && (!createdOwnerRef.current.hostId || !createdOwnerRef.current.cwd)) throw new Error(translate("agentSession.uploadOwnerUnavailable"));
       // The toggle handler could not persist while the chat had no id; carry
       // the pre-prompt choice over so it survives a reload after this point.
-      if (advisorEnabled) {
+      if (pooled ? creationBodyRef.current!.advisor : advisorEnabled) {
         setSessionAdvisorSpawn(realId, true);
         try {
           localStorage.setItem(`omp-advisor-enabled:${realId}`, "true");
@@ -1382,9 +1404,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (hookAliveRef.current && !promptDispatchPendingRef.current && !btwAskPendingRef.current) {
         observeCreatedSessionRef.current?.(realId);
       }
-      if (offline) throw new HostOfflineError(formatApiError(body), body.delivery === "unknown");
+      if (offline) {
+        if (hookAliveRef.current && !pooled) promoteNewSession();
+        if (pooled && body.delivery === "unknown" && body.hostOffline !== true) throw new Error(formatApiError(body));
+        throw new HostOfflineError(formatApiError(body), body.delivery === "unknown");
+      }
       return realId;
-    })();
+    })().catch((error: unknown) => {
+      if (!pooled) throw error;
+      const failure = error instanceof Error ? error : new Error(String(error));
+      reportedCreationErrorsRef.current.add(failure);
+      if (hookAliveRef.current) addNotice({ type: "error", message: failure.message });
+      throw failure;
+    });
 
     ensuringNewSessionRef.current = promise;
     try {
@@ -1392,7 +1424,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       ensuringNewSessionRef.current = null;
     }
-  }, [advisorEnabled, isNew, newSessionCwd, newSessionHostId, newSessionModel, newSessionDefaultModel, toolPreset, thinkingLevel]);
+  }, [advisorEnabled, isNew, pooled, newSessionCwd, newSessionHostId, newSessionCreationId, newSessionPoolId, newSessionProjectId, newSessionInitialization, onNewSessionInitialization, newSessionModel, newSessionDefaultModel, toolPreset, thinkingLevel, promoteNewSession, addNotice]);
+
+  const resolveUploadHost = useCallback(async () => {
+    const sid = sessionIdRef.current ?? await ensureNewSession();
+    if (!sid) throw new Error(translate("agentSession.uploadOwnerUnavailable"));
+    const hostId = createdOwnerRef.current?.hostId ?? session?.hostId;
+    if (pooled && !hostId) throw new Error(translate("agentSession.uploadOwnerUnavailable"));
+    return hostId ?? "local";
+  }, [ensureNewSession, pooled, session?.hostId]);
 
   // The system panel may initialize a dormant session, but must not create a
   // prompt or model run just to inspect the resolved system prompt.
@@ -1455,17 +1495,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const refreshAgentSnapshots = useCallback(async (sid: string) => {
     const queueRevision = ++queueSeqRef.current;
-    const skillDiagnosticsRevision = ++skillDiagnosticsSeqRef.current;
     try {
       const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
       if (!res.ok || !hookAliveRef.current || sessionIdRef.current !== sid) return;
       const data = await res.json() as { state?: AgentStateResponse };
       applyQueueStateSnapshot(queueRevision, data.state?.queuedMessages);
-      applySkillDiagnosticsSnapshot(skillDiagnosticsRevision, data.state?.skillDiagnostics);
     } catch {
       // The next live update or state snapshot heals these views.
     }
-  }, [applyQueueStateSnapshot, applySkillDiagnosticsSnapshot]);
+  }, [applyQueueStateSnapshot]);
 
   const reconcileHandoff = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -1702,18 +1740,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       serverOutboxRef.current = applyOutboxSnapshot(serverOutboxRef.current, entries, settledIds, nativeSettledIds);
       setServerOutbox(serverOutboxRef.current);
     }
+    void reconcileConfirmedLocalOutbox(sid, localOutbox, serverOutboxRef.current.seen)
+      .catch((error) => console.warn(`[omp-web] browser outbox reconciliation failed: ${error instanceof Error ? error.message : String(error)}`));
     // Held messages open the session channel even without a wrapper: subscribe to follow them.
     if (entries.length > 0 && !eventSourceRef.current) void connectEvents(sid, "connected");
   };
 
   useEffect(() => subscribeOutbox((event) => {
     if ("entries" in event) {
+      // Read by a Retry before React renders: a copy waiting in IndexedDB must block another at once.
+      localOutboxRef.current = event.entries;
       setLocalOutbox(event.entries);
       serverOutboxRef.current = rememberLocalOutbox(serverOutboxRef.current, event.entries, sessionIdRef.current);
       setServerOutbox(serverOutboxRef.current);
+      const sid = sessionIdRef.current;
+      if (sid) void reconcileConfirmedLocalOutbox(sid, event.entries, serverOutboxRef.current.seen)
+        .catch((error) => console.warn(`[omp-web] browser outbox reconciliation failed: ${error instanceof Error ? error.message : String(error)}`));
       return;
     }
     const { stored } = event;
+    // Server confirmation or a locally proven browser-only root retires the original before outbox_update arrives.
+    if (stored.replaces) markOutboxRepresented([stored.replaces]);
     const sid = sessionIdRef.current;
     if (stored.sessionId !== sid) return;
     serverOutboxRef.current = rememberOutboxEntries(serverOutboxRef.current, [stored]);
@@ -1722,7 +1769,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (!serverOutboxRef.current.seen.has(stored.id)) setStoredOutbox((current) => [...current.filter((entry) => entry.id !== stored.id), stored]);
     // The server holds it now, so the channel opens even without a wrapper (a first try may have been refused).
     if (hookAliveRef.current && !eventSourceRef.current) void connectEvents(sid, "connected");
-  }), [connectEvents]);
+  }), [connectEvents, markOutboxRepresented]);
 
   // ---------------------------------------------------------------------
   // Host-tool bridge: omp-web registers tools the AGENT can call. The server
@@ -1828,7 +1875,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         openFile: onOpenFile ? (path, name, owner) => {
           if (!hookAliveRef.current) throw new Error("File not opened: the requesting chat is no longer active");
           onOpenFile(path, name, {
-            sessionId: owner ?? sid, hostId: session?.hostId ?? newSessionHostId ?? "local", cwd: session?.cwd ?? newSessionCwd,
+            sessionId: owner ?? sid, hostId: createdOwnerRef.current?.hostId ?? session?.hostId ?? newSessionHostId ?? "local", cwd: createdOwnerRef.current?.cwd ?? session?.cwd ?? newSessionCwd,
           });
         } : undefined,
       }, sid, controller.signal);
@@ -1882,12 +1929,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     await respondHostUri(sid, id, { isError: true, error: `Unknown pi-web resource: ${resource}` });
   }, [respondHostUri]);
 
-  const sendExtensionCustomInput = useCallback(async (request: ExtensionUiCustomRequest, data: string) => {
+  const sendExtensionCustomInput = useCallback(async (request: UiCustomFrame, data: string) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
     try {
       await sendAgentCommand(sid, {
-        type: "extension_ui_input",
+        type: "ui_input",
         id: request.id,
         data,
       });
@@ -1896,18 +1943,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, []);
 
-  const addNotice = useCallback((notice: { id?: string; message: string; type?: NoticeType }) => {
-    const message = notice.message.trim();
-    if (!message) return;
-    dispatchNotice({
-      type: "add",
-      notice: {
-        id: notice.id ?? createNoticeId(),
-        message,
-        type: notice.type ?? "info",
-      },
-    });
-  }, []);
 
   const addUnconfirmedRunErrorNotice = useCallback((
     error: string, source: ErrorAssistantSource | null, sid: string | null,
@@ -1925,13 +1960,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [addNotice]);
 
   const respondToExtensionUi = useCallback(async (
-    request: ExtensionUiDialogRequest,
-    response: { value: string } | { confirmed: boolean } | { cancelled: true } | { answers: RpcAskDialogAnswer[] },
-  ) => {
+    request: UiDialogRequest,
+    value: UiDialogValue | undefined,
+  ): Promise<boolean> => {
     const sid = sessionIdRef.current;
     if (!sid) {
       setExtensionDialog((current) => current?.id === request.id ? null : current);
-      return;
+      return true;
     }
     // Claim the dialog before awaiting: another tab answering broadcasts a
     // synchronized "cancel" for the same request id, which must not tear down
@@ -1939,12 +1974,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     // when a genuinely new request arrives.
     locallyAnsweredDialogRef.current = request.id;
     try {
-      await sendAgentCommand(sid, {
-        type: "extension_ui_response",
-        id: request.id,
-        ...response,
-      });
-      if (!hookAliveRef.current || sessionIdRef.current !== sid) return;
+      await sendAgentCommand(sid, { type: "ui_response", id: request.id, value });
+      if (!hookAliveRef.current || sessionIdRef.current !== sid) return true;
       // Keep the answered panel mounted briefly while the next question arrives.
       clearTimeout(extensionDialogClearTimerRef.current ?? undefined);
       extensionDialogClearTimerRef.current = setTimeout(() => {
@@ -1952,11 +1983,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (locallyAnsweredDialogRef.current === request.id) locallyAnsweredDialogRef.current = null;
         extensionDialogClearTimerRef.current = null;
       }, 250);
+      return true;
     } catch (e) {
       console.error("Failed to send extension UI response:", e);
       if (hookAliveRef.current && sessionIdRef.current === sid) {
         addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
       }
+      // Let the panel take another answer: omp never got this one.
+      if (locallyAnsweredDialogRef.current === request.id) locallyAnsweredDialogRef.current = null;
+      return false;
     }
   }, [addNotice]);
 
@@ -1988,83 +2023,55 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     throw new EventStreamConnectionError(current && result.status === "timeout" ? "timeout" : "closed");
   }, [addNotice, connectEvents]);
 
-  const handleExtensionUiRequest = useCallback((request: IncomingExtensionUiRequest) => {
-    switch (request.method) {
-      case "select":
-      case "confirm":
-      case "input":
-      case "editor":
-      case "ask":
-        if (extensionDialogClearTimerRef.current) {
-          clearTimeout(extensionDialogClearTimerRef.current);
-          extensionDialogClearTimerRef.current = null;
-        }
-        locallyAnsweredDialogRef.current = null;
-        setExtensionDialog(request);
+  const openExtensionDialog = useCallback((request: UiDialogRequest) => {
+    if (extensionDialogClearTimerRef.current) {
+      clearTimeout(extensionDialogClearTimerRef.current);
+      extensionDialogClearTimerRef.current = null;
+    }
+    locallyAnsweredDialogRef.current = null;
+    setExtensionDialog(request);
+  }, []);
+
+  const endExtensionDialog = useCallback((id: UiDialogRequest["id"]) => {
+    // Another tab's answer or omp's own close; this tab's answer keeps its hand-off window.
+    if (id !== locallyAnsweredDialogRef.current) {
+      setExtensionDialog((current) => current?.id === id ? null : current);
+    }
+  }, []);
+
+  const handleExtensionUiFrame = useCallback((frame: UiPresentationFrame) => {
+    switch (frame.method) {
+      case "notify":
+        addNotice({ message: frame.message, type: frame.notifyType ?? "info" });
         break;
-      case "cancel":
-        if (request.targetId !== locallyAnsweredDialogRef.current) {
-          setExtensionDialog((current) => current?.id === request.targetId ? null : current);
-        }
-        break;
-      case "open_url": {
-        // OAuth and similar flows: try to open a tab (often blocked outside a
-        // user gesture), and always surface the URL as a notice fallback.
-        // Reject unsafe schemes (javascript:/data:/file:/protocol-relative).
-        const url = request.launchUrl ?? request.url;
-        const safeUrl = isSafeOpenUrl(url) ? url : "";
-        if (safeUrl) {
-          try {
-            window.open(safeUrl, "_blank", "noopener,noreferrer");
-          } catch {
-            // Pop-up blocked — the notice below still carries the URL.
-          }
-        }
-        addNotice({
-          id: request.id,
-          type: "info",
-          message: safeUrl
-            ? (request.instructions ? `${request.instructions}\n${safeUrl}` : translate("agentSession.openInBrowser", { url: safeUrl }))
-            : translate("agentSession.unsafeUrlBlocked"),
-        });
-        break;
-      }
-      case "notify": {
-        addNotice({
-          id: request.id,
-          message: request.message,
-          type: request.notifyType ?? "info",
-        });
-        break;
-      }
       case "setStatus":
         setExtensionStatuses((prev) => {
-          const rest = prev.filter((item) => item.key !== request.statusKey);
-          return request.statusText ? [...rest, { key: request.statusKey, text: request.statusText }] : rest;
+          const rest = prev.filter((item) => item.key !== frame.statusKey);
+          return frame.statusText ? [...rest, { key: frame.statusKey, text: frame.statusText }] : rest;
         });
         break;
       case "setWidget":
         setExtensionWidgets((prev) => {
-          const rest = prev.filter((item) => item.key !== request.widgetKey);
-          return request.widgetLines
+          const rest = prev.filter((item) => item.key !== frame.widgetKey);
+          return frame.widgetLines
             ? [...rest, {
-                key: request.widgetKey,
-                lines: request.widgetLines,
-                placement: request.widgetPlacement ?? "aboveEditor",
+                key: frame.widgetKey,
+                lines: frame.widgetLines,
+                placement: frame.widgetPlacement ?? "aboveEditor",
               }]
             : rest;
         });
         break;
       case "setTitle":
-        if (request.title) document.title = request.title;
+        if (frame.title) document.title = frame.title;
         break;
       case "set_editor_text":
-        opts.chatInputRef?.current?.insertText(request.text);
+        opts.chatInputRef?.current?.insertText(frame.text);
         break;
       case "custom":
         setExtensionCustomUi((current) => {
-          if (request.closed) return current?.id === request.id ? null : current;
-          return request as ExtensionUiCustomRequest;
+          if (frame.closed) return current?.id === frame.id ? null : current;
+          return frame;
         });
         break;
     }
@@ -2261,7 +2268,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (token === null) return;
     try {
       const queueRevision = ++queueSeqRef.current;
-      const skillDiagnosticsRevision = ++skillDiagnosticsSeqRef.current;
       const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
       if (!res.ok) return;
       const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
@@ -2271,7 +2277,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!hookAliveRef.current || sessionIdRef.current !== sid || promptRunIdRef.current !== runId
         || responseRunVersionRef.current !== responseVersion) return;
       const state = data.state;
-      applySkillDiagnosticsSnapshot(skillDiagnosticsRevision, state?.skillDiagnostics);
       if (!promptDispatchPendingRef.current && state?.responseObserved) runHadContentRef.current = true;
       // Manual compaction emits no completion event; native state releases
       // its controls independently of live transcript hydration. No state
@@ -2311,7 +2316,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         void reconcileAgentState(sid);
       }
     }
-  }, [applyNativeCompacting, applyQueueStateSnapshot, applySkillDiagnosticsSnapshot, finishPromptWithoutStream, refreshSubagentRoster]);
+  }, [applyNativeCompacting, applyQueueStateSnapshot, finishPromptWithoutStream, refreshSubagentRoster]);
 
   // Recovery net for missed SSE events: while a prompt or compaction runs, verify
   // against the server periodically and whenever the tab returns to the
@@ -2509,11 +2514,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         });
         break;
       }
-      case "skill_diagnostics_update": {
-        const revision = ++skillDiagnosticsSeqRef.current;
-        applySkillDiagnosticsSnapshot(revision, event.data);
-        break;
-      }
       case "host_status":
         setHostFrame({ sessionId: sessionIdRef.current, status: event.status as HostStatus });
         break;
@@ -2530,6 +2530,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             Array.isArray(event.nativeSettledIds) ? event.nativeSettledIds as string[] : [],
           );
           setServerOutbox(serverOutboxRef.current);
+          const sid = sessionIdRef.current;
+          if (sid) void reconcileConfirmedLocalOutbox(sid, localOutboxRef.current, serverOutboxRef.current.seen)
+            .catch((error) => console.warn(`[omp-web] browser outbox reconciliation failed: ${error instanceof Error ? error.message : String(error)}`));
           // Retire only confirmations the server has listed or settled; an older empty snapshot can overtake an ACK.
           setStoredOutbox((current) => current.filter((entry) => !serverOutboxRef.current.seen.has(entry.id)));
         }
@@ -2660,7 +2663,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           void loadSession(endedSid, false, false, endedRunId);
           const endToken = beginAuthoritativeModelSync();
           const queueRevision = ++queueSeqRef.current;
-          const skillDiagnosticsRevision = ++skillDiagnosticsSeqRef.current;
           fetch(`/api/agent/${encodeURIComponent(endedSid)}`)
             .then((r) => (r.ok ? r.json() as Promise<{ state?: AgentStateResponse }> : null))
             .then((d) => {
@@ -2670,7 +2672,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
               // The queue does not depend on a model: an exited wrapper still
               // means nothing is queued.
               applyQueueStateSnapshot(queueRevision, d.state?.queuedMessages);
-              applySkillDiagnosticsSnapshot(skillDiagnosticsRevision, d.state?.skillDiagnostics);
               if (!d.state?.model) return;
               const applied = applyAuthoritativeModel(toThinkingModelMeta(d.state.model), endToken);
               if (!applied) return; // stale snapshot — drop everything derived from it
@@ -3182,11 +3183,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         break;
       }
-      case "extension_ui_request":
-        handleExtensionUiRequest(event as unknown as IncomingExtensionUiRequest);
+      case "ui_request":
+        openExtensionDialog(event as unknown as UiDialogRequest);
+        break;
+      case "ui_end":
+        if (typeof event.id === "number" || typeof event.id === "string") endExtensionDialog(event.id);
+        break;
+      case "ui":
+        handleExtensionUiFrame(event as unknown as UiPresentationFrame);
         break;
     }
-  }, [addNotice, addUnconfirmedRunErrorNotice, catchUp, eventCoalescer, clearLiveToolResults, clearTerminalReconcileTimer, finishPromptWithoutStream, handleExtensionUiRequest, handleHostToolCall, handleHostUriRequest, loadSession, reloadActiveSessionHistory, mergeSubagents, onAgentEnd, receiveCorrelatedMessage, reconcileAgentState, refreshLiveModelState, refreshSubagentRoster, resetSubagentActivityState, applyAuthoritativeModel, applySkillDiagnosticsSnapshot, beginAuthoritativeModelSync, setCompacting, setLiveToolResult, surfaceQuotaOnStream, updateQueuedMessages, applyQueueStateSnapshot]);
+  }, [addNotice, addUnconfirmedRunErrorNotice, catchUp, eventCoalescer, clearLiveToolResults, clearTerminalReconcileTimer, endExtensionDialog, finishPromptWithoutStream, handleExtensionUiFrame, handleHostToolCall, handleHostUriRequest, loadSession, reloadActiveSessionHistory, mergeSubagents, onAgentEnd, openExtensionDialog, receiveCorrelatedMessage, reconcileAgentState, refreshLiveModelState, refreshSubagentRoster, resetSubagentActivityState, applyAuthoritativeModel, beginAuthoritativeModelSync, setCompacting, setLiveToolResult, surfaceQuotaOnStream, updateQueuedMessages, applyQueueStateSnapshot]);
   handleAgentEventRef.current = handleAgentEvent;
   syncActionsRef.current = {
     metadata: (context, version, hasLive = liveModelMeta !== null || currentModelOverride !== null) => {
@@ -3283,7 +3290,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   /** Holds a message in the outbox (docs/specs/2026-11-04-message-outbox-design.md): true once this browser has
    * stored it, after which omp-web delivers it whatever this tab does next. It shows as a held bubble until omp has it. */
-  const holdMessage = useCallback(async (sid: string, mode: OutboxMode, message: string, images?: AttachedImage[], uploads?: string[], uploadProofs?: Record<string, string>) => {
+  const holdMessage = useCallback(async (sid: string, mode: OutboxMode, message: string, images?: Pick<AttachedImage, "data" | "mimeType">[], uploads?: string[], uploadProofs?: Record<string, string>, replaces?: string) => {
     try {
       await addToOutbox({
         id: newOutboxId(),
@@ -3295,6 +3302,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         ...(images?.length ? { images: images.map(({ data, mimeType }) => ({ type: "image" as const, data, mimeType })) } : {}),
         ...(uploads?.length ? { uploads } : {}),
         ...(uploadProofs ? { uploadProofs } : {}),
+        ...(replaces ? { replaces } : {}),
         createdAt: Date.now(),
       });
     } catch (e) {
@@ -3413,7 +3421,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     // not a request to stop following the response that this prompt starts.
     userScrollIntentUntilRef.current = 0;
 
-    let recoveryKey = sessionIdRef.current ?? (newSessionCwd ? newChatDraftKey(newSessionCwd, newSessionHostId) : undefined);
+    let recoveryKey = sessionIdRef.current ?? (pooled ? `new:pool:${newSessionPoolId}:${newSessionProjectId}` : newSessionCwd ? newChatDraftKey(newSessionCwd, newSessionHostId) : undefined);
     // Set just before the prompt goes out: a lost reply from any earlier command (get_state, set_model) ran no prompt.
     let promptIssued = false;
     try {
@@ -3423,7 +3431,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // so this composer never saw a run). No turn starts then, and the
       // optimistic one must not sit there spinning.
       let queuedBehindShell = false;
-      if (isNew && newSessionCwd) {
+      if (isNew) {
         const selectedModel = newSessionModel;
         const existingSid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
         const sid = existingSid ?? await ensureNewSession();
@@ -3501,8 +3509,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // Every failure here (stream connect, startup, set_model, or the prompt
       // POST itself) leaves no run to show, so roll back the optimistic bubble.
       setOptimisticUserMessage(null);
-      const mayHaveRun = toastStoppedSend(e, promptIssued);
-      if (mayHaveRun === null) {
+      const alreadyReported = e instanceof Error && reportedCreationErrorsRef.current.has(e);
+      const mayHaveRun = alreadyReported ? false : toastStoppedSend(e, promptIssued);
+      if (!alreadyReported && mayHaveRun === null) {
         addNotice({
           type: "error",
           message: e instanceof EventStreamConnectionError
@@ -3524,9 +3533,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       independentRunErrorRef.current = null;
       slashCommandRunRef.current = false;
       dispatch({ type: "end" });
-      return mayHaveRun ? { status: "accepted" } : { status: "rejected", recoveryKey };
+      return mayHaveRun ? { status: "accepted" } : { status: "rejected", recoveryKey: sessionIdRef.current ?? recoveryKey };
     }
-  }, [catchUp, eventCoalescer, isNew, newSessionCwd, newSessionHostId, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, onSessionCreated, waitForPromptSettlement, addNotice, refreshSubagentRoster, clearLiveToolResults, clearTerminalReconcileTimer, snapshotRunEntries, holdMessage]);
+  }, [catchUp, eventCoalescer, isNew, pooled, newSessionPoolId, newSessionProjectId, newSessionCwd, newSessionHostId, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, onSessionCreated, waitForPromptSettlement, addNotice, refreshSubagentRoster, clearLiveToolResults, clearTerminalReconcileTimer, snapshotRunEntries, holdMessage]);
 
   /** Abort the running agent and send the message as a fresh prompt
    * (abort_and_prompt). Only valid mid-run; the old turn's agent_end is
@@ -3640,8 +3649,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch (e) {
       console.error("Failed to execute shell command:", e);
       // A stopped connection may have delivered the command: it toasts and the composer does not offer it again.
-      const mayHaveRun = toastStoppedSend(e);
-      if (mayHaveRun === null) addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
+      const alreadyReported = e instanceof Error && reportedCreationErrorsRef.current.has(e);
+      const mayHaveRun = alreadyReported ? false : toastStoppedSend(e);
+      if (!alreadyReported && mayHaveRun === null) addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
       if (!mayHaveRun) opts.chatInputRef?.current?.insertIfEmpty(inputText);
     } finally {
       bashRunningRef.current = false;
@@ -4026,27 +4036,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice]);
 
-  const setSkillStartupDiagnostics = useCallback(async (enabled: boolean): Promise<SkillDiagnosticsSnapshot> => {
-    if (typeof enabled !== "boolean") throw new Error("Skill startup diagnostics enabled must be a boolean");
-    const sid = sessionIdRef.current;
-    if (!sid) throw new Error("Skill diagnostics require an active session");
-    const revision = ++skillDiagnosticsSeqRef.current;
-    const result = await sendAgentCommand<unknown>(sid, { type: "set_skill_startup_diagnostics", enabled });
-    if (!hookAliveRef.current || sessionIdRef.current !== sid) throw new Error("Skill diagnostics request became stale");
-    const snapshot = parseSkillDiagnosticsSnapshot(result);
-    if (!snapshot) throw new Error("Skill diagnostics are unavailable for this session");
-    // OMP emits its update frame before answering, so a newer frame or snapshot can
-    // already own the view. The setting was still saved: report what is current
-    // instead of failing, and never roll the view back to this older reply.
-    if (revision <= skillDiagnosticsAppliedSeqRef.current) {
-      const current = skillDiagnosticsRef.current;
-      if (!current) throw new Error("Skill diagnostics are unavailable for this session");
-      return current;
-    }
-    publishSkillDiagnostics(revision, snapshot);
-    return snapshot;
-  }, [publishSkillDiagnostics]);
-
   /** Change how steering interrupts the running agent (immediate vs wait). */
   const handleInterruptModeChange = useCallback(async (mode: "immediate" | "wait") => {
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
@@ -4242,7 +4231,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (accepted && ownerCurrent) promoteNewSession();
       return ownerCurrent;
     } catch (error) {
-      toastBtwError(error);
+      if (!(error instanceof Error && reportedCreationErrorsRef.current.has(error))) toastBtwError(error);
       return false;
     } finally {
       btwAskPendingRef.current = false;
@@ -4386,6 +4375,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
       }
     } catch (e) {
+      if (e instanceof Error && reportedCreationErrorsRef.current.has(e)) return { handled: true, error: e.message };
       return complete({ handled: true, error: e instanceof Error ? e.message : String(e) });
     } finally {
       if (ownsCompaction) {
@@ -4407,7 +4397,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const heldMessagesRef = useRef(heldMessages);
   heldMessagesRef.current = heldMessages;
-  const localOutboxRef = useRef(localOutbox);
   localOutboxRef.current = localOutbox;
   const heldDeletionsRef = useRef(new Set<string>());
   /** Delete of a held bubble: one this browser still holds leaves IndexedDB; the server's only until dispatched (omp
@@ -4433,6 +4422,40 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       heldDeletionsRef.current.delete(id);
     }
   }, [addNotice, markOutboxRepresented]);
+
+  const heldRetriesRef = useRef(new Set<string>());
+  /** Retry keeps the failed bubble's exact mode and payload, and records its lineage in IndexedDB. The server
+   * atomically retires a known root; for a browser-only root, acceptance retires only same-session exact-intent
+   * local lineage. A refused copy leaves the root intact, and the IDB transaction makes concurrent retries reuse one copy. */
+  const retryHeldMessage = useCallback(async (id: string) => {
+    const sid = sessionIdRef.current;
+    const held = heldMessagesRef.current.find((entry) => entry.id === id);
+    if (!sid || !held || held.state !== "failed" || editInFlightRef.current || heldRetriesRef.current.has(id) || heldDeletionsRef.current.has(id)) return;
+    if (serverOutboxRef.current.represented.has(id)) return;
+    if (localOutboxRef.current.some((entry) => entry.replaces === id && entry.state === "sending")) return;
+    heldRetriesRef.current.add(id);
+    try {
+      const serverIds = serverOutboxRef.current.seen;
+      const confirmedIds = new Set(localOutboxRef.current
+        .filter((entry) => entry.sessionId === sid && entry.replaces !== undefined && serverIds.has(entry.id))
+        .map((entry) => entry.id));
+      if (serverIds.has(id)) confirmedIds.add(id);
+      if (confirmedIds.size > 0) await reconcileOutbox(sid, [...confirmedIds]);
+
+      if (!hookAliveRef.current || sessionIdRef.current !== sid || editInFlightRef.current || serverOutboxRef.current.represented.has(id)) return;
+      const current = heldMessagesRef.current.find((entry) => entry.id === id);
+      if (!current || current.state !== "failed") return;
+      if (held.local && !localOutboxRef.current.some((entry) => entry.id === id)) return;
+      if (localOutboxRef.current.some((entry) => entry.replaces === id && entry.state === "sending")) return;
+      await holdMessage(sid, current.mode, current.message, current.images, current.uploads, current.uploadProofs, id);
+    } catch (error) {
+      if (hookAliveRef.current && sessionIdRef.current === sid) {
+        addNotice({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      }
+    } finally {
+      heldRetriesRef.current.delete(id);
+    }
+  }, [addNotice, holdMessage]);
 
   const handleAbortCompaction = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -4895,7 +4918,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     data, loading, error, activeLeafId, messages, entryIds, showPreCompactionHistory, streamState,
     agentRunning, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel, fastModeEnabled, fastModeActive, slowModeSupported, slowModeEnabled, slowModeScope, usageLimit, autoRetryEnabled, interruptMode, autoCompactionEnabled, steeringMode, followUpMode,
     liveModelMeta,
-    retryInfo, contextUsage, systemPrompt, skillDiagnostics, forkingEntryId, editingEntryId,
+    retryInfo, contextUsage, systemPrompt, forkingEntryId, editingEntryId,
     isCompacting, compactError, compactResult, tokensPerSecond, currentModel, displayModel, isAutoModelSelection: !displayModel, sessionStats, agentPhase,
     slashCommands, slashCommandsLoading, queuedMessages, hostStatus,
     notices: noticeState.visible, dismissNotice, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
@@ -4907,13 +4930,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     sessionIdRef, messagesEndRef, scrollContainerRef,
     pendingScrollToUserRef, initialScrollDoneRef, holdScrollPosition,
     // Actions
-    handleSend, handleAbort, handleFork, handleEdit, handleModelChange, handleFastModeChange, handleSlowModeChange, handleAutoRetryChange, handleInterruptModeChange, handleAutoCompactionChange, handleSteeringModeChange, handleFollowUpModeChange, handleCycleModel, handleCycleThinkingLevel, handleAbortRetry, handleInterruptAndReply, setSkillStartupDiagnostics,
+    handleSend, handleAbort, handleFork, handleEdit, handleModelChange, handleFastModeChange, handleSlowModeChange, handleAutoRetryChange, handleInterruptModeChange, handleAutoCompactionChange, handleSteeringModeChange, handleFollowUpModeChange, handleCycleModel, handleCycleThinkingLevel, handleAbortRetry, handleInterruptAndReply,
     retrySession: () => { const sid = sessionIdRef.current; if (sid) void loadSession(sid, true, true); },
     handleCompact, handleHandoff, handleSteer, handleFollowUp, handleAbortCompaction,
-    heldMessages, deleteHeldMessage,
+    heldMessages, deleteHeldMessage, retryHeldMessage,
     handleBuiltinSlashCommand, togglePreCompactionHistory,
     handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, removeQueuedMessage, promoteQueuedToSteer, setActiveLeafId, setData, setMessages,
     dispatch, setAgentRunning, setForkingEntryId,
+    resolveUploadHost,
     btw, askBtw,
     bashRunning, pendingBash, deferredBash,
     // True while a run this UI does not own looks active from the transcript

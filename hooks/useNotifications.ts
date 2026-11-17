@@ -40,7 +40,7 @@ export function useNotificationPrefs() {
  * `sessionId` is the session whose chat is on screen (null while Settings or
  * another view covers it).
  */
-export function useNotifications({ sessionId, locale, onOpenSession }: { sessionId: string | null; locale: string; onOpenSession: (sessionId: string) => void }) {
+export function useNotifications({ sessionId, locale, onOpenSession }: { sessionId: string | null; locale: string; onOpenSession: (sessionId: string, hostId?: string) => void }) {
   const openRef = useRef(onOpenSession);
   useEffect(() => {
     openRef.current = onOpenSession;
@@ -141,7 +141,11 @@ export function useNotifications({ sessionId, locale, onOpenSession }: { session
       });
     };
     const onOpen = (raw: Event) => {
-      if (raw instanceof CustomEvent && typeof raw.detail === "string" && raw.detail) openRef.current(raw.detail);
+      if (!(raw instanceof CustomEvent)) return;
+      if (typeof raw.detail === "string" && raw.detail) openRef.current(raw.detail);
+      else if (isRecord(raw.detail) && typeof raw.detail.sessionId === "string") {
+        openRef.current(raw.detail.sessionId, typeof raw.detail.hostId === "string" ? raw.detail.hostId : undefined);
+      }
     };
     const onWorkerMessage = (message: MessageEvent) => {
       const data: unknown = message.data;

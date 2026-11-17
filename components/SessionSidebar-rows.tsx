@@ -3,7 +3,7 @@
 import { memo, useCallback, useId, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { AgentMessage, ExitedRpcSession, ManagedProject, ProjectLaunchConfig, SessionInfo } from "@/lib/types";
 import { formatExitedSessionNotice, useI18n } from "@/lib/i18n";
-import { ChevronDown, ChevronRight, Folder, GitBranch, MoreHorizontal, Pencil, Pin, Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder, GitBranch, MessageCircleQuestion, MoreHorizontal, Pencil, Pin, Plus } from "lucide-react";
 import { Tooltip } from "./ui/primitives";
 import { ConfirmDialog } from "./ui/field";
 import { copyText } from "@/lib/clipboard";
@@ -46,7 +46,7 @@ function HostGroup({ name, color, statusText, unavailableReason, collapsed, onTo
   unavailableReason: string | null;
   collapsed: boolean;
   onToggle: () => void;
-  onAdd: () => void;
+  onAdd?: () => void;
   /** Shown instead of the list when the host has no workspaces. */
   empty: string | null;
   children: ReactNode;
@@ -72,9 +72,9 @@ function HostGroup({ name, color, statusText, unavailableReason, collapsed, onTo
           <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase" }}>{name}</span>
           {statusText && <span style={{ flexShrink: 0, fontSize: 10.5, color: "var(--text-dim)", textTransform: "none", letterSpacing: 0 }}>{statusText}</span>}
         </button>
-        <SidebarIconButton label={t("hosts.addWorkspaceOn", { host: name })} onClick={onAdd} disabled={unavailableReason !== null}>
+        {onAdd && <SidebarIconButton label={t("hosts.addWorkspaceOn", { host: name })} onClick={onAdd} disabled={unavailableReason !== null}>
           <Plus size={14} strokeWidth={1.9} aria-hidden="true" />
-        </SidebarIconButton>
+        </SidebarIconButton>}
       </div>
       {!collapsed && (
         <div
@@ -101,6 +101,7 @@ interface ProjectRowProps {
   hiddenCount: number;
   selectedSessionId: string | null;
   runningSessionIds: Set<string>;
+  awaitingInputIds: Set<string>;
   unreadSessionIds: Set<string>;
   recentlyCompletedIds?: Set<string>;
   exitedSessions: Map<string, ExitedRpcSession>;
@@ -124,6 +125,8 @@ interface ProjectRowProps {
   /** The active search query; each session row can then list its hits. */
   searchQuery?: string;
   onOpenSearchMatch?: (session: SessionInfo, target: SearchMatchTarget) => void;
+  /** A pinned project of a cluster member: its node's name, status text and, while its link is down, why it cannot be used. */
+  node?: { label: string; statusText?: string | null; unavailableReason?: string | null };
 }
 
 /** One project in the sidebar: a card row matching the session items' visual
@@ -138,6 +141,7 @@ function ProjectRow({
   hiddenCount,
   selectedSessionId,
   runningSessionIds,
+  awaitingInputIds,
   unreadSessionIds,
   recentlyCompletedIds,
   exitedSessions,
@@ -159,8 +163,11 @@ function ProjectRow({
   onSessionDeleted,
   searchQuery,
   onOpenSearchMatch,
+  node,
 }: ProjectRowProps) {
   const { t } = useI18n();
+  // The title is invisible to keyboards and screen readers: say the reason in text too.
+  const reasonId = useId();
   const [hovered, setHovered] = useState(false);
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
@@ -189,7 +196,7 @@ function ProjectRow({
     // The sidebar already reports failed presentation writes in a toast.
     void onUpdatePresentation(project, { alias }).catch(() => {});
   }, [aliasValue, project, onUpdatePresentation]);
-  const label = project.alias ?? projectLabel(project.path);
+  const label = project.alias ?? project.name ?? projectLabel(project.path);
   const pinned = pinnable && project.pinOrder !== undefined;
   const canReorder = !pinnable || pinned;
   const hasActivity = Boolean(activity && (activity.running > 0 || activity.unread > 0 || activity.exited > 0));
@@ -198,7 +205,8 @@ function ProjectRow({
     : tree;
 
   return (
-    <section className="sidebar-project" data-active={isActive ? "true" : "false"} style={{ marginBottom: 12 }}>
+    <section className="sidebar-project" data-active={isActive ? "true" : "false"} style={{ marginBottom: 12, opacity: node?.unavailableReason ? 0.55 : 1 }}>
+      {node?.unavailableReason && <span id={reasonId} className="sr-only">{node.unavailableReason}</span>}
       <ConfirmDialog
         open={confirmRemove}
         onOpenChange={setConfirmRemove}
@@ -291,7 +299,7 @@ function ProjectRow({
               content={(
                 <span style={{ display: "grid", gap: 3, maxWidth: 360, whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--font-mono)", fontSize: 11 }}>
                   <strong style={{ fontFamily: "inherit", fontSize: 11 }}>{t("sessionSidebar.launchConfigDirectory")}</strong>
-                  <span>{project.path}</span>
+                  <span>{project.poolId ? project.origin : project.path}</span>
                   {project.launchConfig?.profile && <span>profile: {project.launchConfig.profile}</span>}
                   {project.launchConfig?.advisor && <span>--advisor</span>}
                   {project.launchConfig?.extraArgs?.map((arg, index) => <span key={`${arg}-${index}`}>{arg}</span>)}
@@ -303,7 +311,8 @@ function ProjectRow({
               className="sidebar-project-identity"
               onClick={() => onActivate(project)}
               aria-current={isActive ? "true" : undefined}
-              title={project.path}
+              title={node?.unavailableReason ? `${project.poolId ? project.origin : project.path}\n${node.unavailableReason}` : project.poolId ? project.origin : project.path}
+              aria-describedby={node?.unavailableReason ? reasonId : undefined}
               style={{
                 flex: "0 1 auto",
                 minWidth: 0,
@@ -339,6 +348,18 @@ function ProjectRow({
               >
                 {label}
               </span>
+              {node && (
+                <>
+                  <span className="sr-only">{t("hosts.onNode", { node: node.label })}</span>
+                  <span
+                    aria-hidden="true"
+                    title={t("hosts.onNode", { node: node.label })}
+                    style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10.5, color: "var(--text-dim)" }}
+                  >
+                    {node.statusText ? `${node.label} · ${node.statusText}` : node.label}
+                  </span>
+                </>
+              )}
             </button>
             </Tooltip>
           )}
@@ -430,7 +451,7 @@ function ProjectRow({
           onClick={() => onToggleExpand(project)}
           aria-label={isExpanded ? t("projects.collapseProject", { name: label }) : t("projects.expandProject", { name: label })}
           aria-expanded={isExpanded}
-          title={isExpanded ? t("projects.collapseProjectTitle", { path: project.path }) : t("projects.expandProjectTitle", { path: project.path })}
+          title={isExpanded ? t("projects.collapseProjectTitle", { path: project.poolId ? label : project.path }) : t("projects.expandProjectTitle", { path: project.poolId ? label : project.path })}
           style={{
             display: "flex", alignItems: "center", justifyContent: "center",
             width: 22, height: 26, padding: 0, flexShrink: 0,
@@ -463,6 +484,7 @@ function ProjectRow({
                   node={node}
                   selectedSessionId={selectedSessionId}
                   runningSessionIds={runningSessionIds}
+                  awaitingInputIds={awaitingInputIds}
                   unreadSessionIds={unreadSessionIds}
                   exitedSessions={exitedSessions}
                   recentlyCompletedIds={recentlyCompletedIds}
@@ -516,6 +538,7 @@ const SessionTreeItem = memo(function SessionTreeItem({
   node,
   selectedSessionId,
   runningSessionIds,
+  awaitingInputIds,
   unreadSessionIds,
   exitedSessions,
   recentlyCompletedIds,
@@ -530,6 +553,7 @@ const SessionTreeItem = memo(function SessionTreeItem({
   node: SessionTreeNode;
   selectedSessionId: string | null;
   runningSessionIds: Set<string>;
+  awaitingInputIds: Set<string>;
   unreadSessionIds: Set<string>;
   exitedSessions: Map<string, ExitedRpcSession>;
   recentlyCompletedIds?: Set<string>;
@@ -551,6 +575,7 @@ const SessionTreeItem = memo(function SessionTreeItem({
   // check then never re-renders unless this row's flags actually changed.
   const isSelected = sessionId === selectedSessionId;
   const isRunning = runningSessionIds.has(sessionId);
+  const isAwaitingInput = awaitingInputIds.has(sessionId);
   const isUnread = unreadSessionIds.has(sessionId);
   const isRecentlyCompleted = !isRunning && (recentlyCompletedIds?.has(sessionId) ?? false);
   const exited = exitedSessions.get(sessionId);
@@ -591,6 +616,7 @@ const SessionTreeItem = memo(function SessionTreeItem({
           session={node.session}
           isSelected={isSelected}
           isRunning={isRunning}
+          isAwaitingInput={isAwaitingInput}
           isUnread={isUnread}
           exited={exited}
           isRecentlyCompleted={isRecentlyCompleted}
@@ -617,6 +643,7 @@ const SessionTreeItem = memo(function SessionTreeItem({
               node={child}
               selectedSessionId={selectedSessionId}
               runningSessionIds={runningSessionIds}
+              awaitingInputIds={awaitingInputIds}
               unreadSessionIds={unreadSessionIds}
               exitedSessions={exitedSessions}
               recentlyCompletedIds={recentlyCompletedIds}
@@ -645,6 +672,10 @@ const SessionTreeItem = memo(function SessionTreeItem({
     const id = prev.node.session.id;
     if (prev.runningSessionIds.has(id) !== next.runningSessionIds.has(id)) return false;
   }
+  if (prev.awaitingInputIds !== next.awaitingInputIds) {
+    const id = prev.node.session.id;
+    if (prev.awaitingInputIds.has(id) !== next.awaitingInputIds.has(id)) return false;
+  }
   if (prev.recentlyCompletedIds !== next.recentlyCompletedIds) {
     const id = prev.node.session.id;
     if ((prev.recentlyCompletedIds?.has(id) ?? false) !== (next.recentlyCompletedIds?.has(id) ?? false)) return false;
@@ -666,6 +697,7 @@ const SessionItem = memo(function SessionItem({
   session,
   isSelected,
   isRunning,
+  isAwaitingInput,
   isUnread,
   exited,
   isRecentlyCompleted,
@@ -683,6 +715,7 @@ const SessionItem = memo(function SessionItem({
   session: SessionInfo;
   isSelected: boolean;
   isRunning?: boolean;
+  isAwaitingInput?: boolean;
   isUnread?: boolean;
   exited?: ExitedRpcSession;
   isRecentlyCompleted?: boolean;
@@ -706,6 +739,7 @@ const SessionItem = memo(function SessionItem({
   const renameCancelRef = useRef(false);
  const [confirmDelete, setConfirmDelete] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
+  const [menuPoint, setMenuPoint] = useState<{ x: number; y: number } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const contentButtonRef = useRef<HTMLButtonElement>(null);
@@ -801,10 +835,24 @@ const SessionItem = memo(function SessionItem({
     <>
     <div
       className="session-item-row"
+      onContextMenu={(event) => {
+        if (renaming || confirmDelete || deleting) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setMenuPoint({ x: event.clientX, y: event.clientY });
+        setActionMenuOpen(true);
+      }}
  onClick={confirmDelete || renaming ? undefined : onClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onKeyDown={(event) => {
+        if (!renaming && !confirmDelete && !deleting
+          && (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))) {
+          event.preventDefault();
+          event.stopPropagation();
+          setMenuPoint(null);
+          setActionMenuOpen(true);
+        }
         if ((confirmDelete || actionMenuOpen) && event.key === "Escape") {
           event.stopPropagation();
           closeConfirmation();
@@ -863,6 +911,11 @@ const SessionItem = memo(function SessionItem({
             <span title={title} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5, fontWeight: isSelected ? 600 : 500, lineHeight: 1.35, letterSpacing: "-0.005em" }}>
               {title}
             </span>
+            {isAwaitingInput && (
+              <span role="img" title={t("sessionSidebar.awaitingInput")} aria-label={t("sessionSidebar.awaitingInput")} style={{ display: "inline-flex", flexShrink: 0, marginLeft: 5, color: "var(--accent)" }}>
+                <MessageCircleQuestion size={11} strokeWidth={2.2} aria-hidden="true" />
+              </span>
+            )}
             {hasUnsentDraft && (
               <span role="img" title={t("sessionSidebar.unsentDraft")} aria-label={t("sessionSidebar.unsentDraft")} style={{ display: "inline-flex", flexShrink: 0, marginLeft: 5, color: "var(--accent)" }}>
                 <Pencil size={11} strokeWidth={2.2} aria-hidden="true" />
@@ -888,14 +941,14 @@ const SessionItem = memo(function SessionItem({
                 {relativeTime && <span className="session-item-time" title={new Date(session.modified).toLocaleString(locale)} style={{ flexShrink: 0, whiteSpace: "nowrap", textAlign: "right", color: isSelected ? "var(--accent)" : "var(--text-dim)", fontSize: 10, fontVariantNumeric: "tabular-nums" }}>{relativeTime}</span>}
               </div>
               <div className="session-item-actions" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
-                <button type="button" ref={menuButtonRef} className="session-item-icon-button session-item-menu-button" onClick={(event) => { event.stopPropagation(); setActionMenuOpen((open) => !open); }} title={t("projects.actions")} aria-label={t("projects.actions")} aria-expanded={actionMenuOpen} style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 0, border: "none", borderRadius: "var(--radius-control)", background: actionMenuOpen ? "var(--bg-selected)" : "transparent", color: actionMenuOpen ? "var(--text)" : "var(--text-dim)", cursor: "pointer" }}>
+                <button type="button" ref={menuButtonRef} className="session-item-icon-button session-item-menu-button" onClick={(event) => { event.stopPropagation(); setMenuPoint(null); setActionMenuOpen((open) => !open); }} title={t("projects.actions")} aria-label={t("projects.actions")} aria-expanded={actionMenuOpen} style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 0, border: "none", borderRadius: "var(--radius-control)", background: actionMenuOpen ? "var(--bg-selected)" : "transparent", color: actionMenuOpen ? "var(--text)" : "var(--text-dim)", cursor: "pointer" }}>
                   <MoreHorizontal size={14} strokeWidth={2} aria-hidden="true" />
                 </button>
-                <SidebarPortalMenu anchor={menuButtonRef} open={actionMenuOpen} onClose={() => setActionMenuOpen(false)} placement="below" minWidth={128}>
- <button type="button" role="menuitem" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleArchive(); }} disabled={archiveBlocked} title={archiveTitle} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: archiveBlocked ? "var(--text-dim)" : "var(--text-muted)", cursor: archiveBlocked ? "not-allowed" : "pointer", textAlign: "left", fontSize: 11, opacity: archiveBlocked ? 0.55 : 1 }}>{t("sessionSidebar.archive")}</button>
-                  <button type="button" role="menuitem" className="sidebar-menu-item" onClick={(event) => { startRename(event); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>{t("sessionSidebar.rename")}</button>
-                  <button type="button" role="menuitem" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleCopyTranscript(); }} disabled={copyingTranscript} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: copyingTranscript ? "default" : "pointer", textAlign: "left", fontSize: 11, opacity: copyingTranscript ? 0.55 : 1 }}>{t("sessionSidebar.copyTranscript")}</button>
-                  <button type="button" role="menuitem" className="sidebar-menu-item" disabled={deleting} onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); setConfirmDelete(true); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>{t("sessionSidebar.delete")}</button>
+                <SidebarPortalMenu anchor={menuButtonRef} open={actionMenuOpen} onClose={() => setActionMenuOpen(false)} placement="below" point={menuPoint} minWidth={150}>
+ <button type="button" role="menuitem" data-menu-shortcut="a" aria-keyshortcuts="A" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleArchive(); }} disabled={archiveBlocked} title={archiveTitle} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: archiveBlocked ? "var(--text-dim)" : "var(--text-muted)", cursor: archiveBlocked ? "not-allowed" : "pointer", textAlign: "left", fontSize: 11, opacity: archiveBlocked ? 0.55 : 1 }}><span>{t("sessionSidebar.archive")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>A</kbd></button>
+                  <button type="button" role="menuitem" data-menu-shortcut="r" aria-keyshortcuts="R" className="sidebar-menu-item" onClick={(event) => { startRename(event); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11 }}><span>{t("sessionSidebar.rename")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>R</kbd></button>
+                  <button type="button" role="menuitem" data-menu-shortcut="c" aria-keyshortcuts="C" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleCopyTranscript(); }} disabled={copyingTranscript} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: copyingTranscript ? "default" : "pointer", textAlign: "left", fontSize: 11, opacity: copyingTranscript ? 0.55 : 1 }}><span>{t("sessionSidebar.copyTranscript")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>C</kbd></button>
+                  <button type="button" role="menuitem" data-menu-shortcut="d" aria-keyshortcuts="D" className="sidebar-menu-item" disabled={deleting} onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); setConfirmDelete(true); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: "pointer", textAlign: "left", fontSize: 11 }}><span>{t("sessionSidebar.delete")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>D</kbd></button>
                 </SidebarPortalMenu>
               </div>
             </div>

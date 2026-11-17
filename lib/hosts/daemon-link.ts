@@ -18,6 +18,7 @@ interface Queued {
   /** Child output bytes this ack releases from its channel's buffer (on a message's last part). */
   bytes: number;
   output: boolean;
+  reliable: boolean;
   /** Bytes this ack takes out of `unackedBytes`: the line's own, plus on a `res` the result bytes sent ahead of it. */
   unacked: number;
   /** Its link sample, set on the line that completes a message (a whole line, or its last part), with `t`, its queue
@@ -30,7 +31,7 @@ interface Queued {
 type UpSample = { at: number; t: number; blob: number; bytesAhead: number; session: string | null };
 
 /** `counted`: child output, held against its channel's buffer until acked. */
-type Pending = Extract<SendItem, { line: string }> & { counted: boolean; sample: UpSample | null } | Extract<SendItem, { blob: Uint8Array }>;
+type Pending = Extract<SendItem, { line: string }> & { counted: boolean; sample: UpSample | null; reliable: boolean } | Extract<SendItem, { blob: Uint8Array }>;
 
 /** How a socket closed; `opened` is false for a dial the server refused or never answered. A string instead: why
  * the daemon gave the socket up itself. */
@@ -53,6 +54,8 @@ export function dialable(url: string, allowHttp: boolean): boolean {
 }
 export type LinkDeps = {
   allowHttp: boolean; primary: boolean;
+  /** Maintenance has its own lifecycle, so an application mismatch must not end this host. */
+  keepOnVersionMismatch?: boolean;
   hello(link: DaemonLink, replay: boolean): string;
   handleDown(link: DaemonLink, message: DownMessage | UnknownMessage): void;
   onEnd(link: DaemonLink, reason: "revoked" | "replaced" | "version"): void;
@@ -73,6 +76,10 @@ export class DaemonLink {
   stop(): Promise<void> { return this.runtime.stop(); }
   rekey(token: string): void { this.runtime.rekey(token); }
   isUp(): boolean { return this.runtime.isUp(); }
+  busy(): boolean { return this.runtime.busy(); }
+  /** An unsequenced report (`capacity`, `config_state`): sent now on an up link with room, never replayed. A
+   * `capacity` without room is dropped; the latest `config_state` without room goes at the next flush. */
+  report(message: Extract<UpMessage, { type: "capacity" | "config_state" }>): void { this.runtime.report(message); }
   queue(body: Unsequenced<UpMessage>, key: string, options?: { counted?: boolean; session?: string | null; blob?: number; ahead?: number }): number | null { return this.runtime.queue(body, key, options); }
   output(body: Unsequenced<Extract<UpMessage, { type: "stdout" | "stderr" }>>, session: string | null): void { this.runtime.output(body.ch, body, session); }
   discard(ch: string): void { this.runtime.discard(ch); }
@@ -84,10 +91,11 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
   const linkUrl = serverUrl + "/api/hosts/link";
   let authorization = "Bearer " + owner.login.token;
   const log = deps.log;
+  let mismatched = false;
   const channels = new Map<string, { buffered: number }>();
   // Uplink messages wait in `sender` until they go out, then here until main acks them; a dropped socket resends
   // them after the next welcome.
-  const sender = new LinkSender<Pending>(true);
+  const sender = new LinkSender<Pending>();
   const outbox = new Outbox<Queued>();
   const down = new SeqWindow();
   /** The downlink line main is sending in parts. */
@@ -126,6 +134,30 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
   /** Link samples of acked messages, waiting for their `stats` message. */
   const samples: LinkStatSample[] = [];
   let statsTimer: NodeJS.Timeout | undefined;
+  let reliablePending = 0;
+  /** The latest `config_state` that found no room: the next flush sends it, so ownership is never left stale. */
+  let pendingConfig: Extract<UpMessage, { type: "config_state" }> | null = null;
+
+  function report(message: Extract<UpMessage, { type: "capacity" | "config_state" }>): void {
+    if (message.type === "config_state") pendingConfig = message;
+    if (!sendReport(message)) {
+      // Room comes back on main's next ack (a full window) or the flush timer's poll (a full socket buffer).
+      if (message.type === "config_state" && linked && !stopped) flushTimer ??= setTimeout(flush, LINK_LIMITS.flushMs);
+      return;
+    }
+    if (message.type === "config_state") pendingConfig = null;
+  }
+  /** Sends `message` on an up link with room; false when it did not go. */
+  function sendReport(message: Extract<UpMessage, { type: "capacity" | "config_state" }>): boolean {
+    const ws = linked;
+    if (stopped || !ws || ws.readyState !== 1 || ws.bufferedAmount >= SEND_BUFFER_BYTES || inFlightBytes >= LINK_LIMITS.unackedBytes) return false;
+    const data = encodeLine({ type: "ack", ack: down.acked }) + encodeLine(message);
+    const bytes = Buffer.byteLength(data);
+    if (inFlightBytes + bytes > LINK_LIMITS.unackedBytes) return false;
+    ws.send(data); inFlight.push(bytes); inFlightBytes += bytes;
+    ackOwed = false; appliedSince = 0;
+    return true;
+  }
 
   /** Queue an uplink message under `key` (its channel, the request id of a `res`, or "stats"); its byte size, or null
    * when it exceeds the line limit. `counted`: child output, held against its channel's buffer. `session`, `blob` (the
@@ -147,7 +179,9 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
     // Ahead of it: what is unacked and what is queued to go (counters, no scan; a queued line counts at its size before
     // its seq is filled in). A `stats` message is not measured itself: its sample would need another one.
     const sample = body.type === "stats" ? null : { at: Date.now(), t: performance.now(), blob, bytesAhead: Math.max(0, ahead ?? unackedBytes + sender.queuedBytes), session };
-    sender.push(key, { line, size, counted, sample });
+    const reliable = ["res", "upload_ack", "exit", "resync"].includes(body.type);
+    if (reliable) reliablePending++;
+    sender.push(key, { line, size, counted, sample, reliable });
     unsentBytes += size;
     scheduleFlush();
     return size;
@@ -191,6 +225,7 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
       const channel = channels.get(item.key);
       if (channel) channel.buffered -= item.bytes;
       unackedBytes -= item.unacked;
+      if (item.reliable) reliablePending--;
       // One sample per message: a split one carries it on its last part, acked with the whole message.
       if (item.sample) {
         const { t, ...sample } = item.sample;
@@ -245,7 +280,7 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
     const sample = unit.done && item.sample
       ? { session: item.sample.session, bytes: unit.messageBytes + item.sample.blob, bytesAhead: item.sample.bytesAhead, at: item.sample.at, t: item.sample.t }
       : null;
-    outbox.push({ seq: unit.seq, line: unit.line, key: unit.key, bytes, output: item.counted, unacked: size + sentBlob, sample });
+    outbox.push({ seq: unit.seq, line: unit.line, key: unit.key, bytes, output: item.counted, reliable: unit.done && item.reliable, unacked: size + sentBlob, sample });
     unackedBytes += size;
     return unit.line;
   }
@@ -260,6 +295,7 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
     unsentBytes = 0;
     const ws = linked;
     if (!ws || stopped) return;
+    if (pendingConfig && sendReport(pendingConfig)) pendingConfig = null;
     let text = "";
     let textBytes = 0;
     const send = (data: string | Uint8Array, bytes: number) => {
@@ -305,7 +341,7 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
       case "welcome":
         if (message.v < MIN_LINK_PROTOCOL_VERSION || message.v > owner.version) throw new LinkProtocolError("Invalid welcome protocol version");
         owner.version = message.v;
-        sender.parts = owner.version >= 5;
+        mismatched = false;
         log("linked to " + serverUrl);
         acknowledgeHostUpdateHealth(); unknownLog.reset(); linked = socket; redialDelay = FIRST_RETRY_MS;
         resend = outbox.pending(); resendAt = 0; sender.dropBlobs();
@@ -422,21 +458,25 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
         if (stopped) return;
         const closed = await connect(sent, hello);
         if (stopped) return;
+        if (sent !== authorization) continue;
         if (typeof closed !== "string" && closed.code === LINK_CLOSE.versionMismatch) {
           let newest: unknown; try { newest = JSON.parse(closed.reason)?.serverVersion; } catch {}
           if (typeof newest === "number" && Number.isInteger(newest) && newest >= MIN_LINK_PROTOCOL_VERSION && newest < owner.version) {
-            owner.version = newest; sender.parts = newest >= 5; continue;
+            owner.version = newest; continue;
           }
           log(typeof newest === "number" && newest < LINK_PROTOCOL_VERSION
             ? "this host's ompweb is newer than the server's: update ompweb on the server"
             : "the server speaks a different link protocol: update ompweb on this host");
-          endLink("version"); return;
+          if (!deps.keepOnVersionMismatch) { endLink("version"); return; }
+          // Rejected application replies cannot be delivered, but remain queued if compatibility returns.
+          mismatched = true;
         }
         if (typeof closed !== "string" && closed.code === LINK_CLOSE.replaced) { log("another ompweb host linked with this token; exiting this link"); endLink("replaced"); return; }
         if (typeof closed !== "string" && closed.code === 1000) { endLink("revoked"); return; }
         if (typeof closed !== "string" && !closed.opened) {
           const { status, body } = await fetch(linkUrl, { headers: { authorization: sent }, signal: AbortSignal.any([stopSignal.signal, AbortSignal.timeout(LINK_LIMITS.offlineMs)]) });
           void body?.cancel().catch(() => {});
+          if (sent !== authorization) continue;
           if (status === 401) { if (deps.reload?.(owner, true)) continue; endLink("revoked"); return; }
           log(status === 503 ? "the server is unavailable (503); redialing" : "the server did not accept the WebSocket upgrade (HTTP " + status + "): check that a reverse proxy forwards Upgrade and Connection, and that the server runs an ompweb at least as new as this host's");
         } else log(typeof closed === "string" ? "link lost (" + closed + "); redialing" : "link lost (code " + closed.code + "); redialing");
@@ -453,7 +493,7 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
     stopped = true; stopSignal.abort(); socket?.close(); clearTimeout(flushTimer); clearTimeout(statsTimer);
     await loop;
   }
-  return { queue, output, discard, result, ackedDown: () => down.acked, isUp: () => linked !== null && !stopped,
+  return { queue, output, discard, result, report, busy: () => !mismatched && reliablePending > 0, ackedDown: () => down.acked, isUp: () => linked !== null && !stopped,
     rekey: (token: string) => { owner.login.token = token; authorization = "Bearer " + token; socket?.close(1001, "credentials changed"); },
     start: () => { if (!started && !stopped) { started = true; loop = keepLinked(); } }, stop };
 }

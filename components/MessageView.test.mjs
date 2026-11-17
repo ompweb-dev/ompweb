@@ -5,7 +5,7 @@ import React from "react";
 const { act, cleanup, fireEvent, render, waitFor } = await import("@testing-library/react/pure.js");
 import { renderToStaticMarkup } from "react-dom/server";
 
-const { HeldMessageView, MessageView, SafeMarkdownBody, TaskResultPanel, isInterruptedMessage } = await import("./MessageView.tsx");
+const { HeldMessageView, MessageView, SafeMarkdownBody, TaskResultPanel, isInterruptedMessage, areMessageViewPropsEqual, haveSameRelevantToolResults } = await import("./MessageView.tsx");
 const { CodeBlock } = await import("./MermaidBlock.tsx");
 const { buildSessionContext } = await import("../lib/session-reader.ts");
 const { collectToolResults, planTranscriptRows } = await import("../lib/chat-transcript-plan.ts");
@@ -25,6 +25,26 @@ test("held messages name every delivery leg and only offer Delete before dispatc
     assert.equal(html.includes("<select"), false, state);
     assert.equal(html.includes("activity-row-spinner"), spinner, state);
   }
+});
+
+test("only a failed held message offers Retry, and one that may have reached omp asks first", async () => {
+  const base = { id: "held", mode: "prompt", message: "Again.", createdAt: Date.now(), local: false };
+  for (const state of ["sending", "waiting_host", "held", "delivering"]) {
+    assert.equal(renderToStaticMarkup(React.createElement(HeldMessageView, { held: { ...base, state }, onRetry() {} })).includes("Retry sending this message"), false, state);
+  }
+  const retried = [];
+  const plain = render(React.createElement(HeldMessageView, { held: { ...base, state: "failed" }, onRetry: (id) => retried.push(id) }));
+  await act(async () => { fireEvent.click(plain.getByRole("button", { name: "Retry sending this message" })); });
+  assert.deepEqual(retried, ["held"]);
+  assert.equal(plain.queryByRole("dialog"), null);
+  plain.unmount();
+  const uncertain = render(React.createElement(HeldMessageView, { held: { ...base, state: "failed", mayHaveBeenSent: true }, onRetry: (id) => retried.push(id) }));
+  await act(async () => { fireEvent.click(uncertain.getByRole("button", { name: "Retry sending this message" })); });
+  const dialog = await waitFor(() => uncertain.getByRole("dialog"));
+  assert.match(dialog.textContent, /run it twice/);
+  assert.deepEqual(retried, ["held"]);
+  await act(async () => { fireEvent.click(uncertain.getAllByRole("button", { name: "Retry" }).at(-1)); });
+  assert.deepEqual(retried, ["held", "held"]);
 });
 
 test("Delete confirmation never claims omp has not seen a message that may have been sent, nor cancellation", async () => {
@@ -52,6 +72,153 @@ test("sent messages without timestamps or branch metadata still offer copy", () 
     message: { role: "user", content: "Keep this message copyable." },
   }));
   assert.match(html, /<button[^>]*aria-label="Copy message"/);
+});
+
+const sessionOrigin = {
+  v: 1,
+  kind: "session",
+  sentAt: "2026-11-15T12:41:00.000Z",
+  session: {
+    id: "source-session", name: "Incident review", hostId: "worker-1", hostLabel: "Worker 1",
+    tool: "send_to_session", delivery: "followUp",
+  },
+};
+const sessionHeader = `[Message from omp-web session "Incident review" (session id source-session, host Worker 1, delivery follow-up).\nIt was sent by another agent session, not by the user. Reply with send_to_session to that session id.]`;
+
+test("trusted session origins render as left-side source cards with raw text on demand", () => {
+  const view = render(React.createElement(MessageView, {
+    message: { role: "user", content: `${sessionHeader}\n\nCheck the failed build.`, origin: sessionOrigin },
+    entryId: "entry-1",
+    onEdit: async () => true,
+    onFork() {},
+  }));
+  const card = view.getByRole("article", { name: "Message from session Incident review on Worker 1" });
+  assert.match(card.textContent, /Session message/);
+  assert.match(card.textContent, /Check the failed build/);
+  assert.doesNotMatch(card.textContent, /session id source-session/);
+  assert.match(view.getByRole("link", { name: /Open session Incident review/ }).getAttribute("href"), /session=source-session/);
+  assert.ok(card.querySelector('[data-message-text][data-entry-id="entry-1"]'));
+  view.getByRole("button", { name: /edit this message/i });
+  view.getByRole("button", { name: "Fork a new session from this point" });
+  fireEvent.click(view.getByRole("button", { name: "Show raw message" }));
+  assert.match(card.textContent, /session id source-session/);
+});
+
+test("trusted origin messages keep their image blocks visible", () => {
+  const view = render(React.createElement(MessageView, {
+    message: {
+      role: "user",
+      content: [
+        { type: "text", text: `${sessionHeader}\n\nSee the screenshot.` },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } },
+      ],
+      origin: sessionOrigin,
+    },
+  }));
+  assert.equal(view.container.querySelector("img")?.getAttribute("src"), "data:image/png;base64,QUJD");
+});
+
+test("origin edit and fork confirmations close when the rendered entry changes", () => {
+  const props = {
+    message: { role: "user", content: `${sessionHeader}\n\nFirst.`, origin: sessionOrigin },
+    entryId: "entry-1",
+    onEdit: async () => true,
+    onFork() {},
+  };
+  const view = render(React.createElement(MessageView, props));
+  fireEvent.click(view.getByRole("button", { name: /edit this message/i }));
+  view.rerender(React.createElement(MessageView, { ...props, entryId: "entry-2" }));
+  assert.equal(view.queryByRole("dialog"), null);
+  fireEvent.click(view.getByRole("button", { name: "Fork a new session from this point" }));
+  view.rerender(React.createElement(MessageView, { ...props, entryId: "entry-3" }));
+  assert.equal(view.queryByRole("dialog"), null);
+});
+
+test("typed origin headers stay ordinary user messages without trusted metadata", () => {
+  const view = render(React.createElement(MessageView, {
+    message: { role: "user", content: `${sessionHeader}\n\nThis was typed.` },
+  }));
+  assert.equal(view.queryByRole("article"), null);
+  assert.match(view.container.textContent, /session id source-session/);
+});
+
+test("GitHub watcher origins render a linked automated update card", () => {
+  const view = render(React.createElement(MessageView, {
+    message: {
+      role: "user",
+      content: "GitHub update (omp-web): ompweb-dev/ompweb#503 https://github.com/ompweb-dev/ompweb/pull/503",
+      origin: {
+        v: 1, kind: "github", sentAt: "2026-11-15T12:42:00.000Z",
+        github: {
+          repo: "ompweb-dev/ompweb", number: 503, target: "pr",
+          url: "https://github.com/ompweb-dev/ompweb/pull/503",
+          events: [{ kind: "review", author: "coderabbitai", bot: true, state: "APPROVED" }],
+        },
+      },
+    },
+  }));
+  const card = view.getByRole("article", { name: "Automated GitHub update for ompweb-dev/ompweb#503" });
+  assert.match(card.textContent, /GitHub update/);
+  assert.match(card.textContent, /Review from coderabbitai/);
+  assert.equal(view.getByRole("link", { name: "Open ompweb-dev/ompweb#503 on GitHub" }).getAttribute("target"), "_blank");
+});
+
+test("held automated messages identify their source before delivery", () => {
+  const html = renderToStaticMarkup(React.createElement(HeldMessageView, {
+    held: { id: "held-origin", mode: "prompt", message: "Check it", createdAt: Date.now(), local: false, state: "held", origin: sessionOrigin },
+  }));
+  assert.match(html, /From .*Incident review/);
+});
+
+test("cross-session tool rows link the named target and show every delivery state", () => {
+  const targetSession = { id: "target-uuid", name: "Deploy", hostId: "worker", hostLabel: "Worker 1", cwd: "/srv/app" };
+  const cases = [
+    ["Accepted", { accepted: true, targetSessionId: "target-uuid", targetSessionName: "Deploy", targetSession, delivery: "followUp", waited: false }],
+    ["Response received", { accepted: true, targetSessionId: "target-uuid", targetSessionName: "Deploy", targetSession, delivery: "followUp", waited: true, responseText: "Done" }],
+    ["Declined", { accepted: false, declined: true, targetSessionId: "target-uuid", targetSessionName: "Deploy", targetSession, delivery: "followUp", waited: false }],
+  ];
+  for (const [state, payload] of cases) {
+    const result = { role: "toolResult", toolCallId: "send-1", content: [{ type: "text", text: JSON.stringify(payload) }] };
+    const view = render(React.createElement(MessageView, {
+      message: {
+        role: "assistant", model: "m", provider: "p",
+        content: [{ type: "toolCall", toolCallId: "send-1", toolName: "send_to_session", input: { sessionId: "target-uuid", message: "Run checks", delivery: "followUp" } }],
+      },
+      toolResults: new Map([["send-1", result]]),
+    }));
+    assert.match(view.container.textContent, new RegExp(state));
+    assert.match(view.getByRole("link", { name: "Open session Deploy on Worker 1" }).getAttribute("href"), /session=target-uuid/);
+    view.unmount();
+  }
+  const failed = render(React.createElement(MessageView, {
+    message: {
+      role: "assistant", model: "m", provider: "p",
+      content: [{ type: "toolCall", toolCallId: "send-1", toolName: "send_to_session", input: { sessionId: "target-uuid", message: "Run checks" } }],
+    },
+    toolResults: new Map([["send-1", { role: "toolResult", toolCallId: "send-1", isError: true, content: [{ type: "text", text: "boom" }] }]]),
+  }));
+  assert.match(failed.container.textContent, /Failed/);
+  failed.unmount();
+});
+
+test("a pending cross-session tool row resolves and links its current target name", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => String(input).startsWith("/api/hosts")
+    ? Response.json({ hosts: [{ id: "worker", label: "Worker 1" }] })
+    : Response.json({ sessions: [{ id: "target-uuid", name: "Deploy", hostId: "worker", cwd: "/srv/app", created: "2026-11-15T12:41:00.000Z" }] });
+  try {
+    const view = render(React.createElement(MessageView, {
+      message: {
+        role: "assistant", model: "m", provider: "p",
+        content: [{ type: "toolCall", toolCallId: "send-1", toolName: "send_to_session", input: { sessionId: "target-uuid", message: "Run checks" } }],
+      },
+    }));
+    assert.match(view.container.textContent, /Sending/);
+    await waitFor(() => view.getByRole("link", { name: "Open session Deploy on Worker 1" }));
+    view.unmount();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 // Plain Copy needs the browser's layout-aware innerText (not implemented by
@@ -406,6 +573,10 @@ test("task tool results render a per-subagent summary panel", () => {
   assert.match(html, /Subagents/);
   assert.match(html, /Map the surface/);
   assert.match(html, /Write the code/);
+  assert.match(html, />Scout</);
+  // A long job ID is capped to a share of the row so the task text keeps visible width.
+  assert.match(html, /<span title="Scout" style="[^"]*max-width:min\(200px, 40%\)/);
+  assert.match(html, /aria-label="Worker \(worker\): /);
   assert.match(html, /2 subagents/);
   assert.match(html, /999k tok/);
   assert.match(html, /gpt-5.6/);
@@ -1029,6 +1200,101 @@ test("user messages fork at their own entry and edit the prompt", async (t) => {
   assert.deepEqual(forked, [["user-7", true]]);
   view.unmount();
 });
+
+test("SafeMarkdownBody is wrapped in React.memo", () => {
+  assert.equal(SafeMarkdownBody.$$typeof, React.memo(() => null).$$typeof);
+});
+
+test("areMessageViewPropsEqual skips re-render when unrelated toolResults change", () => {
+  const msg1 = {
+    role: "assistant",
+    content: [
+      { type: "text", text: "Running tool..." },
+      { type: "toolCall", toolCallId: "call-1", toolName: "read", input: { path: "a.ts" } },
+    ],
+  };
+  const res1 = { role: "toolResult", toolCallId: "call-1", content: "file content" };
+  const res2 = { role: "toolResult", toolCallId: "call-2", content: "another content" };
+
+  const mapA = new Map([["call-1", res1]]);
+  const mapB = new Map([["call-1", res1], ["call-2", res2]]);
+  const mapC = new Map([["call-1", { ...res1, content: "modified" }]]);
+
+  const baseProps = { message: msg1, toolResults: mapA };
+  // New tool in mapB is unrelated to msg1: props should be considered equal
+  assert.equal(areMessageViewPropsEqual(baseProps, { ...baseProps, toolResults: mapB }), true);
+  // Change in msg1's own tool: props should NOT be equal
+  assert.equal(areMessageViewPropsEqual(baseProps, { ...baseProps, toolResults: mapC }), false);
+});
+
+test("haveSameRelevantToolResults and MessageView re-render look up hybrid toolCall blocks by toolCallId over id", () => {
+  const hybridMsg = {
+    role: "assistant",
+    content: [
+      { type: "toolCall", id: "fc_item_1", toolCallId: "call_A", toolName: "bash", input: {} },
+    ],
+  };
+  const resA1 = { role: "toolResult", toolCallId: "call_A", content: [{ type: "text", text: "initial output" }] };
+  const resA2 = { role: "toolResult", toolCallId: "call_A", content: [{ type: "text", text: "updated output" }] };
+  const resLegacyId = { role: "toolResult", toolCallId: "fc_item_1", content: [{ type: "text", text: "wrong lookup" }] };
+
+  const mapA1 = new Map([["call_A", resA1], ["fc_item_1", resLegacyId]]);
+  const mapA1Same = new Map([["call_A", resA1], ["fc_item_1", { ...resLegacyId, content: [{ type: "text", text: "changed legacy" }] }]]);
+  const mapA2 = new Map([["call_A", resA2], ["fc_item_1", resLegacyId]]);
+
+  // Looking up by toolCallId ("call_A") means changing legacy "fc_item_1" does NOT trigger difference
+  assert.equal(haveSameRelevantToolResults(hybridMsg, mapA1, mapA1Same), true);
+  // Changing "call_A" returns false
+  assert.equal(haveSameRelevantToolResults(hybridMsg, mapA1, mapA2), false);
+
+  // Verify MessageView re-renders with updated tool result when toolResults changes for "call_A"
+  const initialProps = {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: false,
+    message: hybridMsg,
+    toolResults: mapA1,
+  };
+  const { container, rerender } = render(React.createElement(MessageView, initialProps));
+  assert.match(container.textContent, /initial output/);
+  assert.doesNotMatch(container.textContent, /wrong lookup/);
+
+  rerender(React.createElement(MessageView, { ...initialProps, toolResults: mapA2 }));
+  assert.match(container.textContent, /updated output/);
+  assert.doesNotMatch(container.textContent, /initial output/);
+});
+
+test("haveSameRelevantToolResults and areMessageViewPropsEqual handle toolCall with empty string toolCallId", () => {
+  const emptyIdMsg = {
+    role: "assistant",
+    content: [
+      { type: "toolCall", toolCallId: "", toolName: "bash", input: {} },
+    ],
+  };
+  const resEmpty1 = { role: "toolResult", toolCallId: "", content: [{ type: "text", text: "empty id output 1" }] };
+  const resEmpty2 = { role: "toolResult", toolCallId: "", content: [{ type: "text", text: "empty id output 2" }] };
+  const resUnrelated = { role: "toolResult", toolCallId: "other", content: [{ type: "text", text: "other" }] };
+
+  const mapEmpty1 = new Map([["", resEmpty1]]);
+  const mapEmpty2 = new Map([["", resEmpty2]]);
+  const mapEmpty1WithUnrelated = new Map([["", resEmpty1], ["other", resUnrelated]]);
+  const mapEmptyWithoutResult = new Map();
+
+  // Adding a result under "" causes unequal comparison
+  assert.equal(haveSameRelevantToolResults(emptyIdMsg, mapEmptyWithoutResult, mapEmpty1), false);
+  // Updating result under "" causes unequal comparison
+  assert.equal(haveSameRelevantToolResults(emptyIdMsg, mapEmpty1, mapEmpty2), false);
+  // Unrelated key changing while "" is unchanged causes equal comparison
+  assert.equal(haveSameRelevantToolResults(emptyIdMsg, mapEmpty1, mapEmpty1WithUnrelated), true);
+
+  const baseProps = {
+    isStreaming: false,
+    message: emptyIdMsg,
+    toolResults: mapEmpty1,
+  };
+  assert.equal(areMessageViewPropsEqual(baseProps, { ...baseProps, toolResults: mapEmpty2 }), false);
+  assert.equal(areMessageViewPropsEqual(baseProps, { ...baseProps, toolResults: mapEmpty1WithUnrelated }), true);
+});
+
 
 test("user-message Edit only runs after confirmation, and not once blocked", async (t) => {
   const originalMatchMedia = window.matchMedia;

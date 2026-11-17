@@ -2,6 +2,7 @@
 // (`get_state.queuedMessages` and live `queue_update` events), so every
 // client viewing the session shows the same queue.
 import type { QueuedMessages } from "@/lib/pi-types";
+import type { MessageOrigin } from "@/lib/message-origin";
 import type { OutboxEntry, OutboxMode } from "@/lib/types";
 import type { LocalOutboxEntry } from "@/lib/event-stream";
 
@@ -31,6 +32,9 @@ export interface HeldMessage {
   message: string;
   images?: { type: "image"; data: string; mimeType: string }[];
   uploads?: string[];
+  origin?: MessageOrigin;
+  /** Only on this browser's own entries (`local`): the upload proofs a retry needs to attach the same files. */
+  uploadProofs?: Record<string, string>;
   state: LocalOutboxEntry["state"] | Exclude<OutboxEntry["state"], "delivered">;
   error?: string;
   mayHaveBeenSent?: boolean;

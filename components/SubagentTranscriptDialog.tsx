@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { useI18n } from "@/lib/i18n";
 import { formatCost, formatDuration, formatTokens, fullModel, modelEffort } from "@/lib/subagent-format";
@@ -18,6 +18,7 @@ interface SubagentMessagesPage {
   reset?: boolean;
   messages: AgentMessage[];
   totalBytes?: number;
+  error?: string;
 }
 
 /** Compact, defensive row for one raw transcript message (content may be a
@@ -76,21 +77,24 @@ const BLOCK_LABEL_STYLE: React.CSSProperties = {
   color: "var(--text-dim)",
 };
 
-/** Model / reasoning-effort row under the dialog title (the title is the agent). */
-export function SubagentModel({ resolvedModel }: { resolvedModel?: string }) {
+/** Labeled rows under the dialog title (the title is the subagent's name):
+ * one row per value, each wrapping in full so nothing is cut at the modal's width. */
+export function SubagentDetails({ agent, resolvedModel, file }: { agent?: string; resolvedModel?: string; file?: string }) {
   const { t } = useI18n();
   const items = [
+    [t("subagentTranscript.agentLabel"), agent],
     [t("subagentTranscript.modelLabel"), fullModel(resolvedModel)],
     [t("subagentTranscript.effortLabel"), modelEffort(resolvedModel)],
+    [t("subagentTranscript.fileLabel"), file],
   ].filter((item): item is [string, string] => Boolean(item[1]));
   if (items.length === 0) return null;
   return (
-    <dl style={{ display: "flex", flexWrap: "wrap", gap: "2px 12px", margin: "2px 0", fontSize: 11, fontFamily: "var(--font-mono)" }}>
+    <dl style={{ display: "grid", gridTemplateColumns: "auto minmax(0, 1fr)", gap: "2px 10px", margin: "4px 0", fontSize: 11, fontFamily: "var(--font-mono)" }}>
       {items.map(([label, value]) => (
-        <div key={label} style={{ display: "inline-flex", gap: 5, minWidth: 0 }}>
+        <Fragment key={label}>
           <dt style={{ color: "var(--text-dim)" }}>{label}</dt>
           <dd style={{ margin: 0, minWidth: 0, color: "var(--text-muted)", overflowWrap: "anywhere" }}>{value}</dd>
-        </div>
+        </Fragment>
       ))}
     </dl>
   );
@@ -140,21 +144,21 @@ function JsonValue({ value }: { value: unknown }) {
 }
 
 /** The subagent's assignment, rendered as markdown. Exported for SSR tests. */
-export function TaskBlock({ task }: { task: string }) {
+export function TaskBlock({ task, sourceSessionId }: { task: string; sourceSessionId?: string | null }) {
   const { t } = useI18n();
   if (!task) return null;
   return (
     <section style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-subtle)", padding: "10px 12px" }}>
       <span style={BLOCK_LABEL_STYLE}>{t("subagentTranscript.taskLabel")}</span>
       <div style={{ marginTop: 6 }}>
-        <MarkdownBody className="markdown-subagent-text">{task}</MarkdownBody>
+        <MarkdownBody className="markdown-subagent-text" sourceSessionId={sourceSessionId}>{task}</MarkdownBody>
       </div>
     </section>
   );
 }
 
 /** The subagent's final output (`<id>.md`). Exported for SSR tests. */
-export function CompletionBlock({ completion, truncated }: { completion: string | null; truncated: boolean }) {
+export function CompletionBlock({ completion, truncated, sourceSessionId }: { completion: string | null; truncated: boolean; sourceSessionId?: string | null }) {
   const { t } = useI18n();
   let parsed: Record<string, unknown> | null = null;
   if (completion) {
@@ -185,7 +189,7 @@ export function CompletionBlock({ completion, truncated }: { completion: string 
         </div>
       ) : completion ? (
         <div style={{ marginTop: 6 }}>
-          <MarkdownBody className="markdown-subagent-text">{completion}</MarkdownBody>
+          <MarkdownBody className="markdown-subagent-text" sourceSessionId={sourceSessionId}>{completion}</MarkdownBody>
         </div>
       ) : (
         <div style={{ marginTop: 6, fontSize: 12, color: "var(--text-dim)", fontStyle: "italic" }}>
@@ -234,22 +238,17 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     return await res.json() as { completion: string | null; truncated: boolean };
   }, [sessionId, subagent?.id]);
 
-  // Full transcript page (RPC registry first, disk fallback) — mirrors the
-  // get_subagent_messages response shape so both sources are interchangeable.
-  const fetchTranscriptPage = useCallback(async (startByte: number, preferDisk: boolean): Promise<SubagentMessagesPage> => {
+  const fetchTranscriptPage = useCallback(async (startByte: number): Promise<SubagentMessagesPage> => {
     if (!sessionId || !subagent?.id) throw new Error("No session");
-    if (preferDisk) {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagent.id)}?fromByte=${startByte}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json() as SubagentMessagesPage;
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(subagent.id)}?fromByte=${startByte}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => null) as { error?: unknown } | null;
+      throw new Error(typeof body?.error === "string" && body.error ? body.error : `HTTP ${res.status}`);
     }
-    return await sendAgentCommand<SubagentMessagesPage>(sessionId, {
-      type: "get_subagent_messages",
-      subagentId: subagent.id,
-      sessionFile: subagent.sessionFile,
-      fromByte: startByte,
-    });
-  }, [sessionId, subagent?.id, subagent?.sessionFile]);
+    const page = await res.json() as SubagentMessagesPage;
+    if (typeof page.error === "string") throw new Error(page.error);
+    return page;
+  }, [sessionId, subagent?.id]);
 
   const loadTranscriptPage = useCallback(async (startByte: number) => {
     if (!sessionId || !subagent?.id) return;
@@ -259,15 +258,7 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     setTranscriptLoading(true);
     setTranscriptError(null);
     try {
-      let page: SubagentMessagesPage;
-      try {
-        page = await fetchTranscriptPage(startByte, fromDisk);
-      } catch (rpcError) {
-        // The RPC registry only knows subagents of the current process; a
-        // live entry whose session restarted falls back to the disk reader.
-        if (fromDisk || !subagent.id) throw rpcError;
-        page = await fetchTranscriptPage(startByte, true);
-      }
+      const page = await fetchTranscriptPage(startByte);
       if (seq !== transcriptRequestSeqRef.current) return;
       if (page.reset) {
         setTranscriptMessages(page.messages);
@@ -283,7 +274,7 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     } finally {
       if (seq === transcriptRequestSeqRef.current) setTranscriptLoading(false);
     }
-  }, [sessionId, subagent?.id, fromDisk, fetchTranscriptPage]);
+  }, [sessionId, subagent?.id, fetchTranscriptPage]);
 
   const load = useCallback(async () => {
     if (!sessionId || !subagent?.id) return;
@@ -347,8 +338,8 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
   // version is never dropped: a bump that arrives mid-throttle re-arms the
   // timer, and the already-processed guard prevents same-version loops.
   useEffect(() => {
-    if (!open || !sessionId || transcriptVersion === 0 || loading) return;
-    const completionDone = transcriptVersion === refetchedVersionRef.current && transcriptVersion === latestVersionRef.current;
+    if (!open || !sessionId || transcriptVersion === 0) return;
+    const completionDone = loading || (transcriptVersion === refetchedVersionRef.current && transcriptVersion === latestVersionRef.current);
     const transcriptDone = transcriptVersion === refetchedTranscriptVersionRef.current;
     if (completionDone && transcriptDone) return;
     latestVersionRef.current = transcriptVersion;
@@ -356,7 +347,7 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
     versionDebounceTimerRef.current = setTimeout(() => {
       versionDebounceTimerRef.current = null;
       // Completion fetch: consume the version only when actually fired.
-      if (refetchedVersionRef.current !== latestVersionRef.current) {
+      if (!loading && refetchedVersionRef.current !== latestVersionRef.current) {
         refetchedVersionRef.current = latestVersionRef.current;
         void load();
       }
@@ -403,17 +394,18 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
             <div style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 12 }}>
               <div style={{ minWidth: 0, flex: 1 }}>
                 <DialogTitle style={{ marginBottom: 2, fontSize: 16, lineHeight: 1.3 }}>
-                  <span style={{ fontFamily: "var(--font-mono)", color: "var(--accent)", fontSize: 14 }}>{agent}</span>
+                  <span style={{ fontFamily: "var(--font-mono)", color: "var(--accent)", fontSize: 14, overflowWrap: "anywhere" }}>{subagent.id}</span>
                 </DialogTitle>
                 {description && (
-                  <div style={{ fontSize: 12.5, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 4 }}>
+                  <div style={{ fontSize: 12.5, color: "var(--text-muted)", overflowWrap: "anywhere", marginBottom: 4 }}>
                     {description}
                   </div>
                 )}
-                <SubagentModel resolvedModel={progress?.resolvedModel ?? parseSubagentProgress(detail?.progress)?.resolvedModel} />
-                <div style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {detail?.sessionFile ?? subagent.sessionFile ?? subagent.id}
-                </div>
+                <SubagentDetails
+                  agent={agent}
+                  resolvedModel={progress?.resolvedModel ?? parseSubagentProgress(detail?.progress)?.resolvedModel}
+                  file={detail?.sessionFile ?? subagent.sessionFile}
+                />
                 {historyMeta && (
                   <div style={{ fontSize: 10.5, color: "var(--text-dim)", fontFamily: "var(--font-mono)", marginTop: 2 }}>
                     {historyMeta}
@@ -471,8 +463,8 @@ export function SubagentTranscriptDialog({ subagent, sessionId, transcriptVersio
               <div style={{ fontSize: 12, color: "var(--status-error)", padding: "8px 2px" }}>{error}</div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                <TaskBlock task={task} />
-                <CompletionBlock completion={completion} truncated={completionTruncated} />
+                <TaskBlock task={task} sourceSessionId={sessionId} />
+                <CompletionBlock completion={completion} truncated={completionTruncated} sourceSessionId={sessionId} />
                 {loading && <div style={{ fontSize: 11, color: "var(--text-dim)" }}>{t("subagentTranscript.loading")}</div>}
                 <button
                   type="button"

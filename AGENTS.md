@@ -12,7 +12,11 @@ npm run build:binary [-- --target bun-<os>-<arch>]   # build, then compile relea
 npm run typecheck && npm run lint
 ```
 
-The dev server needs the `omp` binary installed (on `PATH`, or set `OMP_WEB_OMP_BIN`).
+The dev server needs ompweb's omp build (`runner/`). Fetch the pinned omp packages first, then install
+(`npm test` needs this too):
+`bun runner/scripts/use-omp-build.ts && cd runner && bun install --frozen-lockfile`; then build
+`runner/release/ompweb-omp-<os>-<arch>` (`bun runner/scripts/build-binary.ts`, this machine's target), which a source checkout
+finds by itself, or point `OMP_WEB_OMP_BIN` at it or at a wrapper running `bun runner/src/cli.ts`.
 All live-agent features go through it; session browsing works without it.
 
 ---
@@ -20,8 +24,8 @@ All live-agent features go through it; session browsing works without it.
 ## Architecture
 
 omp-web never imports `@oh-my-pi/*` or `@earendil-works/*` packages, even
-though the server now runs on Bun: live work goes through the installed `omp`
-child. See `DESIGN.md` for the full porting contract.
+though the server now runs on Bun: live work goes through the `ompweb-omp`
+child (`runner/`, ompweb's own omp build). See `DESIGN.md` for the full porting contract.
 
 ```
 Browser              Bun server (server/app.ts)          omp child process
@@ -32,8 +36,8 @@ Browser              Bun server (server/app.ts)          omp child process
   │   (all tabs)     POST /api/events ─▶ subscribe running/session/file  │
   │                        │                                    │
   ├─ send message ─────────▶ POST /api/agent/[id]               │
-  │                        │   startRpcSession() ── spawn ─────▶│ omp --mode rpc-ui
-  │                        │   sendCommand({type:"prompt"}) ───▶│ (NDJSON stdio)
+  │                        │   startRpcSession() ── spawn ─────▶│ ompweb-omp --headless
+  │                        │   sendCommand({type:"prompt"}) ───▶│ (channel, NDJSON stdio)
   │                        │                                    │
   ├─ session subscription ─▶ event-stream-hub onEvent()            │
   │                        │   onFrame() ◀── event frames ──────│
@@ -52,7 +56,7 @@ its own process (no launcher), `ompweb host` and `ompweb hash-password`.
 files via `lib/session-reader.ts` — no child process involved.  
 **Sending a message**: `startRpcSession()` in `lib/rpc-manager.ts` asks the
 session's `Host` (`lib/hosts/host.ts`; `localHost` in `lib/hosts/local-host.ts`)
-to spawn `omp --mode rpc-ui` (one process per active session) and runs
+to spawn `ompweb-omp --headless` (one process per active session) and runs
 `lib/omp/rpc-process.ts` over the returned transport. Every machine-local
 action of a session wrapper (spawn, session-file checks, list invalidation)
 goes through that host.
@@ -61,14 +65,22 @@ Shared foundations in `lib/omp/`:
 
 - `paths.ts` — Node port of omp's directory resolution (`~/.omp/agent`,
   XDG, session dir slugs) and `sessionLocalRoot`, omp's `local://` root rule.
-- `omp-cli.ts` — locate/probe the installed `omp` binary (`resolveOmpBin`,
-  `getOmpVersion`).
-- `rpc-process.ts` — process + NDJSON protocol layer (`RpcProcess`).
+- `omp-cli.ts` — locate/probe the `ompweb-omp` binary (`resolveOmpBin`,
+  `getOmpVersion`): `OMP_WEB_OMP_BIN`, else a source checkout's `runner/release/`, else the fetched copy
+  (`fetchedOmpBin`: beside a compiled binary, otherwise `<agentDir>/omp-web/omp/<version>/`).
+- `runner-fetch.ts` — `fetchOmpRunner`/`ensureOmpRunner`/`ompweb fetch-omp`: downloads this version's
+  `ompweb-omp-<platform>` from its own GitHub release (repo from `package.json` `repository`, `lib/release-repo.ts`),
+  checks it against the release's `ompweb-omp.sha256` and writes it atomically. The web server and the daemon run it in
+  the background at start when the runner is missing. There are no runner npm packages.
+- `rpc-process.ts` — process + NDJSON channel layer (`RpcProcess`; `rpc-*` names are historical, the wire is the `ompweb-omp` channel of `docs/specs/2026-11-12-omp-runner-design.md`).
 - `rpc-transport.ts` — `RpcTransport`: the byte pipe under `RpcProcess`
   (`spawnLocalRpcTransport` for a local child; `RemoteRpcTransport` in
   `lib/hosts/hub.ts` for a remote one).
 - `auth-gateway.ts` — shared, idle-killed `omp auth-gateway stdio` child:
   omp's own credentials and models behind JSON-line gateway requests.
+- `auth-broker.ts` — idle-stopped `omp auth-broker serve` child of the web
+  server (started on the first forwarded request, stopped after 5 minutes with
+  none in flight): `brokerFetch`, `abortBrokerRequests`.
 
 ---
 
@@ -96,17 +108,21 @@ app/api/
   sessions/[id]/export/route.ts   GET exported HTML for a session
   sessions/[id]/local-file/route.ts GET ?uri=local://<file> → `{ path, sessionId }`: the absolute path of a file in the session's own local:// directory, resolved on the owning host's daemon, and the canonical session that owns it (a live alias resolves to its current id; the tab must store that, since the alias goes with its wrapper). The open_file host tool then reads it through /api/files with that `sessionId`; 400 `invalid_local_uri` / `not_a_file`, 404 `session_not_found` / `file_not_found`, 403 on a symlink out, 501 `workspace_unsupported` for a host daemon that predates `resolveLocalFile`
   agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
-  agent/[id]/route.ts             GET state | POST any RPC command
+  agent/[id]/route.ts             GET state | POST any channel command
   events/route.ts                 GET multiplexed SSE | POST subscribe/unsubscribe channels
   events/link/route.ts            GET WebSocket upgrade: the browser link (lib/browser-link.ts), bound to the request's web session; gated like every API route, 426 without an upgrade
   transport-metrics/route.ts      GET { now } (the SSE clock probe) | POST { samples } → <agent dir>/omp-web/transport-metrics.jsonl
-  hosts/route.ts                  GET hosts (this machine first) | POST { label } → token once + login command | PATCH { id, label?, allowAgentStart? } (`local`: label only, empty resets to "This machine") | DELETE ?id= revoke (registry first, then close the link); 503 if hosts.json is unreadable
+  hosts/route.ts                  GET hosts (this machine first) | POST { label } → token once + login command | PATCH { id, label?, allowAgentStart?, shareCredentials? } (`local`: label only, empty resets to "This machine"; `shareCredentials` on `local` is 400) | DELETE ?id= revoke (registry first, then close the link); 503 if hosts.json is unreadable
   hosts/link/route.ts             GET WebSocket upgrade (the `ompweb host` daemon; bearer checked before the upgrade, skipped by the `proxy.ts` gate) | POST 426 for pre-WebSocket daemons
+  hosts/broker/[...path]/route.ts allow-listed forwarding of an omp auth broker's endpoints for a host that shares credentials (`sharesCredentials`: its `shareCredentials` flag or cluster membership); authenticated by the host token, outside the password gate (`proxy.ts` `UNGATED`); see "Remote hosts → Shared credentials"
+  hosts/cluster-config/manifest/route.ts GET the master's mirrored-configuration manifest (`{ version, files, agentEnv, plugins }`) for a cluster member; host token, members only (`admitClusterMember`: 401 unknown token, 403 `local`/not a member, 503 unreadable `hosts.json`/`pools.json`), 409 `{ error, code }` when the configuration cannot be built (`ClusterConfigError`); outside the password gate (`proxy.ts` `UNGATED`); see "Remote hosts → Cluster configuration"
+  hosts/cluster-config/file/[hash]/route.ts GET one file of the current manifest by its sha256 (404 for any other hash, an older version's included); same admission and gate as the manifest
+  hosts/[id]/cluster/route.ts     PUT { projectsRoot } join the cluster (the host's Git projects bind to cluster projects by repository, `gitOrigins`; this machine is added too by any join while it is not a member; the host needs link protocol 10; 409 `host_in_other_cluster` when it holds another server's configuration), then sends the host its configuration (`clusterConfigOp` `apply`) | DELETE leave, then `restore` (none to a daemon below protocol 10, which never applied one); the body carries `restoreError` when the host could not put its own configuration back; 409 `{ error, code }` for offline/old daemon/`cluster_changed`, 503 if `pools.json` is unreadable
   notifications/devices/route.ts  GET VAPID key + subscribed | PUT { deviceId, prefs, subscription? }
   notifications/presence/route.ts POST { clientId, deviceId, visible, sessionId, seq }
   notifications/test/route.ts     POST { deviceId } send a test push (502 on push-service refusal)
   notifications/history/route.ts  GET entries | PATCH { ids } mark read | DELETE ?id= remove one, ?all=1 clear
-  auth/**                         provider list, login/logout, API keys (via RPC)
+  auth/**                         provider list, login/logout, API keys (via channel commands)
   cwd/validate/route.ts           POST validate/select a cwd
   default-cwd/route.ts            POST create ~/omp-cwd-YYYYMMDD
   files/[...path]/route.ts        GET file contents for viewer
@@ -118,11 +134,11 @@ app/api/
   models-config/test/route.ts     POST test a configured model/provider
   omp-settings/route.ts           GET/PUT native config.yml settings (allow-listed)
   web-settings/route.ts           GET/PUT omp-web's own server settings (auto-resume, agent tools, agent env, browser transport; a transport change is pushed to every open browser)
-  mcp/route.ts                    GET/POST/PUT/DELETE project MCP servers
-  plugins/route.ts                GET/POST plugin management (shells out to `omp plugin`)
+  mcp/route.ts                    GET/POST/PUT/DELETE project MCP servers; `GET ?sessionId=&attach=1` reads a running session's live MCP status and never starts one (a cluster session on another member)
+  plugins/route.ts                GET/POST plugin management (shells out to `omp plugin`); without `cwd`, the user level only (omp runs in the agent directory; a `project` scope POST without `cwd` is 400 `cwd_required`)
   projects/route.ts               GET registered+discovered projects | POST add | DELETE hide
   projects/clone/route.ts         POST clone a git URL into a new workspace (NDJSON progress) | DELETE cancel
-  skills/route.ts                 GET/PATCH loaded skills and disable-model-invocation
+  skills/route.ts                 GET/PATCH loaded skills and disable-model-invocation; GET without `cwd` lists the user level only (`skills/check` and `skills/update` likewise; project scope needs a `cwd`: 400 `cwd_required` from check, `cwd_package_scope_required` from update)
   skills/install/route.ts         POST install skills through npx skills add
   skills/search/route.ts          GET/POST skills.sh search
   stt/route.ts                    POST audio (+scope) → 202 { jobId } | GET ?scope= live jobs (lib/stt-jobs.ts)
@@ -136,9 +152,10 @@ lib/
   dynamic.tsx          `dynamic()` over `React.lazy` + `Suspense`
   navigation.ts        `useRouter`/`useSearchParams` over the History API
   omp/                 shared omp foundations (paths, CLI probe, RpcProcess)
+    plugins-cli.ts     `runOmpCli`, `listPlugins` (`omp plugin list --json` as `PluginEntry[]`), `parseJsonLoose`, `ANSI_RE`; loaded by the daemon too (relative imports only); used by `app/api/plugins/route.ts`, `cluster-config-server.ts` and `daemon-cluster-config.ts`
   hosts/               hosts and the local daemon (see "Remote hosts"); none of the daemon-loaded files may import `@/` (the daemon runs on Node through `jiti`)
     host.ts            `Host` interface, `HostStatus`, `isLinkUp`
-    local-host.ts      `localHost`, the daemon's side: spawn + file checks on the daemon's machine; `resolveSpawnCwdResult`; `SESSION_EDIT_EXTENSION_PATH` (from the module's own location: the daemon runs in HOME). Never imported by main, nor is `daemon.ts` (`no-direct-local.test.mjs`)
+    local-host.ts      `localHost`, the daemon's side: spawn + file checks on the daemon's machine; `resolveSpawnCwdResult`. Never imported by main, nor is `daemon.ts` (`no-direct-local.test.mjs`)
     local-bootstrap.ts web server side of the local link: `localLinkUrl`, `ensureLocalHostLink` (the `local` record + `host.json`)
     host-login.ts      `host.json` (`loginHost`, `readHostLogin`) and `isLoopbackHost`, shared by the daemon and local-bootstrap
     session-ops.ts     file-reading half of the session/project routes, run on the owning host's daemon (this machine's too)
@@ -148,11 +165,24 @@ lib/
     hub.ts             main side: the link's upgrade and `websocket` handler (`handleLinkUpgrade`, `hostLinkSocket`), `RemoteHost`, `getHost`, `listHosts`, adoption of live children (`reattach`/`adopt`), orphans, `freezeHostLinks`, `hosts` change events
     daemon.ts          daemon side: `runHostDaemon` (reconnect, buffering, op dispatch, hello with each child's `{sessionId, cwd, pending}`; follows a `host.json` url or token change when a dial fails; loopback redials at most 3 s apart)
     pending-requests.ts daemon side: `PendingRequests`, a channel's still-open blocking requests and current session id for the hello
+    daemon-broker.ts   daemon side: the loopback forwarder that gives a sharing host's omp processes `OMP_AUTH_BROKER_URL`/`OMP_AUTH_BROKER_TOKEN` (`credentialsEnv`); forwards to the link's server with the link's host token
     registry.ts        `<agent dir>/omp-web/hosts.json`: create/update/revoke, token hashing and lookup; the `local` record (`rotateLocalHostToken`, `customLocalLabel`)
     session-index.ts   sessions and projects across hosts, cached per host; `hostForSessionId`, `sessionSpawnTarget`, `invalidateLocalSessionLists`
+    cluster.ts         pure cluster rules: `clusterOf` (= `pools[0]`), `isClusterMember`, `sharesCredentials`, `joinCluster`/`leaveCluster`, `clusterJoinBlock`, `ompSharesCredentials` (also the daemon's spawn check); browser-importable (Settings uses it)
+    cluster-config.ts  pure, daemon-safe: what a cluster member mirrors from the master (`MIRRORED`, `LOCAL_SETTINGS`, `CONFIG_LIMITS`), `buildManifest`, `stripLocalSettings`/`mergeLocalSettings`, `isManagedPath`, `ClusterConfigError`
+    cluster-config-server.ts main side: `currentClusterConfig` (the manifest cached per fingerprint, one build at a time, `omp plugin list` cached 120 s), `clusterConfigVersion`, `admitClusterMember`, `configErrorResponse`; used by the two `app/api/hosts/cluster-config/` routes and `hub.ts`
+    daemon-cluster-config.ts daemon side: `createClusterConfig` (`ensure`/`apply`/`restore`/`state`/`holds`/`stop`): download, verify, apply whole or not at all, the member's backup (`own-config/`), plugins, leaving; Node only, relative imports
+    host-bearer.ts     `hostFromBearer`: the host an `Authorization: Bearer <host token>` request names, or the 401/503 answer; used by `admitClusterMember`
     update-types.ts    shared per-host software status and operation contract
     updates.ts         daemon-side version checks, compatibility gate and durable update state
     update-worker.ts   host-only install/restart helper; never starts or stops the web-server service
+  github/              GitHub agent tools (server only; spec `docs/specs/2026-11-13-github-watch-tool-design.md`)
+    gh.ts              the server's `gh` runner: `GhRunner`, `checkGh` (60 s login cache), target parsing; env from `createChildProcessEnvironment`
+    api.ts             GitHub data over `gh api`: metadata snapshots; `readItem` is the one path that returns GitHub text
+    events.ts          pure diff of a snapshot against a watch's cursor; words metadata-only updates
+    watch-store.ts     `<agent dir>/omp-web/github-watches.sqlite` (WAL): watches, cursors, pending updates, posted comment ids, read grants; `removeSessionWatches`/`renameSession` do nothing when the file does not exist (a session delete never creates, or on Windows holds open, a store)
+    watcher.ts         60 s poller: pending row, then a `prompt` outbox add, then the cursor on acceptance
+    tools.ts           the five tools (`GITHUB_TOOL_NAMES`, `GITHUB_REPLAY_SAFE_TOOLS`), run after agent-tools' enabled and rate checks
   provider-accounts.ts distinct omp accounts per provider from `omp usage` reports (Models → provider detail)
   agent-client.ts      agent commands from the tab: POST /api/agent/[id], or the worker's browser link in the `ws` transport; records each command's `action` sample
   agent-command.ts     `runAgentCommand`: the one command path behind POST /api/agent/[id] and a browser link's `cmd`
@@ -260,10 +290,10 @@ bin/
 scripts/
   build-client.ts     `npm run build`: bundles app/index.html into dist/ (Bun.build + tailwind-plugin.ts; fonts emitted as /assets files)
   tailwind-plugin.ts  bun-plugin-tailwind minus Tailwind's color-mix() polyfill (Bun 1.4.4 drops repeated @supports rules); build and dev
-  smoke.ts            `npm run smoke`: starts the built server (or `--binary <path>`) and `ompweb host` with a throwaway HOME; checks the SPA, an asset, the API, a session listed through the daemon and SSE
+  smoke.ts            `npm run smoke`: starts the built server (or `--binary <path>`) with a throwaway HOME, verifies automatic local-host startup, the SPA, assets, session access and SSE, then stops its own processes
   transport-metrics.ts `bun scripts/transport-metrics.ts [--since 2h|<ISO>] [--until <ISO>] [--client <id>] [--session <id>] [--file <path>]`: per-transport summary of the browser transport samples and per host and direction of the host link samples (`--session`: link samples of one session; default: the last 24 h of the agent dir's file)
   link-hol-probe.ts   `bun scripts/link-hol-probe.ts --host <id> --model <provider/modelId>`: head-of-line load on one host link (large prompts down, large session reads up, get_state beside them) for the link samples; usage at its top
-  build-binary.ts     `npm run build:binary`: compiles server/binary.ts (NODE_ENV define, no .env/bunfig autoload) into release/ompweb-<os>-<arch>/ beside dist/, public/, the KaTeX files, the session-edit extension and the licenses; archives it
+  build-binary.ts     `npm run build:binary`: compiles server/binary.ts (NODE_ENV define, no .env/bunfig autoload) into release/ompweb-<os>-<arch>/ beside dist/, public/, the KaTeX files, the omp runner (`ompweb-omp`, built first by `runner/scripts/build-binary.ts`; not with `--no-runner`, which releases use: they attach the runners as separate assets) and the licenses; archives it
   build-release-binaries.sh  the five release targets (one list), run by publish.yml and prerelease.yml (a prerelease per verified `main` commit, titled by build time; one concurrency group per commit, so no commit's run is dropped)
   licenses.ts         the release's `licenses/`: license files of every npm package the server and client bundles hold (Bun.build metafiles; build-client.ts writes build/client-packages.json) and `bun-LICENSE-<version>.md`, the vendored license of the embedded Bun runtime. Bumping Bun: vendor its LICENSE.md for the new version, or build-binary.ts stops
 
@@ -292,7 +322,8 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
 - `OMP_WEB_PACKAGE_DIR` (set by the launcher) is the root for `dist/`, `public/` and KaTeX; `process.cwd()` is the fallback for dev and tests. The compiled binary sets it to its own directory (unless set) before any server module loads, so every runtime file must come from that root: a module's `import.meta.url` in the binary is Bun's virtual `/$bunfs/`, which no other process can read. A new file the server or daemon reads at runtime also goes into `scripts/build-binary.ts`'s copy list.
 - The binary needs `process.env.NODE_ENV` defined as `"production"` at build time (`scripts/build-binary.ts`): a plain `bun build --compile` inlines `"development"`, and the server then never writes the daemon's link. `npm run smoke -- --binary` catches that (no session lists).
 - `Bun.serve` turns on `SO_REUSEPORT` when `development` is false, so a second omp-web would share the port instead of failing; `startServer` passes `reusePort: false`, and `startProduction` (`server/app.ts`) reports an `EADDRINUSE` in one line.
-- The web-server in-app update worker runs on Node (`OMP_WEB_NODE_BIN`, the launcher's `process.execPath`), not Bun. The compiled web server updates by download (`lib/self-update.ts`). Host-daemon updates use their own helper in `lib/hosts/update-worker.ts`, including for binary hosts; never reuse the web-server worker to restart a host.
+- Server updates use `self-update.ts` and `server-update-worker.ts`: a package builds a self-contained Node worker, while a compiled release runs a private binary copy outside the install. The server worker also owns a shared local-host transition; independent hosts retain `hosts/update-worker.ts`. All workers use the verified native lifecycle in `upgrade-process.ts`.
+- Stage and digest-check the candidate, run `ompweb fetch-omp` and `ompweb preflight` in its environment, then stop anything. `PREFLIGHT_MARKER` identifies the preflight command. Server completion needs an expected-version boot nonce and live process proof, not a launcher's former IPC/restart marker protocol. A failed cutover retains the prior tree and reports rollback status.
 - The daemon-owned watcher (`lib/hosts/workspace-watch.ts`) re-stats ~50 ms after every event to catch burst saves (Bun may drop native events within ~2 ms); main only routes its sequenced watch events.
 - `bun:sqlite` `.get()` returns `null` for no row (not `undefined`).
 - `bun:sqlite` `close()` keeps the database file open while prepared statements are alive (until GC), so Windows cannot remove or replace it: the stores close with `close(true)`, which finalizes them (`closeNotificationStore`, `closeUsageDatabase`).
@@ -311,7 +342,8 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   Wrappers report tab/command interest and protected preparation through transport
   capabilities; disposal closes membership, while explicit delete/reload can kill.
   Reconciliation failure never kills a process another server uses.
-- For legacy hosts, concurrent `startRpcSession()` calls share one start promise.
+- Every link is host-owned since link v11, so the backstops below run only for a transport without
+  `hostOwnedLifecycle` (test fakes): concurrent `startRpcSession()` calls share one start promise.
   Two cleanup backstops remain on the server, both unref'd:
   `IDLE_DESTROY_MS` (10 min) and `DISCONNECT_DESTROY_MS`
   (`OMP_WEB_DISCONNECT_DESTROY_MS`, 2 min, `0` disables). The shorter one only
@@ -327,7 +359,7 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   parameters in `omp-web/host-running.json`; the daemon resumes them once after
   its restart. Web-server restarts just rejoin. The first v6 → v7 daemon upgrade
   requires a quiescent host: the old daemon has no recovery manifest.
-- **Legacy hosts only:** the per-web-server recovery mechanism below remains.
+- The per-web-server recovery mechanism below runs only for a transport without `hostOwnedLifecycle`.
 - Off by default (`autoResumeSessions` in `omp-web-settings.json`). When on,
   `notifyRunningChange()` keeps `omp-web-interrupted-sessions-<pid>.json` in
   the agent dir listing sessions that are mid-run; startup
@@ -357,8 +389,7 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   The daemon owns lifecycle, streaming snapshots and first-answer dialog settlement.
   Web callbacks choose the last-active eligible server and are not blindly retried.
   `channels_changed` discovers background runs; `sessions_changed` invalidates lists;
-  one link is the automatic notification publisher. v4–v6 links remain exclusive;
-  cross-version attempts to share a session fail with `session_running_elsewhere`.
+  one link is the automatic notification publisher.
   Cross-server fences live in the daemon: a history edit takes the acknowledged
   `editLease` op before preflight, and a `peer_message_command` marker makes another server's identical echo
   ambiguous (`watchReplacement`). An open's preparation lease passes only to the
@@ -405,7 +436,7 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   busy key; control lines skip both. The
   `hello` is the first text frame of a socket. Each `hello.channels`
   entry carries `pending`: the raw stdout lines of that child's
-  still-open `host_tool_call`s, `host_uri_request`s and blocking `extension_ui_request`s
+  still-open `host_tool_call`s, `host_uri_request`s and blocking `ui_request`s
   (`PendingRequests`), or null past `LINK_LIMITS.pendingBytes`. Each side keeps unacked
   lines, resends after a reconnect and drops any `seq` it already applied. The
   hub decodes a whole frame before applying any of it (a bad line closes 1007).
@@ -448,11 +479,13 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   v4 (the WebSocket link) dropped v3 before any release. v5 (pieces) keeps v4;
   v6 (uploads: hub → daemon binary frames, `upload_ack`, `uploadStart`/
   `uploadAbort`/`uploadAttach`) keeps v4 and v5. v7 adds multi-server joins,
-  host-owned lifecycle, callback routing and channel/list discovery:
-  `MIN_LINK_PROTOCOL_VERSION` is 4 and `LINK_PROTOCOL_VERSION` 7 (literal
-  one-liners: the deploy script parses them with `sed`); a v4 daemon gets no
-  `part`, whole lines and no unacked window (`link.sender.parts`); a v4/v5
-  daemon gets 426 for uploads. Main keeps at least N-1, and
+  host-owned lifecycle, callback routing and channel/list discovery.
+  v8 (host pool) adds `capacity` reports, `creationId`
+  and `preparePoolProject`; v9 adds `open.launch.shareCredentials` (see "Shared
+  credentials" below); v10 adds `open.launch.configVersion`, the `config_state`
+  report and the `clusterConfig` op (see "Cluster configuration" below). v11 (the omp runner) makes channel
+  lines the runner's `{t}` frames instead of omp RPC frames and drops v4–v10: `MIN_LINK_PROTOCOL_VERSION` and
+  `LINK_PROTOCOL_VERSION` are both 11 (literal one-liners: the deploy script parses them with `sed`). Main keeps at least N-1, and
   dropping one is an explicit decision (a hello
   outside the range gets close 4426 with `{"serverVersion":N}`, a pre-WebSocket
   daemon's POST gets 426). Once the WebSocket experiments end, the first version
@@ -520,11 +553,157 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   session resumes after its host's hello (`resumeOnHostLink`,
   `lib/session-resume.ts`), once, after the orphan's exit.
 - **Proxy exclusion.** The `proxy.ts` gate lets exactly `/api/hosts/link` through
-  (the `UNGATED` pattern names that path, no subpaths): the daemon has no
+  (the `UNGATED` pattern names that path, no subpaths), the prefix
+  `/api/hosts/broker/v1/` (below) and the two exact cluster configuration paths (below): the daemon has no
   session cookie, so it authenticates with its bearer token instead. The hub
   verifies the `Authorization: Bearer <host token>` header before the upgrade
   (401 unknown token, 503 unreadable `hosts.json` or frozen server). Keep
-  `/api/hosts` itself behind the proxy.
+  `/api/hosts` itself behind the proxy. `/api/hosts/broker/v1/` is the next ungated
+  path (the `UNGATED` pattern names that prefix; anything else under
+  `/api/hosts/broker/` stays gated): the daemon authenticates there with its
+  host token too. A reverse proxy must pass it without its own authentication,
+  without response buffering (the snapshot stream stays open) and
+  without redirects. The last ungated paths are the one alternation
+  `api\/hosts\/cluster-config\/(?:manifest|file\/[0-9a-f]{64})$` of `UNGATED`: exactly
+  `/api/hosts/cluster-config/manifest` and `/api/hosts/cluster-config/file/<64 hex digits>`, nothing
+  below or beside them (`/api/hosts/[id]/cluster` and `/api/hosts/[id]/updates` answer to the id
+  `cluster-config` and stay gated); each route checks the host token and membership itself
+  (`admitClusterMember`, again after the configuration is built, so a host revoked or removed meanwhile
+  gets 401/403), and a reverse proxy passes them without its own authentication and
+  without redirects (exact paths, unlike the broker's prefix).
+- **Shared credentials** (`docs/specs/2026-11-10-shared-credentials-design.md`).
+  A linked host's `shareCredentials` (default off; `local` never has it) makes the
+  omp processes its daemon spawns use the credentials of the server machine
+  through `omp auth-broker serve`; ompweb still never reads `agent.db`.
+  - **Route.** `app/api/hosts/broker/[...path]/route.ts` checks the host token
+    before reading a body (401 unknown token, 403 `local` or sharing off, 503
+    unreadable `hosts.json` or no broker), then forwards only an allow-list of
+    broker endpoints (snapshot, its stream, health, `refresh`, `disable`,
+    `block`, `blocks`, usage), body at most 1 MiB, with a handful of request
+    and response headers. Everything else answers 404, `POST /v1/credential`
+    included: a host cannot upload a credential. It turns the idle timeout off
+    after authenticating. Turning sharing off or revoking the host calls
+    `abortBrokerRequests` for it and later requests get 403 or 401.
+  - **Daemon.** `open.launch.shareCredentials` (link v9) makes the daemon start omp
+    with the loopback forwarder's URL and a secret it generates at each start. The
+    host token never enters an omp environment: the forwarder adds the link's
+    current token to each request, sends it to that link's server and refuses
+    redirects.
+  - **No fallback.** The hub answers 426 `host_upgrade_required` for a sharing
+    host on a v4–v8 daemon, and the daemon refuses to spawn on an omp older than
+    15.13.1. Starting a session is refused; it never uses the host's own stored
+    logins. Joining a running session is never refused.
+  - **Which server decides.** The server whose `open` starts a process decides
+    its credentials, an advisor replacement included (`withCredentials` in
+    `lib/hosts/daemon-channels.ts`); a server that joins a running process does
+    not change them. The resume manifest keeps the server URL
+    (`launch.credentialsServer`). A launch whose link is no longer in `host.json`
+    is refused with 409 `credentials_link_gone`, on resume as on a new start.
+  - **Scope.** The host can read current access tokens and stored API keys;
+    refresh tokens stay on the server. Not shared: `models.yml` custom providers,
+    environment-variable API keys, omp settings.
+- **Cluster** (`docs/specs/2026-11-11-cluster-membership-design.md`). The
+  cluster is `pools[0]`; `local` is its master, added on creation or on the next
+  join if an existing first pool lacks it. The rest of `pools.json` is ignored
+  by the interface.
+  - **Membership computes credential sharing; it is never stored.** A member
+    other than `local` shares regardless of its `shareCredentials` flag
+    (`sharesCredentials(record, pools)`), so leaving restores the host's own
+    setting. An unreadable `pools.json` refuses a start (503
+    `pool_storage_unavailable`) rather than starting with other logins.
+  - **Every writer of `pools.json` that can end a host's sharing aborts that
+    host's broker requests** (`abortBrokerRequests`): `PUT /api/hosts` and the
+    cluster `DELETE`. A flag change or revoke writes `hosts.json` and likewise
+    aborts requests when sharing ends.
+  - **Membership, not the confirmation or `enabled`, grants sharing.** A host
+    added to `pools[0]` through `PUT /api/hosts` (or a `pools.json` edit) shares
+    without the join dialog, and so do members of a disabled first pool.
+  - **Placement skips members that cannot share.** `startPooledSession` leaves
+    out a member that `sharesCredentials` forces to share unless its link is
+    shared (`hostOwnsLifecycle`) at `SHARED_CREDENTIALS_SINCE_VERSION`, before
+    preparation; `spawnRpc`'s 426 stays the last guard. Other pools' members
+    keep their own eligibility.
+  - **Join keeps what the host showed.** A created cluster project takes the
+    host project's name, else its folder name (split on `/` and `\`), and its
+    alias; binding a visible checkout un-hides a hidden cluster project.
+    `POST /api/projects` pool registration matches by `repositoryKey` (or the
+    identical text) and keeps the stored origin.
+  - **Mirrored to members:** this machine's omp configuration, see "Cluster
+    configuration" below. Not mirrored: programs (an MCP command, a language server, a local
+    model engine), `.omp/` in a repository, named omp profiles.
+  - **Only grouping passes `pools` to `projectTargetId`.** Selection, expand
+    keys, reorder, pin and drag use the project's own target.
+- **Cluster configuration** (`docs/specs/2026-11-11-cluster-configuration-design.md`).
+  A member runs omp on this machine's configuration, and its daemon applies it, never omp.
+  - **Master.** `buildManifest` (`lib/hosts/cluster-config.ts`) lists the `MIRRORED` files (from the
+    agent directory, and `~/.agents/skills`), `config.yml` without the `LOCAL_SETTINGS` keys (one
+    constant, read by the master when it builds and by the member when it merges), with
+    the agent environment variables and the plugin set. `version` is a sha256 over all of it. Limits: 5 MiB per file,
+    50 MiB per bundle, 5 MiB for the serialized manifest, which is what a member reads (`CONFIG_LIMITS`, shared
+    with the daemon; too many files is `bundle_too_large`); a configuration over one is not served at all
+    (`ClusterConfigError`, which names a file and never its content; it reaches Settings as `masterConfigError`
+    in the `hosts` snapshot). `currentClusterConfig` rebuilds only when its fingerprint changes
+    (an async stat of every file, agent environment, plugin list, which is read at most every 120 s, so a
+    plugin change reaches members within about two minutes, and keeps the
+    last good list when `omp plugin list` fails: a member removes the plugins the manifest lacks); a read
+    error in the fingerprint walk makes the fingerprint unique, so the build reports it instead of a cached manifest standing.
+    `startClusterConfigSync` (`instrumentation.node.ts`) runs `syncClusterConfig` at start, every 30 s, and
+    whenever `masterConfigVersion` finds a new version after a known one (a member start reads it too):
+    `clusterConfig apply` to each online v10 member that is not `configCurrent`, `restore` to a host outside
+    the cluster whose link is up (`omp-missing` too) and that still reports a configuration of this server or has
+    not reported since its link came up (a dropped `config_state`; the answer says); never while one of that
+    link's ops is unanswered. Join sends `apply` after it saves `pools.json`, leave `restore`
+    after it saves; neither may await between reading the pools and saving.
+  - **Protocol 10.** `open.launch.configVersion` is the master's version (64 hex digits,
+    `CONFIG_VERSION_RE`). The hub sets it for a cluster member's process start (not for a join of a
+    running channel), after reading `pools.json` a second time so a host that left meanwhile gets none. The daemon strips `shareCredentials`,
+    `credentialsServer` and `configVersion` from every wire launch and sets them only for the opening link
+    (`forStart`); a launch with a version needs `credentialsServer` and applies it first
+    (`createClusterConfig.ensure`) or the start is refused 409 `cluster_config_failed`. `config_state
+    { state, owned }` is an unsequenced daemon report (like `capacity`, never replayed), at link up, on each
+    change and after each `host.json` reload; one that finds the send window full is not dropped: the latest goes at
+    the link's next flush (main's ack, or the poll of a full socket buffer). The
+    `clusterConfig` op is `{ action: "apply", version }` or `{ action: "restore" }` and answers `{ state, owned }`;
+    the hub keeps that answer's state only until the link's first `config_state` since it came up (a report goes
+    ahead of the sequenced answer, so it can be newer).
+    **The version is never persisted in the resume manifest:** `ChannelTable.running()` drops it and
+    `host-running.json` has no field for it, so a recovered session starts on the version already applied.
+  - **Daemon.** Per version: manifest, then each file the member lacks by hash from the link's server
+    (`<agent dir>/omp-web/cluster-config/objects/`, verified by hash), then one transaction: files are
+    staged, the member's own entries move aside (first apply: `own-config/`, with `plugins.json`,
+    `agent-env.json`, `absent.json`, `server.json` and `settings.yml`, a plain copy of its own `config.yml`
+    or `config.yaml` read through a link, which later applies merge from; later: `trash/`), the staged ones move in, the agent
+    environment and `state.json` are written; any failure puts everything back and the previous
+    version stays. Renames move links as links and cannot cross filesystems (`EXDEV` fails with both
+    directories named); a link above an entry (`~/.agents`) is refused. Every request to the master,
+    its body included, must finish within 30 s (`clusterConfigTimings.fetchMs`); `stop()` aborts it and a
+    running `omp plugin` command (`halt`). Plugins run after the
+    files in the same queue without the start waiting (`syncPlugins`, `omp plugin`; npm pinned by
+    version, a marketplace plugin has no pin); a new version with the same plugin list keeps `plugins: "current"`
+    while the step re-checks it; a failure keeps `plugins: "failed"` and is retried at most
+    every 30 s (`pluginRetryMs`). Applies, restores and plugin jobs run one at a time.
+  - **Ownership.** `own-config/server.json` records the server whose configuration the host holds: one
+    server at a time. Another server's `ensure`/`apply` is refused while the recorded one is still in
+    `host.json` (`foreign`); a recorded server that is no longer linked is taken over by the next apply. `owned`
+    in `config_state` and in the op's answer is `holds(link server)`. A join of a host that reports
+    another server's configuration is 409 `host_in_other_cluster`. Only the server that `holds` the configuration
+    puts it back: another server's `restore` answers at once and changes nothing (`owned: false`; a backup nobody
+    holds, such as a kept plugin list, waits for the next start), and a session start sent before that server's restore is refused
+    after it (`left`), as is any start while the holder's restore runs. A link that ends `"revoked"` while its server
+    `holds` the configuration awaits `restore` before the daemon shuts down: no other server could put it back.
+  - **Placement.** `isHostConfigCurrent`: `local` and hosts outside the cluster always; a member only when it reports
+    this server's version, `files` and `plugins` current. `selectPoolHost` skips a member that is not;
+    `startPooledSession` says why: "still receiving the configuration" or "Update
+    ompweb on the pool's workers". A start pinned to one member applies first and is refused with the reason; a
+    plugin difference does not refuse it.
+  - **Upgrade.** Every linked daemon speaks protocol 11 or newer (`MIN_LINK_PROTOCOL_VERSION`; an older one is refused
+    at the link), so every member takes the configuration; joining also needs the `gitOrigins` op and an omp that
+    shares credentials (`clusterJoinBlock`).
+  - **Settings.** Rows carry `clusterConfig { …state, owned, current }` (`listHosts`); the member line shows
+    current, updating (none while `masterConfigError` is set), failed (reason), held by another server, needs update (`clusterJoinBlock` says "upgrade"), and the MCP commands
+    missing there. For a cluster session on another member (`isClusterTarget` with a member host) the MCP,
+    Skills, Plugins and Agents panels use no cwd and no session (the user-level routes above); MCP alone keeps
+    the session for `?attach=1`, read-only (`McpConfig liveOnly`).
 - **Remote paths never reach `allowFileRoot`** or any other main-side
   filesystem check: they mean nothing on main. `startNewRpcSession` calls
   `allowFileRoot` and the local session-list invalidation only for the local
@@ -553,6 +732,16 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   (`confirmFromServer`). Local callers never ask for this machine. A remote
   caller asks before any other host unless that host allows agent starts, and
   always before this machine, for `new_session` and `send_to_session` alike.
+- **Message origin.** Messages created by `send_to_session`, a `new_session`
+  first prompt, or the GitHub watcher remain native user messages for model
+  authority, but carry server-authored `origin` metadata. The runner stores it
+  in the existing `client-message-entry` correlation journal; the reader joins
+  it only on the active branch, and the outbox stores it beside held entries.
+  Browser/HTTP commands cannot supply `origin` (`origin_not_allowed`), and
+  readers drop malformed or over-4096-byte metadata. The chat renders trusted
+  origins as left-aligned source cards; matching text without metadata remains
+  an ordinary user bubble. Older runners ignore the optional command field and
+  show the explicit model-facing source header as plain text.
 - **Workspace operations are daemon-owned** (`lib/workspace-types.ts`,
   `lib/hosts/workspace-ops.ts`; design `docs/specs/2026-11-03-remote-workspaces-design.md`).
   Files/index/shell output/watch, Git/worktrees, browsing/default cwd and clone
@@ -754,25 +943,27 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   instead of lapsing a held row by its clock (later opens only read the version).
   Async restore streams archives with fixed 256 MiB compressed and
   expanded limits, rejecting unsupported IDs before archive consumption.
-- **Not yet remote:** Skills/Plugins/Agents/MCP settings; transcript search reads
+- **Not yet remote:** Skills/Plugins/Agents/MCP settings for a host outside the cluster (cluster
+  members run this machine's, see "Cluster configuration"); transcript search reads
   this machine's files.
 
 #### Local daemon (`docs/specs/2026-10-29-local-daemon-design.md`)
-- **Two services.** `ompweb` (web) and `ompweb-host` (`ompweb host`, the daemon) are installed together by `ompweb systemd install`, `ompweb launchd install` and the Windows tray install; uninstall removes both, `ompweb systemd restart` restarts the web unit only. The daemon owns this machine's omp children, so a web restart, update or redeploy leaves runs going; restarting the daemon ends them (auto-resume then resumes the sessions that were running). An upgrade restarts the daemon only when the running daemon's link version is outside the new release's `[MIN_LINK_PROTOCOL_VERSION, LINK_PROTOCOL_VERSION]` range (it would get 4426 or 426 and exit); a daemon inside the range keeps running.
+- **Independent host lifetime.** Installers still install web and host services together; ordinary web restarts leave the daemon's sessions running. Production also starts a missing local host independently through `local-daemon-start.ts`, after preparing its link and probing private control. The singleton prevents duplicates. A coordinated upgrade may restart a shared-installation or incompatible host only after plan approval, with explicit Force approval when sessions may end.
 - **Local link bootstrap** (`lib/hosts/local-bootstrap.ts`, `instrumentation.node.ts`): async `ensureLocalHostLink()` atomically upserts this server's `{url, token}` in `host.json.links` under the same lock as token selection, preserving the primary pair and other links. Files stay 0600. The directory watch reconciles added/removed links without restarting the daemon; malformed configuration is not overwritten. `ompweb host login --add --url <url>` adds a remote server (token from stdin); `host logout --url <url>` removes its link. A remote primary remains protected from local bootstrap replacement.
 - **Dev mode does not take the daemon.** With `NODE_ENV=development` `ensureLocalHostLink` is skipped, so the daemon stays linked to production and the dev server shows "This machine" offline. The local row of `GET /api/hosts` carries `daemonManaged: false` there, which hides the install banner.
 - **`local` is a registry record like any host**, with three exceptions: it is listed first, `PATCH` takes `label` only (`allowAgentStart` is fixed), and it cannot be revoked. Renaming "This machine" is a `PATCH /api/hosts {id: "local", label}`; an empty label resets it (`registry.ts` stores `""`; `customLocalLabel()` / `DEFAULT_LOCAL_LABEL` map it). `getHost("local")` works without the record: it is the daemon link, offline while none is linked, and "needs upgrade" on a protocol mismatch (`hostVersion` in the row is the daemon's).
-- **Joining on hello** (`reattach`/`adopt` in `hub.ts`): v7 servers call `open` to join each listed channel, restore pending requests and the current whole streaming message, then request state/subagents/side-question snapshots before releasing held frames. They also join `channels_changed` announcements with no tab open, preserving background badges/notifications. The daemon has already negotiated and set process-global subscriptions; servers do not change those settings. Legacy hosts retain the previous adoption handshake, including startup settings.
-- **The daemon replays open blocking requests** (`pending-requests.ts`): `host_tool_call`, `host_uri_request` and blocking `extension_ui_request` lines, until answered or cancelled, capped at `LINK_LIMITS.pendingBytes` per channel. An adopted wrapper feeds them through `handleFrame` (`replaying`; agent tools are not re-run), so dialogs reappear and browser tool calls wait for the next tab (`hostToolsUnknown`, `parkHostTool`). A request opened while the old server stopped is also resent unacked: `RpcProcess.release` skips held requests the replay already delivered, so it is handled once. The hello also carries `autoApproveExtension`, which an adopted run has no spawn result for.
-- **Legacy orphan cleanup:** only v4–v6 channels use `killOrphan` when adoption is impossible. v7 adoption failure/disposal closes the server's membership; the host decides abandonment and continues any peer's run. Explicit delete/archive is fenced on the host against a concurrent open, even before this server has a wrapper.
+- **Joining on hello** (`reattach`/`adopt` in `hub.ts`): servers call `open` to join each listed channel, restore pending requests and the current whole streaming message, then request state/subagents/side-question snapshots before releasing held frames. They also join `channels_changed` announcements with no tab open, preserving background badges/notifications. The daemon has already negotiated and set process-global subscriptions; servers do not change those settings.
+- **The daemon replays open blocking requests** (`pending-requests.ts`): `host_tool_call`, `host_uri_request` and blocking `ui_request` lines, until answered or cancelled, capped at `LINK_LIMITS.pendingBytes` per channel. An adopted wrapper feeds them through `handleFrame` (`replaying`; agent tools are not re-run), so dialogs reappear and browser tool calls wait for the next tab (`hostToolsUnknown`, `parkHostTool`). A request opened while the old server stopped is also resent unacked: `RpcProcess.release` skips held requests the replay already delivered, so it is handled once. The hello also carries `autoApproveExtension`, which an adopted run has no spawn result for.
+- **Adoption failure** or disposal closes the server's membership; the host decides abandonment and continues any peer's run. Explicit delete/archive is fenced on the host against a concurrent open, even before this server has a wrapper.
 - **Shutdown freezes the links and never kills daemon children.** The `cleanup` in `rpc-manager.ts` runs `markShuttingDown()` and `freezeHostLinks()`: link sockets are closed 1001 and from then on a link neither sends nor applies anything (no kill, no rejection of open host tool calls as tabs close); new upgrades get 503 "omp-web is shutting down". A real SIGTERM exits in the same tick (`process.exit` in `instrumentation.node.ts`), before Bun writes the close frame, so daemons usually see 1006 or ECONNREFUSED rather than 1001 and redial the same way. The daemon keeps the output unacked and redials for the next server. An adoption that fails after the freeze leaves its child to the next server instead of killing it.
-- **Install banner** (`components/LocalDaemonBanner.tsx`). In production, when the local row stays offline with `hostVersion === null` (no daemon has linked since this server started) for 90 s of a page view (well past the daemon's redial wait, at most 3 s on loopback, so a restarting daemon does not trip it), it shows the platform's install command and, for a foreground `ompweb` (terminal or npx, no service), `ompweb host` to keep running in another terminal; Settings → Hosts shows both for an offline local row. Dismissal is kept in `localStorage`. Main never installs services or starts the daemon.
+- **Failed-start guidance** (`components/LocalDaemonBanner.tsx`). Production first attempts automatic host startup without installing services. If no daemon links within the existing 90 s grace, the banner and Settings → Hosts retain start/install guidance. Development never starts or takes the production daemon. An unknown or unsafe existing control endpoint is an error, not permission to launch another host.
 - **No direct local path.** `local-host.ts` is the daemon's; `lib/hosts/no-direct-local.test.mjs` fails when anything outside its allow-list spawns omp or imports it. The utility omp (`rpc-utility.ts`, login) is the one deliberate exception: it is not a session.
 
 ### Session moves (omp >= 18.5 ownership) and title generation
 - Only the first omp process to write a session file owns it; a non-owner moves
   to a sibling file with a new id on its first write and emits a
-  `notice` with `source: "session-persistence"`. `handleFrame` answers it with
+  `notice` with `source: "session-persistence"` (the runner sends it before the
+  new `session` frame, which the daemon's `ChannelTable` reads the same way). `handleFrame` answers it with
   `followSessionMove()`: the pending flag makes the next `applyIdentity` treat
   the id change as the same conversation (stream/run state kept, **old id kept
   as a registry alias**, new id registered via `onIdentityChange({keepOldId})`).
@@ -796,7 +987,7 @@ executor-style promises instead. Server code may use them freely.
 ### Editing and branching — don't confuse them
 - **Fork** ("Fork a new session from this point" button, `messageView.newSessionTitle`, on user and assistant messages; only offered while the session is idle — ChatWindow gates it on `!sessionBusy && !isNew`): creates a new independent `.jsonl` file via omp's `branch` RPC. Shown as a child in the sidebar tree via `parentSession` header field. `branch` only takes a user entry and keeps the history *before* it, so `lib/chat-fork.ts` maps rows: a user prompt forks at itself and its returned text prefills the fork's composer (edit-and-resend, text only — attached images are not restored); an assistant reply forks at the next user prompt so the reply is kept; the newest reply falls back to its own prompt with the prefill. Rows that would edit the very first prompt (an empty fork) offer no fork.
   The button only opens a `ConfirmDialog` (`ForkSessionButton`); `onFork` runs on confirm, so a stray tap while scrolling never forks.
-- **Edit** (`edit_message`, user-message button): moves the live conversation's history to before that user entry; it is not a read-only historical view or an explicit Fork. `lib/omp/session-edit-extension.mjs`, explicitly loaded on spawn/restart, calls omp's public `ctx.navigateTree(entryId, { summarize: false })` and appends a non-message `omp-web-history-navigation` entry. Node never imports the Bun-only SDK or rewrites the JSONL.
+- **Edit** (`edit_message`, user-message button): moves the live conversation's history to before that user entry; it is not a read-only historical view or an explicit Fork. The runner's `edit_message` command (`runner/src/commands/session.ts`) calls omp's `navigateTree(entryId, { summarize: false })` and appends a non-message `omp-web-history-navigation` entry. The web server never imports the Bun-only SDK or rewrites the JSONL.
   - The button only opens a `ConfirmDialog` in `UserMessageView`; `onEdit` runs on confirm, so a stray tap never rewinds the live session.
   - Require authoritative `get_state.isSettled === true` and reject pending background work; runtimes without settlement reporting fail explicitly. Preserve run/edit fencing, including rename and automatic-title fallbacks, and do not report success after an observed edit-time native persistence error.
   - `SessionEditResult` remains `{ sessionId: string, cancelled: boolean, leafId: string | null }`. The returned ID identifies the confirmed post-edit conversation. Single-owner Edit keeps ID/file; a non-owner's native copy-on-write relocation is expected. Server persistence notices feed `applyIdentity` and registry aliases; the HTTP result drives client identity adoption (there is no public identity-change frame). Reload the confirmed target before text prefill, reject unrelated switches, and preserve the original file and old branches.
@@ -810,6 +1001,7 @@ executor-style promises instead. Server code may use them freely.
   - Event connections own their readiness waits: replacement and unmount settle the old wait as closed, clear its timers/coalesced work and close its observer. Late continuations must not attach streams to an unmounted hook or let a stale connection authorize a new operation. Keep lifetime cleanup separate from the mount-load latch so StrictMode setup/cleanup replay still cleans up observers attached afterward.
   A new chat's first prompt is the exception to "abandoned readiness": when its chat unmounts while omp spawns, `handleSend` still sends the prompt, opens no observer, skips host-tool/roster setup and returns `accepted`. An existing session's messages need no exception: they go through the message outbox (below), which delivers them with no tab involved.
   Ordinary `ChatInput.onSend` returns `Promise<PromptSubmissionResult>` (`accepted` / `rejected` / `superseded`). With `outbox` (an existing session) the composer clears only once `onSend` (or `onSteer`/`onFollowUp`) reports the message stored in the browser's outbox, and only if it still holds what was sent; a refusal leaves it in place. For a new chat only rejection restores composed text/file contents and images through `recoverDraft`; its receipt supplies the promoted real-session draft key when the new chat became a session, otherwise the composer uses the originating key captured before submission. Superseded failures must not reinsert a processed turn or reset a newer run. The composer owns recovery; `useAgentSession.handleSend` must not separately insert failed-send text and duplicate it.
+  Retry roots may be server-known or browser-only. Server-known roots are hidden only on a server-confirmed `replaces`; a browser-only failed root is retired only after a valid accepted receipt for its committed, same-session exact-intent copy, even if a lost-response replay is an empty tombstone without `replaces`. Concurrent same-root holds share one IndexedDB copy and each caller gets its durable-add acknowledgement. Refusals preserve the root; cross-session and unrelated same-text entries remain.
 - **In-session branch** (Continue button / BranchNavigator): reads a historical view of the entry tree within the same file; it does not change the live agent's context. Multiple entries share the same `parentId`. Switching between them calls `/api/sessions/[id]/context?leafId=` through `handleLeafChange`; never use that read-only path to implement Edit.
 
 ### ToolCall field normalization
@@ -942,7 +1134,7 @@ end to end:
 ### Event protocol differences vs pi
 omp emits no `prompt_done` / `prompt_error` / `compaction_start` /
 `compaction_end` events. Completion is `agent_end` (`isTerminal !== false`),
-errors surface as failed RPC responses plus `notice` events.
+errors surface as failed command results (`res`) plus `notice` events.
 New frame types (`turn_start/end`, `notice`, `todo_reminder`, ...) must be
 handled or safely ignored.
 
@@ -980,7 +1172,7 @@ during the wait.
   (`lib/composer-prefs.ts`, `omp-web:submit-during-run`); only an explicitly
   stored choice overrides it, and an absent key yields `queue`.
 - omp-web's own `!!` shell command (`bashRunning`, set for the whole `bash`
-  RPC) is the one state omp refuses a prompt in. The wrapper degrades instead
+  command) is the one state omp refuses a prompt in. The wrapper degrades instead
   of throwing (`queueWhileShellRunning` in `lib/rpc-manager.ts`): the frame is
   forwarded as omp's `follow_up` — never aborted, never reimplemented here —
   and the reply reports it (`{queued:true, queue:"followUp",
@@ -1060,6 +1252,10 @@ during the wait.
   Startup recovery fails a same-PID `delivering` row (a reused PID from the
   last run) unless this process holds that claim in memory: an add accepted
   before a delayed startup retry may already be in flight.
+  A steer waits (`held`) while an ask (`askDialog`/`formDialog`) is open, since
+  omp's ask tool aborts on a user steer; the wrapper's `onAskClosed` (answered,
+  cancelled, expired or child gone) pumps it. The composer is hidden meanwhile,
+  and a `send_to_session` steer goes as a follow-up (its result says so).
   Host offline → `waiting_host`; uncertain replies/child exits while delivering
   → `failed` with `mayHaveBeenSent`, never independently resent. Anything that
   stops an entry before its native write (an error before the claim, omp exiting
@@ -1120,7 +1316,13 @@ during the wait.
   settled ids prevent late ACKs from resurrecting delivered entries. States:
   Sending (browser, locked while its first-leg command may be in flight),
   Waiting to send / Waiting for <host> (Delete), Delivering (locked),
-  Not sent (Delete). The delivery mode is a read-only label. Delete
+  Not sent (Retry, Delete). Retry (`retryHeldMessage`) holds a new entry with the same text, images, uploads and
+  mode and `replaces: <failed id>`, persisted in IndexedDB and sent with `outbox_add`. The server retires a failed
+  original of the same session in the transaction that stores the copy, and the worker (or `sw.js`) deletes the
+  browser's row of it in the commit that deletes the stored copy; a refused copy leaves it. The `outboxStored` it
+  posts carries `replaces`, and the hook marks that original represented at once. Retry holds no copy while one
+  naming the id waits in IndexedDB (true after a remount, a reload or a closed page) or once one was stored, and
+  never sends `outbox_remove`. A `mayHaveBeenSent` entry asks first. The delivery mode is a read-only label. Delete
   (`deleteHeldMessage`) awaits the IndexedDB delete commit for a browser-held
   entry; a server entry sends `outbox_remove`, refused with 409
   `outbox_dispatched` once delivering. A late commit consumes only the original
@@ -1155,6 +1357,17 @@ during the wait.
   no gap. A follow-up or steer becomes omp's queue chip. Stream connections
   opened for held messages (`connectEvents(sid, "connected")`) talk to omp only
   after `connected`, since any command would start a wrapper.
+
+### GitHub agent tools (lib/github/, docs/specs/2026-11-13-github-watch-tool-design.md)
+- **Server login only.** Every GitHub call uses the web server's `gh` login. The runner pins API requests to `github.com`, removes `GH_TOKEN` and `GITHUB_TOKEN` from its child environment, and uses `createChildProcessEnvironment` to exclude omp-web's secrets. omp-web never reads, stores or forwards a GitHub token. Missing or logged-out `gh` returns a tool error naming the required installation or login step.
+- **Updates are metadata only.** A watch update is a `prompt`-mode outbox entry that names `OWNER/REPO#N` and the URL, and carries metadata: logins and author association, ids, URLs, review states, comment counts, thread line numbers, and CI counts by conclusion. Check names and thread file paths are left out: whoever writes the branch, a fork included, names them. `capName` (one line, no `\p{C}`, 100 characters) is only for the path in a resolve confirm, which the user reads. Pending (draft) reviews and their inline comments are left out of snapshots, so the submitted review arrives as new. Only `github_read` (`readItem`) returns GitHub-written prose, such as bodies and titles.
+- **Crash idempotency.** `claimPending` atomically checks the watch's UUID registration, base cursor, pending state and posting fences before persisting deterministic bounded batches. Batch ids include the registration identity. Progress and final cursor commits are fenced by registration, pending identity and expected batch index; a restart replays the same batch id, which the outbox collapses. Final updates remove the watch only after every batch completes. Retryable delivery failures and unexpected 413s retain pending work; a 404 ends the session's watches, while other permanent refusals are logged and consumed according to `deliveryOf`.
+- **Own posts.** `recordPosted` stores exact comment and associated review identities, including `review:<databaseId>` aliases for REST replies. Snapshots suppress only those identities, preserving other comments and reviews from the same account. A shared expiring posting lease spans the write and identity recording; pending claims also check the lease and recorded identities. An uncertain write is neither retried nor inferred successful from matching login/body. A crash after GitHub accepts a post but before its identity is recorded can still produce one metadata-only update.
+- **Confirmations.** Reads from a local session never ask. A remote session's read, watch, unwatch and comment (on its `target`), and resolve (on the thread's item), ask once per session and repository (`hasReadGrant`/`grantRead`) unless that host's `allowAgentStart` is on. Writes (`github_comment`, `github_resolve_thread`) ask every time, from any host, unless `githubWritesUnasked` is on. omp's `host_tool_cancel` aborts the server call's `AgentToolContext.signal` (`serverToolCalls` in rpc-manager); a write checks it after its confirm, right before posting. The host rule (`startsUnasked`) lives in the leaf `lib/agent-tool-hosts.ts`; rpc-manager builds the GitHub ops with `createGithubToolOps(listHosts)`. A `PRRT_` reply and `github_resolve_thread` first look the thread up (`fetchThread`): a reply whose thread is on another item than `target` is refused, and a resolve's confirm names `OWNER/REPO#N path:line` and, from a remote session, needs that repository's read grant.
+- **Replay after a restart.** `rpc-manager.ts` has two replay guards. The host-owned callback guard (`hostOwnedLifecycle` with `deliveredCallbacks`) runs again only `list_sessions` and `GITHUB_REPLAY_SAFE_TOOLS` (`watch_github`, `unwatch_github`, `github_read`). The agent-tool branch of `host_tool_call` (ahead of `answerServerAgentTool`) also runs `new_session` again while Agent tools is enabled. `github_comment` and `github_resolve_thread` never run again on either: they answer the unknown-outcome error (`unknownOutcome`), which for GitHub tools says to check with `github_read` (comments or threads) before retrying, because the post may already have happened.
+- **Limits.** At most 20 watches per session (`MAX_WATCHES_PER_SESSION`). A poll cycle is 60 s, or 1.5 s per distinct watched item past 40 items (`ITEM_SPACING_MS`), with all watched items (across all sessions, one entry per item) spread across it. A snapshot costs about 1 GraphQL point, so the poller spends at most about 2400 of the login's 5000 points an hour, shared with the user's own `gh`. Each snapshot reads `rateLimit { remaining resetAt }`; below 200 points left (`BUDGET_FLOOR`) polling waits for the reset and logs once.
+- **CI is reported once per head.** A head's result is sent once, when its checks visible at that poll have all completed. Workflows that start later on the same head (chained `workflow_run`) and re-runs of that head are not reported.
+- **Agent tools off pauses watches.** The poller checks `agentToolsEnabled` each cycle. With **Agent tools** off, polling stops and watches are kept; turning it back on resumes from the stored cursors, so what happened meanwhile is delivered then.
 
 ### Live event stream: one socket per browser (`/api/events`)
 - Browsers cap HTTP/1.1 at **6 connections per host across all tabs**, and an
@@ -1295,7 +1508,7 @@ during the wait.
   non-collapsible default (`collapsible` prop) for SSR tests.
 
 ### Side questions (`/btw`, `lib/btw.ts`, `hooks/useBtw.ts`, `components/BtwPanel.tsx`)
-- `btw` / `btw_cancel` / `get_btw_history` are passthrough RPC commands;
+- `btw` / `btw_cancel` / `get_btw_history` are passthrough channel commands;
   answers stream as `btw_delta` (text appended to the latest turn) and
   `btw_record` (full snapshot per lifecycle change) frames. omp persists the
   history per session (and re-reads it from disk when idle), so the TUI and
@@ -1347,19 +1560,19 @@ during the wait.
 - **Roster hydration**: `get_subagents` snapshots (which carry progress)
   rehydrate the roster after SSE reconnect (`refreshSubagentRoster`, wired
   into mount, send, and the reconcile poll). Terminal subagents vanish from
-  the RPC registry — history fills that gap.
+  the live registry — history fills that gap.
 - **On-disk history** (`lib/subagent-history.ts`, `/api/sessions/[id]/subagents*`):
   omp persists each subagent's transcript to the parent session's sibling
   artifacts dir (`<session-dir>/<subagent-id>.jsonl`) and the parent file's
   task toolResults keep `progress[]`/`results[]` snapshots. omp-web recovers
   the roster from disk (`extractSubagentHistory`, result fields win over the
   mid-run snapshot), so past/finished runs show in the composer panel after a
-  reload. The transcript route pages the sibling file byte-wise (mirroring
-  `get_subagent_messages`, which is RPC-registry-gated and refuses files it
-  doesn't know). The dialog reads only the final output — `<id>.md` via
-  `?mode=completion` (bounded tail read that also works for transcripts
-  beyond the 16MB paging cap) with a live `get_subagents` snapshot fallback
-  for header enrichment; it never pages the raw transcript. Subagent ids are
+  reload. The host-backed transcript route pages the sibling file byte-wise
+  without waiting for a live process. The dialog reads final output from
+  `<id>.md` via `?mode=completion` (a bounded tail read that also works for
+  transcripts beyond the 16MB paging cap), uses a live `get_subagents`
+  snapshot only for header enrichment, and pages the raw transcript through
+  that route when the user opens it. Subagent ids are
   `[A-Za-z0-9_-]+` segments joined by `.`, because omp names a nested spawn
   `Parent.Child` (`SUBAGENT_ID_RE` in `lib/subagent-types.ts`, which also
   keeps `/`, `\` and `..` out of the joined path). The transcript route caps
@@ -1545,9 +1758,10 @@ during the wait.
 - The MCP settings live in their own Settings tab (`SettingsTabs` id `"mcp"`,
   workspace-gated). Server list rows show a config-derived status dot
   (valid+enabled / disabled / invalid) — no live-connectivity probe exists in
-  the RPC protocol, so failures surface as toasts (`toast.error`) from the
+  the channel protocol, so failures surface as toasts (`toast.error`) from the
   editor actions, not inline text.
 - The endpoint is guarded by the same allowed-root rules as `/api/files`.
+- `GET /api/mcp?sessionId=…&attach=1` returns the live status of a session this server already has running (a remote one included), and otherwise answers `liveError: "The session is not running"` instead of starting one (a cluster session on another member is read where it runs; `McpConfig liveOnly` shows it read-only).
 
 ### Plugins and skills
 - `/api/plugins` shells out to the user's `omp plugin` CLI (`list/install/uninstall/enable/disable/upgrade`, `--json` where available) — never the Bun-only SDK.
@@ -1555,16 +1769,18 @@ during the wait.
 - Skill toggling edits only the `disable-model-invocation` frontmatter key on the target `SKILL.md`; keep that surgical so user formatting survives. omp reports it back as `hide` (it reads `hide`/`disableModelInvocation`/`disable-model-invocation`). Frontmatter is omp's only per-skill "hide from model, keep `/skill:`" knob; `disabledExtensions: ["skill:<name>"]` removes the skill entirely.
 - Only user-owned skills are togglable: `getSkillToggleRoots()` (allowed file roots — workspaces the user opened — plus replica scan roots) is the single allowlist for both PATCH and the `togglable` flag GET returns; it is `main`'s pre-CLI allowlist, unchanged. Skills omp lists from anywhere else (the plugin cache, registry installs, custom directories outside a workspace) render a disabled toggle — their files belong to an installer and an update would discard the edit. Never widen PATCH to whatever omp lists.
 - `/api/skills/install` shells through `npx skills add ... --agent universal`, which installs into the ecosystem-standard `.agents/skills` dirs omp reads; project installs run with the selected cwd.
+- `GET /api/plugins`, `POST /api/plugins`, `GET /api/skills`, `POST /api/skills/check` and `POST /api/skills/update` take no `cwd` for the user level (`loadUserSkillsWithInstallInfo`; omp runs in the agent directory, `ensureAgentDir`; the replica scan reads the user roots only, before names are deduplicated, so an agent directory below a project keeps its user skills). The GET routes have no project scope; a project-scope `POST /api/plugins` or `/api/skills/check` without a `cwd` answers 400 `cwd_required`, and `/api/skills/update` answers 400 `cwd_package_scope_required`. Settings uses this for a cluster session on another member, whose project is not on this machine.
 
 ### Updates: web server versus host software
-- **Settings → System** owns the web server's settings and application update. `GET /api/app-update` and its prepare/commit flow remain web-server-only; a compiled web server still links to the release download page.
-- **Settings → Hosts** owns each machine's ompweb daemon and OMP runtime, including **This machine**. `GET /api/hosts/[id]/updates` checks on that daemon; `POST {target, version}` starts its update. Offline and older daemons return explicit failures, never fall back to checking or updating the web server.
-- The hub supplies its supported protocol range to `checkUpdates`/`updateSoftware` host ops. Both the hub and the daemon reject an unknown or incompatible candidate protocol before installing ompweb. The update stays visible with a blocked reason. OMP runtime updates do not change the link protocol.
-- A daemon update is refused while it owns session processes (subagents included); the daemon also refuses new spawns while an update is running. Check completion through the durable operation state after reconnect, not the POST's acceptance alone. An OMP update leaves already-running sessions on their loaded runtime.
-- `/api/omp-update` remains an explicit server-side maintenance API for existing callers. The settings UI and AppShell no longer use it as a global update control or send a server-wide session restart after a host update.
+- **Settings → System** prepares and reviews a durable server-and-host upgrade plan, including owned compiled releases. `POST /api/app-update {action:"prepare"}` returns the plan; commit requires `{action:"commit",attemptId,approval:{planId,force}}`. Approval is bound to release identity and the registered-host/session snapshot. An incompatible host without a verified recovery path blocks server cutover.
+- **Settings → Hosts** manages individual daemons, including **This machine**; omp updates with ompweb. Normal `POST {target:"ompweb",version}` does not interrupt activity. `force:true` requires distinct GUI confirmation and may end sessions/subagents. Machine-readable `canForceUpdate` and blockers govern the action, never English message parsing. Force does not waive integrity, ownership, process identity, disabled updates, local drains or service permissions.
+- **Recovery plane.** Modern candidates may acknowledge an approved future server protocol through an operation-bound preflight nonce and maintenance receipt. Legacy recovery admits only a fixed bootstrap on one operation-bound runner channel, never general old application traffic. Windows uses native process/service/task handling. Old daemons copy only `update-worker.ts`; its startup must work without sibling modules and load shared lifecycle code from verified sources before replacing an install.
+- **Completion and rollback.** `upgrade-plan.ts`, `self-update.ts` and `server-update-worker.ts` persist progress; POST acceptance and shell output are not success. Verify the expected release, live process identity and operation/boot receipt after reconnect. Retain the prior install until healthy, and report partial recovery explicitly. See `docs/superpowers/specs/2026-11-14-coordinated-gui-upgrades-design.md` when changing upgrade or bootstrap contracts.
+- `/api/omp-update` keeps only `restart`, an explicit server-side maintenance API for existing callers. The settings UI and AppShell no longer use it as a global update control or send a server-wide session restart after a host update.
 
 ### Auth and model config
-- Auth flows go through RPC commands (`get_login_providers`, `login`, `get_logout_accounts`, `logout`) against the omp child process; credentials live in omp's `agent.db` (SQLite) which omp-web never touches directly. `/api/auth/accounts/[provider]` lists stored accounts and removes one by `credentialId`; omp without those commands reports `supported: false` and the UI falls back to the read-only `omp usage` account list.
+- Auth flows go through `ompweb-omp` commands (`get_login_providers`, `login`, `get_logout_accounts`, `logout`) against the omp child process; credentials live in omp's `agent.db` (SQLite) which omp-web never touches directly. `/api/auth/accounts/[provider]` lists stored accounts and removes one by `credentialId`; omp without those commands reports `supported: false` and the UI falls back to the read-only `omp usage` account list.
+- Linked hosts with `shareCredentials` read this machine's credentials through `lib/omp/auth-broker.ts`, the `omp auth-broker serve` child (the token comes from `omp auth-broker token` and stays in the server process; a refused token stops the child and the next request starts a new one). The broker reloads the store on every snapshot, so a login or logout in Settings reaches every omp process a sharing host starts afterwards; a running process picks it up the next time it is used (omp stops listening for updates after 20 seconds without activity and resumes on its next use) and keeps the access tokens and API keys it has already loaded until it ends.
 - The Models panel reads and writes `models.yml` in the omp agent directory (`~/.omp/agent/models.yml`, `.yaml` fallback).
 - API-key status endpoints must never return the raw key.
 
@@ -1600,7 +1816,7 @@ during the wait.
   the `.sidebar-shell` container query (the keyboard shortcuts still work).
 
 ### Composer word prediction (`hooks/useWordPrediction.ts`, `components/GhostMirror.tsx`)
-- Ghost text comes from omp's `predict_word` RPC (engine = omp's
+- Ghost text comes from omp's `predict_word` command (engine = omp's
   `spelling.autocomplete` setting; omp applies the prose gates). Tab or →
   accepts; accept/typed-past outcomes go back as `predict_word_feedback`.
 - Keystroke predictions never spawn or replace an omp child: the agent route
@@ -1797,6 +2013,9 @@ during the wait.
   activity is wrapped in `subagent_*` frames and never notifies. "Completed"
   fires on `session_settled` (not `prompt_result`), so background work started
   by the prompt is done too; a failed or aborted last prompt suppresses it.
+  On a shared daemon channel the other servers get that prompt's outcome as
+  `peer_prompt_outcome` (no command id), which only feeds their detector, so the
+  elected notifier hears a failure whichever server prompted.
   Auto-approved tool confirmations return before the hook and never notify.
   omp sends `retry_fallback_applied` before the `auto_retry_start` of the same
   failure, so the detector holds a reason-less fallback until that frame.

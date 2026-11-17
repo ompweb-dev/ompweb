@@ -7,6 +7,7 @@ import { attachUploads, forgetUploads, takeUploads, type OutboxUploadReceipt } f
 import { runOutboxCommand } from "@/lib/message-outbox";
 import { readClientMessageIds } from "@/lib/client-message-ids";
 import { reconcileOutboxHandoffs } from "@/lib/outbox-handoff";
+import type { MessageOrigin } from "@/lib/message-origin";
 
 // Commands that ride whatever child is alive and never spawn or replace one:
 // keystroke predictions, and the side-question reads/cancel omp-web sends in
@@ -19,13 +20,6 @@ export const NO_SPAWN_REPLIES: Record<string, unknown> = {
   get_btw_history: { records: [] },
   btw_cancel: { cancelled: false },
 };
-
-// Live diagnostics of a skill-resolving omp. A saved or exited session has none,
-// and resuming a full child (MCP, LSP) just to answer a read-only inspection or
-// flip one setting is not what the click asked for: with no live wrapper these
-// answer 409 instead of starting omp, and a live idle child is never replaced
-// because the advisor flag differs.
-const LIVE_SESSION_ONLY = new Set(["get_skill_diagnostics", "set_skill_startup_diagnostics"]);
 
 /** omp-web's own failures carry a stable code the client can localize; omp's
  * errors stay opaque English text. */
@@ -59,7 +53,7 @@ function sendFences(): Map<string, Promise<void>> {
  * the browser socket. `owner`: the caller's web session (lib/web-auth.ts
  * `requestOwner`), whose uploads a prompt may attach. Never throws: failures
  * become `commandErrorResponse`. */
-export async function runAgentCommand(id: string, body: unknown, advisor: boolean, owner: string, trustedUploads?: OutboxUploadReceipt[]): Promise<Response> {
+export async function runAgentCommand(id: string, body: unknown, advisor: boolean, owner: string, trustedUploads?: OutboxUploadReceipt[], trustedOrigin?: MessageOrigin): Promise<Response> {
   let release = () => {}; // frees this command's send fence; idempotent
   try {
     const command = body as { type?: unknown; [key: string]: unknown } | null;
@@ -67,6 +61,9 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
       return Response.json({ error: "command type is required", code: "command_type_required" }, { status: 400 });
     }
     const type = command.type;
+    if (command.origin !== undefined) {
+      return Response.json({ error: "Message origin is server-owned.", code: "origin_not_allowed" }, { status: 400 });
+    }
     // Held messages: stored and answered here; the outbox's dispatcher sends them to omp (lib/message-outbox.ts).
     if (type === "outbox_add" || type === "outbox_remove" || type === "outbox_scope") return await runOutboxCommand(id, command, advisor, owner);
     if (type === "get_client_message_status") {
@@ -91,12 +88,13 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
     }
     if (prior) await prior;
     const send = async (session: AgentSessionWrapper) => {
-      if (!uploads) return session.send(command);
+      const options = trustedOrigin ? { origin: trustedOrigin } : undefined;
+      if (!uploads) return session.send(command, options);
       return session.withPendingCommand(async () => {
         let sending: Promise<unknown>;
         try {
           await attachUploads(uploads.ids, owner, session, command, uploads.receipts);
-          sending = session.send(command);
+          sending = session.send(command, options);
         } finally {
           release();
         }
@@ -114,9 +112,8 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
     let resumeId = id;
     let resumeHost: AgentSessionWrapper["host"] | undefined;
     const noSpawn = Object.hasOwn(NO_SPAWN_REPLIES, type);
-    const liveOnly = LIVE_SESSION_ONLY.has(type);
     if (existing?.isAlive()) {
-      if (noSpawn || liveOnly || (existing.adopted && !existing.hostOwnedLifecycle)
+      if (noSpawn || (existing.adopted && !existing.hostOwnedLifecycle)
         || existing.advisorSpawned === (advisor === true || existing.launchAdvisor === true) || existing.isRunning() || existing.isEditingHistory()) {
         const result = await send(existing);
         return Response.json({ success: true, data: result });
@@ -129,12 +126,6 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
       if (!existing.hostOwnedLifecycle) await existing.destroyAndWait("advisor", true);
     }
     if (noSpawn) return Response.json({ success: true, data: NO_SPAWN_REPLIES[type] });
-    if (liveOnly) {
-      return Response.json(
-        { error: "Skill diagnostics require a running session", code: "skill_diagnostics_unavailable" },
-        { status: 409 },
-      );
-    }
 
     const resolved = resumeHost ? { host: resumeHost } : await resolveSessionHostOr404(resumeId);
     if ("response" in resolved) return resolved.response;

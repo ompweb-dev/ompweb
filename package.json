@@ -1,14 +1,14 @@
 {
   "name": "@kahme247/ompweb",
-  "version": "0.6.0",
+  "version": "0.7.2",
   "description": "Web UI for the oh-my-pi (omp) coding agent",
-  "homepage": "https://github.com/kahme247/ompweb#readme",
+  "homepage": "https://github.com/ompweb-dev/ompweb#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kahme247/ompweb.git"
+    "url": "git+https://github.com/ompweb-dev/ompweb.git"
   },
   "bugs": {
-    "url": "https://github.com/kahme247/ompweb/issues"
+    "url": "https://github.com/ompweb-dev/ompweb/issues"
   },
   "license": "MIT",
   "engines": {
@@ -43,7 +43,7 @@
     "build:binary": "npm run build && bun scripts/build-binary.ts",
     "start": "bun server/main.ts -H 127.0.0.1 -p 30177",
     "start:lan": "bun server/main.ts -H 0.0.0.0 -p 30177",
-    "test": "bun test --parallel --timeout 30000",
+    "test": "bun test --parallel --timeout 30000 ./app ./bin ./components ./hooks ./lib ./scripts ./server ./tests",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "tray:install": "node bin/omp-web-tray.js --install",

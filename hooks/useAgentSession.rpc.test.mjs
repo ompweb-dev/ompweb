@@ -106,6 +106,34 @@ class FakeSharedWorker {
             this.port.onmessage?.({ data: { outboxDropped: message.n, ...(error ? { error } : {}) } });
           };
           if (world.outboxDrop) world.outboxDrop(commit);
+        } else if (message.op === "outbox_reconcile") {
+          world.outboxReconciles.push({ sessionId: message.sessionId, confirmedIds: message.confirmedIds });
+          const commit = (error) => {
+            if (!error) {
+              const entries = world.outbox;
+              const confirmed = new Set(message.confirmedIds);
+              const removed = new Set();
+              const sameIntent = (a, b) => a.sessionId === b.sessionId && a.mode === b.mode && a.message === b.message
+                && JSON.stringify(a.images ?? []) === JSON.stringify(b.images ?? [])
+                && JSON.stringify(a.uploads ?? []) === JSON.stringify(b.uploads ?? []);
+              for (const entry of entries) {
+                if (entry.sessionId !== message.sessionId || !confirmed.has(entry.id)) continue;
+                removed.add(entry.id);
+                if (!entry.replaces) continue;
+                const root = entries.find((candidate) => candidate.id === entry.replaces && candidate.sessionId === message.sessionId);
+                if (!root || root.state !== "failed" || !sameIntent(root, entry)) continue;
+                removed.add(root.id);
+                for (const sibling of entries) {
+                  if (sibling.sessionId === message.sessionId && sibling.state === "failed" && sameIntent(sibling, entry)
+                    && (sibling.id === root.id || sibling.replaces === root.id)) removed.add(sibling.id);
+                }
+              }
+              world.outbox = entries.filter((entry) => !removed.has(entry.id));
+              this.port.onmessage?.({ data: { outbox: world.outbox.map((entry) => ({ ...entry, state: entry.state ?? "sending" })) } });
+            }
+            this.port.onmessage?.({ data: { outboxReconciled: message.n, ...(error ? { error } : {}) } });
+          };
+          if (world.outboxReconcile) world.outboxReconcile(message, commit);
           else commit();
         }
       },
@@ -156,7 +184,7 @@ function safeParse(text) {
 }
 
 function jsonResponse(status, value) {
-  return { ok: status >= 200 && status < 300, status, json: async () => value };
+  return { ok: status >= 200 && status < 300, status, headers: new Headers(), json: async () => value };
 }
 
 // Backend snapshot the router serves. Tests mutate these between phases.
@@ -175,11 +203,13 @@ const world = {
   wrappers: new Map(),
   nativeHistories: new Map(), // isolated, parent-linked native history fixtures
   btwHistory: new Map(), // sid -> BtwRecord[] served by get_btw_history
+  respond: null, // Optional test-owned HTTP boundary; the real components still consume its DTOs.
   clientMessageStatuses: new Map(), // sid -> explicit native selective-read result, never reconstructed from submitted text
   outbox: [], // held entries the fake dispatcher has not sent yet
   outboxHold: false,
   outboxCommit: null, // a test may hold the worker's durable-commit acknowledgement
-  outboxDrop: null,
+  outboxReconcile: null,
+  outboxReconciles: [],
 };
 
 async function fetchStub(url, init = {}) {
@@ -195,6 +225,8 @@ async function fetchStub(url, init = {}) {
       return jsonResponse(status, value);
     }
   }
+  const response = world.respond?.(method, u, body, init);
+  if (response) return await response;
 
   let m;
   if ((m = u.match(/\/api\/sessions\/([^/?#]+)\/state/))) {
@@ -289,9 +321,11 @@ const overrides = [
   [globalThis, "SharedWorker", { value: FakeSharedWorker }],
   [globalThis, "fetch", { value: fetchStub }],
   [globalThis, "ResizeObserver", { value: class { observe() {} disconnect() {} } }],
+  [globalThis, "CSS", { value: globalThis.CSS ?? { escape: (value) => value } }], // Existing TabBar test shim; fixture IDs contain no CSS escapes.
   [window.HTMLElement.prototype, "scrollIntoView", { value() {} }],
   [document, "hidden", { get: () => visibilityState === "hidden" }],
   [document, "visibilityState", { get: () => visibilityState }],
+  [document, "fonts", { value: new window.EventTarget() }],
   [window, "matchMedia", {
     value: (media) => Object.assign(new window.EventTarget(), { matches: false, media }),
   }],
@@ -355,8 +389,13 @@ afterEach(async () => {
   }
 });
 
-// The hook chain includes components/ui/toast.tsx, whose DOM toasts must never fire in tests.
-mock.module("@/components/ui/toast", () => import("./__fixtures__/toast-stub.mjs"));
+// Replace only the imperative notification boundary. AppShell's transitive
+// notification UI keeps the real provider, descriptions, gestures and icons.
+const realToastExports = { ...await import("@/components/ui/toast") };
+const { toast: testToast, toastCalls: testToastCalls } = await import("./__fixtures__/toast-stub.mjs");
+mock.module("@/components/ui/toast", () => ({
+  ...realToastExports, toast: testToast, default: testToast,
+}));
 const { useAgentSession } = await import("../hooks/useAgentSession.ts");
 const { selectSessionHistory } = await import("@/lib/session-sync");
 const { publishSessionsChanged } = await import("@/lib/session-change-bus");
@@ -374,11 +413,13 @@ const onlineHost = {
   autoApproveExtension: () => false,
 };
 const { isUnknownSlashCommand, slashCommandName, runHostTool } = await import("@/hooks/useAgentSession-stream");
-const { toastCalls } = await import("@/components/ui/toast");
+const toastCalls = testToastCalls;
 const { MessageView } = await import("@/components/MessageView");
 const { translate } = await import("@/lib/i18n");
 const { ChatWindow } = await import("@/components/ChatWindow");
-const { SESSION_EDIT_COMMAND, SESSION_EDIT_RESPONSE_PREFIX } = await import("@/lib/omp/session-edit-extension.mjs");
+const { SessionSidebar } = await import("@/components/SessionSidebar");
+const { AppShell } = await import("@/components/AppShell");
+const { FileExplorer } = await import("@/components/FileExplorer");
 // Edit only opens a confirm dialog; the edit starts from its confirm button.
 async function confirmEdit(view, button) {
   await act(async () => { fireEvent.click(button); });
@@ -462,11 +503,57 @@ function resetWorld() {
   world.btwHistory.clear();
   world.clientMessageStatuses.clear();
   world.abortRestoreQueue = null;
+  world.respond = null;
   world.outbox.length = 0;
   world.outboxHold = false;
   world.outboxCommit = null;
   world.outboxDrop = null;
+  world.outboxReconcile = null;
+  world.outboxReconciles.length = 0;
   workerPort?.onmessage?.({ data: { outbox: [] } });
+}
+
+function servePooledWorkspace() {
+  const sessions = [
+    { ...sessionInfo("worker-one"), name: "Worker one conversation", cwd: "/shared", projectRoot: "/shared", hostId: "h1", poolId: "workers", projectId: "app", projectKey: "pool:workers:app" },
+    { ...sessionInfo("worker-two"), name: "Worker two conversation", cwd: "/shared", projectRoot: "/shared", hostId: "h2", poolId: "workers", projectId: "app", projectKey: "pool:workers:app" },
+    { ...sessionInfo("legacy"), name: "Worker legacy conversation", cwd: "/legacy", projectRoot: "/legacy", hostId: "h1" },
+    { ...sessionInfo("mac"), name: "Mac conversation", cwd: "/shared", projectRoot: "/shared", hostId: "local" },
+  ];
+  const projects = [
+    { path: "/shared", hostId: "h1", poolId: "workers", projectId: "app", projectKey: "pool:workers:app", name: "Pool app", origin: "git@example.invalid:app.git" },
+    { path: "/legacy", hostId: "h1", alias: "Worker legacy project" },
+    { path: "/shared", hostId: "local", alias: "Mac project" },
+  ];
+  const hosts = [
+    { id: "local", label: "Mac", status: "online", ompVersion: "18.4.4", ompwebVersion: "0.6.0", platform: "darwin", lastSeenAt: null, hostVersion: 2, serverVersion: 2, serverPlatform: "darwin", daemonManaged: false },
+    ...["h1", "h2"].map((id, index) => ({ id, label: `Worker ${index + 1}`, status: "online", ompVersion: "18.4.4", ompwebVersion: "0.6.0", platform: "linux", lastSeenAt: "2026-11-10T00:00:00.000Z", allowAgentStart: true, hostVersion: 2, serverVersion: 2 })),
+  ];
+  const pools = [{
+    id: "workers", label: "Worker pool", enabled: true,
+    members: ["h1", "h2"].map((hostId) => ({ hostId, projectsRoot: "/projects", provisioned: true, draining: false })),
+    projects: [{ id: "app", name: "Pool app", origin: "git@example.invalid:app.git", clonePaths: { h1: "/shared", h2: "/shared" }, addedAt: "2026-11-10T00:00:00.000Z" }],
+  }];
+  for (const session of sessions) primeSession(session.id, [userMsg(`${session.id}-u`, `Question for ${session.name}`)]);
+  world.respond = (method, raw) => {
+    if (method !== "GET") return null;
+    const url = new URL(raw, "https://omp.test");
+    if (url.pathname === "/api/sessions") return jsonResponse(200, { sessions, runningSessionIds: [], runningSessions: [] });
+    if (url.pathname === "/api/projects") return jsonResponse(200, { projects });
+    if (url.pathname === "/api/hosts") return jsonResponse(200, { hosts, pools });
+    if (url.pathname === "/api/worktrees") return jsonResponse(200, { isGit: false, isTopLevel: false, worktrees: [] });
+    if (url.pathname.startsWith("/api/git/")) return jsonResponse(200, url.pathname.endsWith("/status") ? { isGitRepository: false, repositoryRoot: null, files: [] } : { supported: false });
+    if (url.pathname.startsWith("/api/files/")) {
+      const owner = url.searchParams.get("sessionId");
+      if (url.searchParams.get("type") === "list") return jsonResponse(200, { entries: [{ name: owner === "worker-one" ? "owner-only.txt" : "central-decoy.txt", isDir: false, size: 12 }] });
+      const content = owner === "worker-one" ? "FIRST OWNER CONTENT" : owner === "worker-two" ? "SECOND OWNER CONTENT" : "CENTRAL DECOY CONTENT";
+      return jsonResponse(200, { content, language: "text", size: content.length });
+    }
+    if (url.pathname === "/api/file-index") return jsonResponse(200, { matches: url.searchParams.get("sessionId") === "worker-one" ? [{ path: "worker-search-result.txt", isDir: false }] : [], truncated: false });
+    return null;
+  };
+  localStorage.setItem("omp-web:expanded-projects", JSON.stringify(["pool:workers:app", "h1:/legacy", "/shared"]));
+  return { sessions, projects, hosts, pools };
 }
 
 function primeSession(sid, messages) {
@@ -1211,8 +1298,8 @@ test("an answered dialog handoff cannot clear the next unanswered request", asyn
   resetWorld();
   primeSession("dialog-handoff", [userMsg("u0", "q")]);
   const { w, es } = await startRun("dialog-handoff", "ask me");
-  const first = { type: "extension_ui_request", id: "first", method: "editor", title: "First question" };
-  const next = { ...first, id: "next", title: "Next question" };
+  const first = { type: "ui_request", id: 1, method: "editor", args: ["First question"] };
+  const next = { ...first, id: 2, args: ["Next question"] };
   await act(() => es.emit(first));
   await settle(300);
   assert.equal(w.latest.extensionDialog?.id, first.id, "unanswered requests have no clear timer");
@@ -1220,11 +1307,11 @@ test("an answered dialog handoff cannot clear the next unanswered request", asyn
   let release;
   const acknowledgement = new Promise((resolve) => { release = resolve; });
   world.holds.push({
-    match: (method, _url, body) => method === "POST" && body?.type === "extension_ui_response",
+    match: (method, _url, body) => method === "POST" && body?.type === "ui_response",
     produce: () => acknowledgement,
   });
   let response;
-  await act(async () => { response = w.latest.respondToExtensionUi(first, { value: "My answer" }); });
+  await act(async () => { response = w.latest.respondToExtensionUi(first, "My answer"); });
   await act(() => es.emit(next));
   await act(async () => {
     release({ value: { success: true, data: {} } });
@@ -1240,26 +1327,70 @@ for (const failure of ["HTTP rejection", "connection failure"]) {
     const sid = `answer-failure-${failure}`;
     primeSession(sid, [userMsg("u0", "q")]);
     const { w, es } = await startRun(sid, "ask");
-    const request = { type: "extension_ui_request", id: "retry-answer", method: "editor", title: "Answer" };
+    const request = { type: "ui_request", id: 5, method: "editor", args: ["Answer"] };
     await act(() => es.emit(request));
     world.holds.push({
-      match: (method, _url, body) => method === "POST" && body?.type === "extension_ui_response",
+      match: (method, _url, body) => method === "POST" && body?.type === "ui_response",
       produce: async () => {
         if (failure === "connection failure") throw new Error("connection lost");
         return { status: 500, value: { error: "answer delivery failed" } };
       },
     });
-    await act(async () => { await w.latest.respondToExtensionUi(request, { value: "my retained answer" }); });
+    await act(async () => { await w.latest.respondToExtensionUi(request, "my retained answer"); });
     await settle(300);
     assert.equal(w.latest.extensionDialog?.id, request.id, "failure must not unmount and erase the answer");
     assert.equal(w.latest.notices.at(-1)?.type, "error");
     await act(() => es.emit({ ...request }));
     assert.equal(w.latest.extensionDialog?.id, request.id);
-    await act(async () => { await w.latest.respondToExtensionUi(request, { value: "my retained answer" }); });
+    await act(async () => { await w.latest.respondToExtensionUi(request, "my retained answer"); });
     await settle(300);
     assert.equal(w.latest.extensionDialog, null, "a successful retry closes the answered question");
   });
 }
+
+test("dialog answers go out as ui_response with omp's value; a cancel carries none", async () => {
+  resetWorld();
+  primeSession("ui-answers", [userMsg("u0", "q")]);
+  const { w, es } = await startRun("ui-answers", "ask");
+  const confirm = { type: "ui_request", id: 8, method: "confirm", args: ["Keep going?", ""] };
+  await act(() => es.emit(confirm));
+  await act(async () => { await w.latest.respondToExtensionUi(confirm, true); });
+  await act(async () => { await w.latest.respondToExtensionUi(confirm, undefined); });
+  const sent = world.calls.filter((c) => c.body?.type === "ui_response").map((c) => c.body);
+  assert.deepEqual(sent.map(({ type, id, value }) => ({ type, id, value })), [
+    { type: "ui_response", id: 8, value: true },
+    { type: "ui_response", id: 8, value: undefined },
+  ]);
+  assert.equal("value" in JSON.parse(JSON.stringify(sent[1])), false, "a cancel sends no value");
+});
+
+test("ui_end closes another tab's dialog; presentation ui frames drive notices, status, widgets and custom UI", async () => {
+  resetWorld();
+  primeSession("ui-frames", [userMsg("u0", "q")]);
+  const { w, es } = await startRun("ui-frames", "ask");
+  await act(() => es.emit({ type: "ui_request", id: 9, method: "select", args: ["Which?", ["A", "B"]] }));
+  assert.equal(w.latest.extensionDialog?.id, 9);
+  await act(() => es.emit({ type: "ui_end", id: 9 }));
+  assert.equal(w.latest.extensionDialog, null);
+
+  await act(() => {
+    es.emit({ type: "ui", method: "notify", message: "Heads up", notifyType: "warning" });
+    es.emit({ type: "ui", method: "setStatus", statusKey: "lint", statusText: "3 issues" });
+    es.emit({ type: "ui", method: "setWidget", widgetKey: "todo", widgetLines: ["one"] });
+    es.emit({ type: "ui", method: "custom", id: 4, lines: ["hello"] });
+  });
+  assert.equal(w.latest.notices.at(-1)?.message, "Heads up");
+  assert.equal(w.latest.notices.at(-1)?.type, "warning");
+  assert.deepEqual(w.latest.extensionStatuses, [{ key: "lint", text: "3 issues" }]);
+  assert.deepEqual(w.latest.extensionWidgets, [{ key: "todo", lines: ["one"], placement: "aboveEditor" }]);
+  assert.deepEqual(w.latest.extensionCustomUi?.lines, ["hello"]);
+
+  await act(async () => { await w.latest.sendExtensionCustomInput(w.latest.extensionCustomUi, "x"); });
+  const input = world.calls.find((c) => c.body?.type === "ui_input")?.body;
+  assert.deepEqual({ id: input?.id, data: input?.data }, { id: 4, data: "x" });
+  await act(() => es.emit({ type: "ui", method: "custom", id: 4, lines: [], closed: true }));
+  assert.equal(w.latest.extensionCustomUi, null);
+});
 
 test("a stale local queue action reports that its target is unavailable", async () => {
   resetWorld();
@@ -3614,7 +3745,7 @@ test("busy foreground catch-up restores missing middle messages without overwrit
   await act(async () => {
     visibilityState = "visible"; document.dispatchEvent(new Event("visibilitychange"));
     await sleep(20);
-    es.emit({ type: "extension_ui_request", id: "question", method: "confirm", title: "Keep going?" });
+    es.emit({ type: "ui_request", id: "question", method: "confirm", args: ["Keep going?", ""] });
     es.emit({ type: "message_update", message: assistantMsg("current", "newer tokens") });
     release();
   });
@@ -4095,35 +4226,27 @@ async function attachEditableWrapper(t, native, { holdHistory = false } = {}) {
   const historyFrames = [];
   const identityChanges = [];
   const ready = { type: "ready", protocolVersion: 2 };
-  let protocolNegotiated = false;
+  let readied = false;
   const emitNative = (frame) => { for (const listener of [...listeners]) listener(frame); };
   const wrapper = new AgentSessionWrapper({
     isAlive: true,
-    async waitReady() { return ready; },
-    async negotiateProtocol(frame) {
-      assert.equal(frame, ready, "the wrapper must negotiate the announced ready frame");
-      protocolNegotiated = true;
-    },
+    async waitReady() { readied = true; return ready; },
     onFrame(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     async sendCommand(command) {
-      assert.equal(protocolNegotiated, true, "commands must wait for readiness and protocol negotiation");
+      assert.equal(readied, true, "commands must wait for readiness");
       if (command.type === "get_state") return {
         sessionId: native.sessionId, sessionFile: native.filePath,
         isStreaming: world.agents.get(native.sessionId)?.state?.isStreaming ?? false,
         isCompacting: false, isSettled: true, hasPendingAsyncWork: false, queuedMessageCount: 0,
       };
-      if (command.type === "get_available_commands") return { commands: [{ name: SESSION_EDIT_COMMAND, source: "extension" }] };
-      if (command.type === "prompt" && command.message.startsWith(`/${SESSION_EDIT_COMMAND} `)) {
-        const request = JSON.parse(command.message.slice(SESSION_EDIT_COMMAND.length + 2));
-        const response = await native.command({ type: "edit_message", entryId: request.entryId });
+      if (command.type === "edit_message") {
+        const response = await native.command(command);
         const value = await response.json();
         if (native.editOutcome === "persistence-error") {
           emitNative({ type: "notice", source: "session-persistence", level: "error", message: value.error });
         }
-        emitNative({ type: "extension_ui_request", method: "notify", message: SESSION_EDIT_RESPONSE_PREFIX + JSON.stringify({
-          requestId: request.requestId, ...(response.ok ? value.data : { error: value.error }),
-        }) });
-        return { agentInvoked: false };
+        if (!response.ok) throw new Error(value.error);
+        return value.data;
       }
       if (command.type === "prompt") { await native.command(command); return { agentInvoked: true }; }
       return {};
@@ -5986,12 +6109,12 @@ test("the answering tab keeps its dialog mounted during a synchronized cancel ha
   primeSession("s1", [userMsg("u0", "q")]);
   const { w, es } = await startStreamingRun("s1");
   await act(async () => {
-    es.emit({ type: "extension_ui_request", id: "question", method: "confirm", title: "Keep going?" });
+    es.emit({ type: "ui_request", id: "question", method: "confirm", args: ["Keep going?", ""] });
   });
   assert.equal(w.latest.extensionDialog?.id, "question");
   await act(async () => {
-    const response = w.latest.respondToExtensionUi(w.latest.extensionDialog, { confirmed: true });
-    es.emit({ type: "extension_ui_request", id: "cancel:question", method: "cancel", targetId: "question" });
+    const response = w.latest.respondToExtensionUi(w.latest.extensionDialog, true);
+    es.emit({ type: "ui_end", id: "question" });
     await response;
   });
   assert.equal(w.latest.extensionDialog?.id, "question", "the local hand-off window must survive its own synchronized cancel");
@@ -6121,275 +6244,6 @@ test("overlapping Stops share one atomic withdrawal; an image-only entry does no
   assert.equal(world.calls.filter((c) => c.body?.type === "abort_and_restore_queue").length, 1);
   assert.equal(getDraft("abort-atomic-twice")?.value, "words");
   clearDraft("abort-atomic-twice");
-});
-
-function skillDiagnosticsSnapshot(showStartupDiagnostics, name = "review") {
-  return {
-    cwd: "/workspace",
-    showStartupDiagnostics,
-    diagnostics: [{
-      name,
-      reason: "source-order",
-      skills: [
-        { name, filePath: `/workspace/.agents/skills/${name}/SKILL.md`, source: "project" },
-        { name, filePath: `/home/me/.agents/skills/${name}/SKILL.md`, source: "user", pluginName: "shared" },
-      ],
-      duplicates: [{
-        skill: { name, filePath: `/mirror/.agents/skills/${name}/SKILL.md`, source: "custom" },
-        retained: { name, filePath: `/workspace/.agents/skills/${name}/SKILL.md`, source: "project" },
-      }],
-    }],
-  };
-}
-
-test("skill diagnostics hydrate from state and follow defensive live updates", async () => {
-  resetWorld();
-  primeSession("skill-state", [userMsg("u0", "q")]);
-  const initial = skillDiagnosticsSnapshot(true);
-  world.agents.set("skill-state", {
-    running: true,
-    state: {
-      skillDiagnostics: {
-        ...initial,
-        diagnostics: [{
-          ...initial.diagnostics[0],
-          skills: initial.diagnostics[0].skills.map((skill) => ({ ...skill, body: "private" })),
-          privateDiagnostic: true,
-        }],
-        privateSnapshot: true,
-      },
-    },
-  });
-
-  const w = await mountSession("skill-state");
-  assert.deepEqual(w.latest.skillDiagnostics, initial, "get_state hydration recovers a startup frame emitted before SSE attached");
-
-  const updated = skillDiagnosticsSnapshot(false, "deploy");
-  await act(() => lastEs().emit({
-    type: "skill_diagnostics_update",
-    data: { ...updated, containRoot: "/private" },
-  }));
-  assert.deepEqual(w.latest.skillDiagnostics, updated);
-
-  await act(() => lastEs().emit({
-    type: "skill_diagnostics_update",
-    data: { cwd: "/workspace", showStartupDiagnostics: true, diagnostics: "none" },
-  }));
-  assert.equal(w.latest.skillDiagnostics, null, "malformed data is unsupported, not a fabricated clean result");
-
-  const recovered = skillDiagnosticsSnapshot(true, "recovered");
-  world.agents.set("skill-state", { running: true, state: { skillDiagnostics: recovered } });
-  await act(async () => {
-    lastEs().open();
-    await sleep(30);
-  });
-  assert.deepEqual(w.latest.skillDiagnostics, recovered, "stream attachment reconciles an update emitted before SSE attached");
-});
-
-/** Start the startup-diagnostics setter with its POST held. `respond` answers the held POST; `saving` is the hook's promise. */
-async function startHeldSkillSetter(w, sid, enabled) {
-  let respond;
-  world.holds.push({
-    match: (method, url, body) => method === "POST" && url.includes(`/api/agent/${sid}`) && body?.type === "set_skill_startup_diagnostics",
-    produce: () => new Promise((resolve) => { respond = (data) => resolve({ value: { success: true, data } }); }),
-  });
-  let saving;
-  await act(async () => {
-    saving = w.latest.setSkillStartupDiagnostics(enabled);
-    await sleep(20);
-  });
-  // The test awaits `saving` itself; this only keeps a failed assertion from leaving an unhandled rejection behind.
-  saving.catch(() => {});
-  return { saving, respond: (data) => respond(data) };
-}
-
-test("the startup diagnostics setter publishes OMP's effective snapshot and rejects unsupported replies", async () => {
-  resetWorld();
-  primeSession("skill-actions", [userMsg("u0", "q")]);
-  const on = skillDiagnosticsSnapshot(true);
-  const off = skillDiagnosticsSnapshot(false);
-  world.agents.set("skill-actions", { running: false, state: { skillDiagnostics: on } });
-  const w = await mountSession("skill-actions");
-  assert.deepEqual(w.latest.skillDiagnostics, on);
-
-  world.holds.push({
-    match: (method, url, body) => method === "POST" && url.includes("/api/agent/skill-actions") && body?.type === "set_skill_startup_diagnostics",
-    produce: async () => ({ value: { success: true, data: off } }),
-  });
-  let disabled;
-  await act(async () => {
-    disabled = await w.latest.setSkillStartupDiagnostics(false);
-  });
-  assert.deepEqual(disabled, off);
-  assert.deepEqual(w.latest.skillDiagnostics, off, "the effective snapshot replaces the previous one");
-
-  world.holds.push({
-    match: (method, url, body) => method === "POST" && url.includes("/api/agent/skill-actions") && body?.type === "set_skill_startup_diagnostics",
-    produce: async () => ({ value: { success: true, data: off } }),
-  });
-  let overridden;
-  await act(async () => {
-    overridden = await w.latest.setSkillStartupDiagnostics(true);
-  });
-  assert.deepEqual(overridden, off, "an override that keeps the setting off is returned as the effective value, not the requested one");
-  assert.deepEqual(w.latest.skillDiagnostics, off);
-
-  world.holds.push({
-    match: (method, url, body) => method === "POST" && url.includes("/api/agent/skill-actions") && body?.type === "set_skill_startup_diagnostics",
-    produce: async () => ({ value: { success: true, data: { cwd: "/workspace", showStartupDiagnostics: false, diagnostics: null } } }),
-  });
-  await assert.rejects(() => w.latest.setSkillStartupDiagnostics(false), /skill diagnostics/i);
-  assert.deepEqual(w.latest.skillDiagnostics, off, "a malformed response cannot erase the last supported snapshot");
-  await assert.rejects(() => w.latest.setSkillStartupDiagnostics("false"), /boolean/i);
-});
-
-test("the startup diagnostics setter does not start an empty chat and rejects stale session responses", async () => {
-  resetWorld();
-  const empty = await mountSession(null);
-  const callsBefore = world.calls.length;
-  await assert.rejects(() => empty.latest.setSkillStartupDiagnostics(false), /active session/i);
-  assert.equal(world.calls.length, callsBefore, "no active session means no lazy child-start request");
-
-  primeSession("old-skills", [userMsg("u0", "old")]);
-  const old = await mountSession("old-skills");
-  const held = await startHeldSkillSetter(old, "old-skills", false);
-  old.unmount();
-
-  primeSession("current-skills", [userMsg("u0", "current")]);
-  const current = await mountSession("current-skills");
-  held.respond(skillDiagnosticsSnapshot(false, "stale"));
-  await assert.rejects(held.saving, /stale/i);
-  assert.equal(current.latest.skillDiagnostics, null, "the previous chat cannot update the selected chat");
-});
-
-test("a saved setting whose own update frame beats the HTTP response resolves to the saved snapshot", async () => {
-  resetWorld();
-  primeSession("skill-own-frame", [userMsg("u0", "q")]);
-  const enabled = skillDiagnosticsSnapshot(true, "own-frame");
-  world.agents.set("skill-own-frame", { running: true, state: { skillDiagnostics: enabled } });
-  const w = await mountSession("skill-own-frame");
-  assert.deepEqual(w.latest.skillDiagnostics, enabled);
-
-  const { saving, respond } = await startHeldSkillSetter(w, "skill-own-frame", false);
-  const saved = skillDiagnosticsSnapshot(false, "own-frame");
-  try {
-    // OMP emits the update frame before it answers the command.
-    await act(() => lastEs().emit({ type: "skill_diagnostics_update", data: saved }));
-    assert.deepEqual(w.latest.skillDiagnostics, saved);
-  } finally {
-    respond(saved);
-  }
-  let result;
-  await act(async () => {
-    result = await saving;
-  });
-  assert.deepEqual(result, saved, "the control reports the saved setting instead of a stale failure");
-  assert.deepEqual(w.latest.skillDiagnostics, saved);
-});
-
-test("a setter response overtaken by a newer update returns the current snapshot without rolling it back", async () => {
-  resetWorld();
-  primeSession("skill-newer-frame", [userMsg("u0", "q")]);
-  world.agents.set("skill-newer-frame", { running: true, state: { skillDiagnostics: skillDiagnosticsSnapshot(true, "before") } });
-  const w = await mountSession("skill-newer-frame");
-
-  const { saving, respond } = await startHeldSkillSetter(w, "skill-newer-frame", false);
-  const newer = skillDiagnosticsSnapshot(false, "after-reload");
-  try {
-    await act(() => lastEs().emit({ type: "skill_diagnostics_update", data: newer }));
-  } finally {
-    respond(skillDiagnosticsSnapshot(false, "answered-before-reload"));
-  }
-  let result;
-  await act(async () => {
-    result = await saving;
-  });
-  assert.deepEqual(result, newer);
-  assert.deepEqual(w.latest.skillDiagnostics, newer, "the older response never replaces a newer update");
-});
-
-test("a state snapshot requested before a newer skill update cannot overwrite it when it resolves late", async () => {
-  resetWorld();
-  primeSession("skill-order", [userMsg("u0", "q")]);
-  world.agents.set("skill-order", { running: true, state: { skillDiagnostics: skillDiagnosticsSnapshot(true, "startup") } });
-  const w = await mountSession("skill-order");
-
-  let release;
-  world.holds.push({
-    match: (method, url) => method === "GET" && url === "/api/agent/skill-order",
-    produce: () => new Promise((resolve) => {
-      release = () => resolve({ value: { running: true, state: { skillDiagnostics: skillDiagnosticsSnapshot(true, "stale-state") } } });
-    }),
-  });
-  const newer = skillDiagnosticsSnapshot(false, "newer-update");
-  try {
-    await act(async () => {
-      lastEs().open(); // stream attachment requests an authoritative state snapshot
-      await sleep(20);
-    });
-    assert.ok(release, "precondition: the snapshot request is still in flight");
-    await act(() => lastEs().emit({ type: "skill_diagnostics_update", data: newer }));
-    assert.deepEqual(w.latest.skillDiagnostics, newer);
-  } finally {
-    release?.();
-  }
-  await act(async () => {
-    await sleep(30);
-  });
-  assert.deepEqual(w.latest.skillDiagnostics, newer, "the late older snapshot is dropped");
-});
-
-test("a fresh chat hydrates and follows skill diagnostics after slash discovery creates its runtime", async () => {
-  resetWorld();
-  const startup = skillDiagnosticsSnapshot(true, "fresh-startup");
-  world.holds.push({
-    match: (method, url) => method === "POST" && url === "/api/agent/new",
-    produce: async () => ({ value: { sessionId: "fresh-skills" } }),
-  });
-  world.agents.set("fresh-skills", { running: true, state: { skillDiagnostics: startup } });
-  const w = await mountSession(null, undefined, { newSessionCwd: "/workspace" });
-  assert.equal(w.latest.skillDiagnostics, null, "an empty new-chat page has no runtime or diagnostics");
-  assert.deepEqual(world.esInstances, [], "mounting an empty new chat must not attach a stream");
-
-  await act(async () => { await w.latest.loadSlashCommands(); });
-  const es = lastEs();
-  assert.deepEqual(es?.channel, { kind: "session", sessionId: "fresh-skills" }, "the created runtime must be observed before its first prompt");
-  await act(async () => {
-    es.open();
-    await sleep(30);
-  });
-  assert.deepEqual(w.latest.skillDiagnostics, startup, "the startup frame emitted before attachment is recovered from state");
-
-  const updated = skillDiagnosticsSnapshot(false, "fresh-updated");
-  await act(() => es.emit({ type: "skill_diagnostics_update", data: updated }));
-  assert.deepEqual(w.latest.skillDiagnostics, updated, "live diagnostics follow the created runtime");
-  assert.equal(callsTo("POST", "/api/agent/fresh-skills").some((call) => call.body?.type === "prompt"), false, "discovery never starts a model run");
-  w.unmount();
-});
-
-test("a fresh chat runtime created after unmount cannot attach or apply skill diagnostics", async () => {
-  resetWorld();
-  let release;
-  world.holds.push({
-    match: (method, url) => method === "POST" && url === "/api/agent/new",
-    produce: () => new Promise((resolve) => { release = () => resolve({ value: { sessionId: "stale-fresh" } }); }),
-  });
-  world.agents.set("stale-fresh", { running: true, state: { skillDiagnostics: skillDiagnosticsSnapshot(true, "stale-fresh") } });
-  const w = await mountSession(null, undefined, { newSessionCwd: "/workspace" });
-  let discovery;
-  await act(async () => {
-    discovery = w.latest.loadSlashCommands();
-    await sleep(20);
-    w.unmount();
-  });
-  await act(async () => {
-    release();
-    await discovery;
-    await sleep(30);
-  });
-  assert.deepEqual(world.esInstances, [], "a stale create must not leak an event stream");
-  assert.equal(callsTo("GET", "/api/agent/stale-fresh").length, 0, "a stale create must not request diagnostics for a switched chat");
-  assert.equal(w.latest.skillDiagnostics, null);
 });
 
 test("a fresh chat's first prompt attaches one event stream instead of an observer plus its own", async () => {
@@ -6596,6 +6450,481 @@ test("a fresh chat whose host drops after the spawn adopts the kept session, so 
   assert.equal(retry.status, "accepted");
   assert.equal(callsTo("POST", "/api/agent/new").length, 1, "the retry reuses the kept session");
   assert.equal(callsTo("POST", "/api/agent/kept-remote").some((call) => call.body?.type === "prompt"), true);
+});
+
+test("a lost pooled creation response retries the original identity and frozen initialization, then adopts its owner", async () => {
+  resetWorld();
+  const creationId = "e740daaa-78c7-46ae-9985-409064653f01";
+  const journal = new Map();
+  let loseResponse = true;
+  const create = async () => {
+    const request = callsTo("POST", "/api/agent/new").at(-1).body;
+    if (!journal.has(request.creationId)) {
+      journal.set(request.creationId, { sessionId: "pooled-original", hostId: "h2", cwd: "/worker-2/worktrees/original" });
+      primeSession("pooled-original", []);
+    }
+    if (loseResponse) {
+      loseResponse = false;
+      throw new TypeError("Response lost after creation");
+    }
+    return { value: { success: true, ...journal.get(request.creationId), data: {} } };
+  };
+  world.holds.push(
+    { match: (method, url) => method === "POST" && url === "/api/agent/new", produce: create },
+    { match: (method, url) => method === "POST" && url === "/api/agent/new", produce: create },
+  );
+  const promoted = [];
+  const w = await mountSession(null, undefined, {
+    newSessionCwd: "/diagnostic/representative", newSessionHostId: "h1",
+    newSessionCreationId: creationId, newSessionPoolId: "workers", newSessionProjectId: "app",
+    onSessionCreated: (session) => promoted.push(session),
+  });
+  await act(async () => { await w.latest.loadSlashCommands().catch(() => []); });
+  await act(async () => {
+    await w.latest.handleModelChange("anthropic", "changed-after-loss");
+    await w.latest.handleThinkingLevelChange("high");
+    await w.latest.handleToolPresetChange("none");
+    w.latest.handleAdvisorChange(true);
+  });
+  await act(async () => { await w.latest.loadSlashCommands(); });
+  let sending;
+  await act(async () => { sending = w.latest.handleSend("first prompt"); await sleep(30); });
+  let receipt;
+  await act(async () => { lastEs()?.open(); receipt = await sending; });
+  w.unmount();
+  const requests = callsTo("POST", "/api/agent/new").map((call) => call.body);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].creationId, creationId);
+  assert.equal(requests[0].poolId, "workers");
+  assert.equal(requests[0].projectId, "app");
+  assert.equal("cwd" in requests[0], false, "a representative checkout is not a creation target");
+  assert.equal("hostId" in requests[0], false);
+  assert.deepEqual(requests[1], requests[0], "a retry must not change an already-journaled initialization");
+  assert.equal(requests[1].type, "ensure_session", "the first prompt uses the owner route, not a changed creation intent");
+  assert.equal(journal.size, 1);
+  assert.equal(receipt.status, "accepted");
+  assert.deepEqual(promoted.map(({ id, hostId, cwd, poolId, projectId }) => ({ id, hostId, cwd, poolId, projectId })), [
+    { id: "pooled-original", hostId: "h2", cwd: "/worker-2/worktrees/original", poolId: "workers", projectId: "app" },
+  ]);
+  assert.equal(callsTo("POST", "/api/agent/pooled-original").filter((call) => call.body?.type === "prompt").length, 1);
+});
+
+test("pooled creation uncertainty with a known id adopts the owner without resending the initial command", async () => {
+  resetWorld();
+  const owner = { sessionId: "uncertain-owner", hostId: "h2", cwd: "/worker-2/worktrees/uncertain" };
+  primeSession(owner.sessionId, []);
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/new",
+    produce: async () => ({
+      status: 503,
+      value: { ...owner, error: "The initialization answer was lost", code: "pool_delivery_unknown", delivery: "unknown" },
+    }),
+  });
+  const promoted = [];
+  const w = await mountSession(null, undefined, {
+    newSessionCwd: "/diagnostic/representative", newSessionHostId: "h1",
+    newSessionCreationId: "9eaaed5b-773b-419a-b03e-9b07866623a1", newSessionPoolId: "workers", newSessionProjectId: "app",
+    onSessionCreated: (session) => promoted.push(session),
+  });
+  let first;
+  await act(async () => { first = await w.latest.handleSend("do not resend automatically"); await sleep(30); });
+  assert.equal(first.status, "rejected");
+  assert.equal(w.latest.sessionIdRef.current, owner.sessionId);
+  assert.equal(callsTo("POST", `/api/agent/${owner.sessionId}`).filter((call) => call.body?.type === "prompt").length, 0);
+  let retry;
+  await act(async () => { retry = w.latest.handleSend("explicit retry"); await sleep(30); });
+  await act(async () => { lastEs()?.open(); retry = await retry; });
+  w.unmount();
+  assert.equal(retry.status, "accepted");
+  assert.equal(callsTo("POST", "/api/agent/new").length, 1, "a known owner is never placed again");
+  assert.deepEqual(promoted.map(({ hostId, cwd }) => ({ hostId, cwd })), [{ hostId: "h2", cwd: owner.cwd }]);
+  assert.deepEqual(callsTo("POST", `/api/agent/${owner.sessionId}`).filter((call) => call.body?.type === "prompt").map((call) => call.body.message), ["explicit retry"]);
+});
+
+test("a pooled session whose owner is offline never creates on another target", async () => {
+  resetWorld();
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/new",
+    produce: async () => ({ status: 503, value: {
+      sessionId: "offline-pool-owner", hostId: "h2", cwd: "/worker-2/worktrees/offline",
+      error: "Owner is offline", code: "host_offline", delivery: "refused",
+    } }),
+  });
+  const w = await mountSession(null, undefined, {
+    newSessionCwd: "/diagnostic/representative", newSessionHostId: "h1",
+    newSessionCreationId: "3af9fe09-0719-4942-b105-755ed9b0c5ec", newSessionPoolId: "workers", newSessionProjectId: "app",
+  });
+  await act(async () => { await w.latest.handleSend("first"); });
+  world.holds.push({
+    match: (method, url, body) => method === "POST" && url.includes("/api/agent/offline-pool-owner") && body?.type === "prompt",
+    produce: async () => ({ status: 503, value: { error: "Owner is offline", code: "host_offline", hostOffline: true, delivery: "refused" } }),
+  });
+  let retry;
+  await act(async () => { retry = w.latest.handleSend("retry"); await sleep(30); });
+  await act(async () => { lastEs()?.open(); retry = await retry; });
+  w.unmount();
+  assert.equal(retry.status, "rejected");
+  assert.equal(w.latest.sessionIdRef.current, "offline-pool-owner");
+  assert.equal(callsTo("POST", "/api/agent/new").length, 1);
+});
+
+test("choosing a different logical project starts a distinct creation intent without a representative path", async () => {
+  resetWorld();
+  const ids = ["a0f374af-d4cd-4ce0-8d24-e417fa5ad60c", "b2317aee-c4a0-411e-bd6e-49837012ae96"];
+  for (const [index, projectId] of ["app", "other-app"].entries()) {
+    world.holds.push({
+      match: (method, url) => method === "POST" && url === "/api/agent/new",
+      produce: async () => ({ status: 503, value: { error: "No capacity", code: "pool_unavailable" } }),
+    });
+    const w = await mountSession(null, undefined, {
+      newSessionCwd: null, newSessionCreationId: ids[index], newSessionPoolId: "workers", newSessionProjectId: projectId,
+    });
+    await act(async () => { await w.latest.loadSlashCommands().catch(() => []); });
+    w.unmount();
+  }
+  assert.deepEqual(callsTo("POST", "/api/agent/new").map(({ body }) => ({
+    creationId: body.creationId, poolId: body.poolId, projectId: body.projectId,
+  })), [
+    { creationId: ids[0], poolId: "workers", projectId: "app" },
+    { creationId: ids[1], poolId: "workers", projectId: "other-app" },
+  ]);
+});
+
+test("reopening a pending pooled composer reuses its frozen creation body instead of new defaults", async () => {
+  resetWorld();
+  const creationId = "183df38f-688a-4b72-b8e7-0d6dc95407e9";
+  const target = { newSessionCwd: null, newSessionCreationId: creationId, newSessionPoolId: "workers", newSessionProjectId: "app" };
+  let initialization;
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/new",
+    produce: async () => { throw new TypeError("Response lost after creation"); },
+  });
+  const first = await mountSession(null, undefined, { ...target, onNewSessionInitialization: (body) => { initialization = body; } });
+  await act(async () => { await first.latest.handleModelChange("anthropic", "original-model"); });
+  await act(async () => { await first.latest.loadSlashCommands().catch(() => []); });
+  first.unmount();
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/new",
+    produce: async () => ({ value: { success: true, sessionId: "reopened-original", hostId: "h2", cwd: "/worker-2/original", data: {} } }),
+  });
+  const reopened = await mountSession(null, undefined, { ...target, newSessionInitialization: initialization });
+  await act(async () => { await reopened.latest.loadSlashCommands(); });
+  const requests = callsTo("POST", "/api/agent/new").map(({ body }) => body);
+  assert.deepEqual(requests[1], requests[0], "navigation must not change the already-used creation intent");
+  assert.equal(reopened.latest.sessionIdRef.current, "reopened-original");
+  assert.equal(callsTo("POST", "/api/agent/reopened-original").some(({ body }) => body?.type === "prompt"), false);
+  reopened.unmount();
+});
+
+test("resolving a pooled file owner preserves the live composer until its first command sends the completed upload", async (t) => {
+  resetWorld();
+  const sid = "pooled-upload-first-command";
+  const file = new File([new Uint8Array([80, 75, 0, 0, 1, 2])], "before-first-prompt.zip", { type: "application/zip" });
+  primeSession(sid, []);
+  let releaseCreation;
+  let releaseUpload;
+  t.after(() => { releaseCreation?.(); releaseUpload?.(); });
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/new",
+    produce: () => new Promise((resolve) => { releaseCreation = () => resolve({ value: { success: true, sessionId: sid, hostId: "h2", cwd: "/worker-2/owned", data: {} } }); }),
+  }, {
+    match: (method, url) => method === "PUT" && url.startsWith("/api/uploads/"),
+    produce: () => new Promise((resolve) => { releaseUpload = () => resolve({ value: { received: file.size, done: true } }); }),
+  });
+  world.respond = (method, url) => url === "/api/uploads" && method === "POST" ? jsonResponse(200, { received: 0 }) : null;
+  const chatInputRef = React.createRef();
+  const promoted = [];
+  function Shell() {
+    const [session, setSession] = React.useState(null);
+    return React.createElement(ChatWindow, {
+      session, newSessionCwd: null, chatInputRef,
+      ...(!session ? { newSessionPoolId: "workers", newSessionProjectId: "app", newSessionCreationId: "4c9dbe74-5d07-46b6-aa7b-87bf6ad55761" } : {}),
+      onSessionCreated(created) { promoted.push(created); setSession(created); },
+    });
+  }
+  const view = ownRoot(render(React.createElement(Shell), { wrapper: TestRoot }));
+  await settle();
+  const composer = view.getByRole("textbox");
+  await act(async () => {
+    fireEvent.change(composer, { target: { value: "Keep this draft with its upload" } });
+    chatInputRef.current.addFiles([file]);
+    await sleep(30);
+  });
+  assert.equal(callsTo("POST", "/api/agent/new").length, 1);
+  await act(async () => { releaseCreation(); await sleep(50); });
+  assert.equal(view.getByRole("textbox") === composer, true, "resolving ownership is not a view transition");
+  assert.equal(composer.value, "Keep this draft with its upload");
+  assert.equal(view.queryAllByText(file.name).length, 1);
+  assert.deepEqual(promoted, [], "the owner is retained without promoting before the first command");
+  await until(() => releaseUpload, "the owned upload starts");
+  const upload = callsTo("POST", "/api/uploads")[0].body;
+  assert.equal(upload.host, "h2");
+  assert.equal(callsTo("DELETE", "/api/uploads/").length, 0);
+  await act(async () => { lastEs()?.open(); releaseUpload(); await sleep(50); });
+  assert.equal(composer.value, "Keep this draft with its upload");
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: translate("chatInput.send") })); await sleep(50); lastEs()?.open(); });
+  await until(() => callsTo("POST", `/api/agent/${sid}`).some(({ body }) => body?.type === "prompt"), "the first prompt reaches its retained owner");
+  const prompt = callsTo("POST", `/api/agent/${sid}`).find(({ body }) => body?.type === "prompt").body;
+  assert.equal(prompt.message, "Keep this draft with its upload");
+  assert.deepEqual(prompt.uploads, [upload.id]);
+  assert.deepEqual(promoted.map(({ id, hostId }) => ({ id, hostId })), [{ id: sid, hostId: "h2" }]);
+  assert.equal(callsTo("POST", "/api/agent/new").length, 1);
+  view.unmount();
+});
+
+test("nonprompt pooled placement failures are visible once while rejection and frozen retry intent are retained", async () => {
+  resetWorld();
+  toastCalls.length = 0;
+  const error = "Repository authentication failed on the worker. Configure access to git@example.invalid:app.git.";
+  let release;
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/new",
+    produce: () => new Promise((resolve) => { release = () => resolve({ status: 503, value: { error, code: "pool_preparation_failed" } }); }),
+  });
+  let systemPromptLoader;
+  const view = ownRoot(render(React.createElement(ChatWindow, {
+    session: null, newSessionCwd: null, newSessionPoolId: "workers", newSessionProjectId: "app",
+    newSessionCreationId: "49ad40e2-ed0d-497a-a7aa-5bc20751395e",
+    onSystemPromptLoaderChange: (loader) => { systemPromptLoader = loader; },
+  }), { wrapper: TestRoot }));
+  await settle();
+  await act(async () => { fireEvent.change(view.getByRole("textbox"), { target: { value: "/" } }); await sleep(30); });
+  let systemResult;
+  await act(async () => {
+    systemResult = systemPromptLoader().then(() => ({ accepted: true }), (failure) => ({ accepted: false, failure }));
+    release();
+    await systemResult;
+    await sleep(30);
+  });
+  assert.equal((await systemResult).accepted, false, "nonprompt consumers still receive rejection");
+  assert.equal(callsTo("POST", "/api/agent/new").length, 1, "concurrent lazy consumers share one attempt");
+  const visibleErrors = view.queryAllByText(error, { exact: false }).length + toastCalls.filter((call) => String(call[1]).includes(error)).length;
+  assert.equal(visibleErrors, 1, "the actionable server failure is displayed once, not only logged or swallowed");
+  assert.equal(callsTo("POST", "/api/agent/").some(({ url, body }) => url !== "/api/agent/new" && body?.type === "prompt"), false);
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/new",
+    produce: async () => ({ value: { success: true, sessionId: "prepared-after-explicit-retry", hostId: "h2", cwd: "/worker-2/prepared", data: {} } }),
+  });
+  await act(async () => { await systemPromptLoader(); });
+  const attempts = callsTo("POST", "/api/agent/new").map(({ body }) => body);
+  assert.equal(attempts.length, 2, "only the explicit later action retries placement");
+  assert.deepEqual(attempts[1], attempts[0]);
+  assert.equal(callsTo("POST", "/api/agent/").some(({ body }) => body?.type === "prompt"), false);
+  view.unmount();
+});
+
+test("known-ID upload uncertainty retains the pending composer and retries the bound owner without another placement", async () => {
+  resetWorld();
+  const sid = "known-upload-owner";
+  const file = new File([new Uint8Array([80, 75, 0, 0])], "uncertain-upload.zip", { type: "application/zip" });
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/new",
+    produce: async () => ({ status: 503, value: { sessionId: sid, hostId: "h2", cwd: "/worker-2/known", delivery: "unknown", code: "pool_delivery_unknown", error: "The initialization answer was lost; inspect the retained owner." } }),
+  });
+  world.respond = (method, url) => url === "/api/uploads" && method === "POST"
+    ? jsonResponse(200, { received: 0 })
+    : method === "PUT" && url.startsWith("/api/uploads/") ? jsonResponse(200, { received: file.size, done: true }) : null;
+  const inputRef = React.createRef();
+  const promoted = [];
+  function Shell() {
+    const [session, setSession] = React.useState(null);
+    return React.createElement(ChatWindow, {
+      session, newSessionCwd: null, chatInputRef: inputRef,
+      ...(!session ? { newSessionPoolId: "workers", newSessionProjectId: "app", newSessionCreationId: "080bc04b-0806-4f4d-ae4e-a354608d9cc0" } : {}),
+      onSessionCreated(created) { promoted.push(created); setSession(created); },
+    });
+  }
+  const view = ownRoot(render(React.createElement(Shell), { wrapper: TestRoot }));
+  await settle();
+  const composer = view.getByRole("textbox");
+  await act(async () => {
+    fireEvent.change(composer, { target: { value: "Keep the uncertain owner's draft" } });
+    inputRef.current.addFiles([file]);
+    await sleep(50);
+  });
+  assert.equal(view.getByRole("textbox") === composer, true);
+  assert.equal(composer.value, "Keep the uncertain owner's draft");
+  assert.ok(view.queryByText(file.name));
+  assert.deepEqual(promoted, []);
+  assert.equal(callsTo("POST", "/api/uploads").length, 0);
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: translate("chatInput.uploadRetry") })); await sleep(50); });
+  await until(() => callsTo("POST", "/api/uploads").length === 1, "the explicit upload retry uses its retained owner");
+  assert.equal(callsTo("POST", "/api/uploads")[0].body.host, "h2");
+  assert.equal(callsTo("POST", "/api/agent/new").length, 1);
+  assert.equal(callsTo("POST", `/api/agent/${sid}`).some(({ body }) => body?.type === "prompt"), false);
+  view.unmount();
+});
+
+test("the rendered sidebar keeps member-owned legacy sessions accessible beside pooled and Mac projects", async () => {
+  resetWorld();
+  servePooledWorkspace();
+  const selected = [];
+  const view = ownRoot(render(React.createElement(SessionSidebar, {
+    selectedSessionId: null, onSelectSession: (session) => selected.push(session),
+    addProjectOpen: false, setAddProjectOpen() {}, usageVisible: false,
+  }), { wrapper: TestRoot }));
+  await settle();
+  await until(() => view.queryByText("Pool app"), "the configured logical project renders");
+  assert.equal(view.queryAllByText("Pool app").length, 1);
+  assert.ok(view.queryByText("Worker one conversation"));
+  assert.ok(view.queryByText("Worker two conversation"));
+  assert.ok(view.queryByText("Mac conversation"));
+  assert.ok(view.queryByText("Worker legacy conversation"), "a member's unmatched physical workspace remains reachable");
+  assert.equal(view.queryByRole("button", { name: translate("hosts.addWorkspaceOn", { host: "Worker 1" }) }), null, "existing-session presentation must not expose a member creation target");
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: translate("sessionSidebar.search") })); });
+  await until(() => view.queryByRole("textbox", { name: translate("sessionSidebar.search") }), "the user-opened search field commits");
+  await act(async () => {
+    fireEvent.change(view.getByRole("textbox", { name: translate("sessionSidebar.search") }), { target: { value: "legacy" } });
+    await sleep(30);
+  });
+  await act(async () => { fireEvent.click(view.getByText("Worker legacy conversation")); });
+  assert.deepEqual(selected.map(({ id, hostId, cwd, poolId }) => ({ id, hostId, cwd, poolId })), [
+    { id: "legacy", hostId: "h1", cwd: "/legacy", poolId: undefined },
+  ]);
+  view.unmount();
+});
+
+test("a selected remote session can browse its owner files without reading a same-path central decoy", async (t) => {
+  resetWorld();
+  servePooledWorkspace();
+  window.history.replaceState(null, "", "?session=worker-one");
+  t.after(() => window.history.replaceState(null, "", "/"));
+  const view = ownRoot(render(React.createElement(AppShell, { appName: "ompweb" }), { wrapper: TestRoot }));
+  await settle();
+  await until(() => view.queryByRole("button", { name: translate("appShell.showFilePanel") }), "the restored remote session's panel control appears");
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: translate("appShell.showFilePanel") })); await sleep(60); });
+  await until(() => view.queryByText("owner-only.txt"), "the remote owner's directory renders");
+  assert.equal(view.queryByText("central-decoy.txt"), null);
+  await act(async () => { fireEvent.click(view.getByText("owner-only.txt")); await sleep(60); });
+  await until(() => view.queryByText("FIRST OWNER CONTENT"), "the file opens against the same real owner");
+  assert.equal(view.queryByText("CENTRAL DECOY CONTENT"), null);
+  view.unmount();
+});
+
+test("equal-path file tabs retain their originating session when the selected owner changes", async (t) => {
+  resetWorld();
+  servePooledWorkspace();
+  window.history.replaceState(null, "", "?session=worker-one");
+  t.after(() => window.history.replaceState(null, "", "/"));
+  const view = ownRoot(render(React.createElement(AppShell, { appName: "ompweb" }), { wrapper: TestRoot }));
+  await settle();
+  const stream = world.esInstances.find(({ channel }) => channel.kind === "host-tools");
+  assert.ok(stream);
+  await until(() => view.queryByRole("button", { name: translate("appShell.showFilePanel") }), "the first owner is selected");
+  await act(async () => {
+    stream.emit({ type: "host_tool_call", id: "first-open", sessionId: "worker-one", hostId: "h1", cwd: "/shared", toolName: "open_file", arguments: { path: "/shared/report.txt" } });
+    await sleep(60);
+  });
+  await until(() => view.queryByText("FIRST OWNER CONTENT"), "the first owner file opens");
+  await act(async () => { fireEvent.click(view.getByText("Worker two conversation")); await sleep(60); });
+  await act(async () => {
+    stream.emit({ type: "host_tool_call", id: "second-open", sessionId: "worker-two", hostId: "h2", cwd: "/shared", toolName: "open_file", arguments: { path: "/shared/report.txt" } });
+    await sleep(60);
+  });
+  await until(() => view.queryByText("SECOND OWNER CONTENT"), "the equal path opens on the second owner");
+  const tabs = view.getAllByRole("tab", { name: /report\.txt/ });
+  assert.equal(tabs.length, 2, "equal physical paths on different owners are different tabs");
+  await act(async () => { fireEvent.click(tabs[0]); await sleep(30); });
+  const visibleFirst = view.queryAllByText("FIRST OWNER CONTENT").some((element) => !element.closest('[style*="display: none"]'));
+  assert.equal(visibleFirst, true, "returning to the first tab still displays its original owner");
+  assert.equal(view.queryByText("CENTRAL DECOY CONTENT"), null);
+  view.unmount();
+});
+
+test("a retained foreign-source tab cannot mention its path into the selected worker chat", async (t) => {
+  resetWorld();
+  servePooledWorkspace();
+  window.history.replaceState(null, "", "?session=worker-one");
+  t.after(() => window.history.replaceState(null, "", "/"));
+  const view = ownRoot(render(React.createElement(AppShell, { appName: "ompweb" }), { wrapper: TestRoot }));
+  await settle();
+  const stream = world.esInstances.find(({ channel }) => channel.kind === "host-tools");
+  assert.ok(stream);
+  await until(() => view.queryByRole("button", { name: translate("appShell.showFilePanel") }), "the source conversation is selected");
+  await act(async () => {
+    fireEvent.change(view.getByRole("textbox"), { target: { value: "Worker one draft" } });
+    stream.emit({ type: "host_tool_call", id: "mention-first-open", sessionId: "worker-one", hostId: "h1", cwd: "/shared", toolName: "open_file", arguments: { path: "/shared/report.txt" } });
+    await sleep(60);
+  });
+  await until(() => view.queryByText("FIRST OWNER CONTENT"), "the first owner's file opens");
+  await act(async () => { fireEvent.click(view.getByText("Worker two conversation")); await sleep(60); });
+  await act(async () => {
+    fireEvent.change(view.getByRole("textbox"), { target: { value: "Worker two draft" } });
+    stream.emit({ type: "host_tool_call", id: "mention-second-open", sessionId: "worker-two", hostId: "h2", cwd: "/shared", toolName: "open_file", arguments: { path: "/shared/report.txt" } });
+    await sleep(60);
+  });
+  await until(() => view.queryByText("SECOND OWNER CONTENT"), "the selected worker's equal-path file opens separately");
+  const tabs = view.getAllByRole("tab", { name: /report\.txt/ });
+  assert.equal(tabs.length, 2);
+  await act(async () => { fireEvent.click(tabs[0]); await sleep(30); });
+  assert.equal(view.queryAllByText("FIRST OWNER CONTENT").some((element) => !element.closest('[style*="display: none"]')), true);
+  const foreignMention = view.queryByRole("button", { name: translate("appShell.mentionFileInChat") });
+  if (foreignMention) await act(async () => { fireEvent.click(foreignMention); });
+  assert.equal(view.getByRole("textbox").value, "Worker two draft", "a source-relative path must not be inserted into another worker's composer");
+  assert.equal(foreignMention === null || foreignMention.disabled, true, "the foreign-source action is unavailable");
+  await act(async () => { fireEvent.click(view.getByText("Worker one conversation")); await sleep(60); });
+  const sourceMention = view.getByRole("button", { name: translate("appShell.mentionFileInChat") });
+  assert.equal(sourceMention.disabled, false, "returning to the source session restores the action");
+  await act(async () => {
+    const composer = view.getByRole("textbox");
+    composer.focus();
+    composer.setSelectionRange(composer.value.length, composer.value.length);
+    fireEvent.click(sourceMention);
+  });
+  assert.equal(view.getByRole("textbox").value.includes("@report.txt"), true);
+  assert.equal(view.getByRole("textbox").value.startsWith("Worker one draft"), true);
+  view.unmount();
+});
+
+test("a populated local pool member keeps legacy access without a physical add-workspace control", async () => {
+  for (const localMember of [false, true]) {
+    resetWorld();
+    const { pools } = servePooledWorkspace();
+    if (localMember) pools[0].members.push({ hostId: "local", projectsRoot: "/projects", provisioned: true, draining: false });
+    const selected = [];
+    const view = ownRoot(render(React.createElement(SessionSidebar, {
+      selectedSessionId: null, onSelectSession: (session) => selected.push(session),
+      addProjectOpen: false, setAddProjectOpen() {}, usageVisible: false,
+    }), { wrapper: TestRoot }));
+    await settle();
+    await until(() => view.queryByText("Mac conversation"), "the local host's unmatched conversation remains reachable");
+    const add = view.queryByRole("button", { name: translate("hosts.addWorkspaceOn", { host: "Mac" }) });
+    if (localMember) assert.equal(add, null, "membership takes precedence over the reserved local host ID");
+    else assert.equal(add?.disabled, false, "a standalone non-member Mac keeps its add-workspace action");
+    await act(async () => { fireEvent.click(view.getByText("Mac conversation")); });
+    assert.deepEqual(selected.map(({ id, hostId, cwd, poolId }) => ({ id, hostId, cwd, poolId })), [
+      { id: "mac", hostId: "local", cwd: "/shared", poolId: undefined },
+    ]);
+    view.unmount();
+  }
+});
+
+test("local artifact images rendered from an assistant reply retain the reply's originating session", async () => {
+  resetWorld();
+  const view = ownRoot(render(React.createElement(MessageView, {
+    message: assistantMsg("image-reply", "![worker screenshot](/var/tmp/owner-shot.png)"),
+    cwd: "/shared", sessionId: "worker-one", onOpenFile() {},
+  }), { wrapper: TestRoot }));
+  await settle();
+  const image = view.getByRole("img", { name: "worker screenshot" });
+  const url = new URL(image.getAttribute("src"), "https://omp.test");
+  assert.equal(url.pathname.startsWith("/api/files/"), true);
+  assert.equal(url.searchParams.get("sessionId"), "worker-one", "the browser must not fetch the central machine's same-looking image");
+  assert.equal(url.searchParams.get("hostId"), null, "without physical context the remote session derives its owner, never a guessed local hint");
+  view.unmount();
+});
+
+test("workspace file search stays in its source session rather than a same-path central directory", async () => {
+  resetWorld();
+  servePooledWorkspace();
+  const view = ownRoot(render(React.createElement(FileExplorer, {
+    cwd: "/shared", hostId: "h1", sourceSessionId: "worker-one", fileSearchOpen: true, onOpenFile() {},
+  }), { wrapper: TestRoot }));
+  await settle();
+  await act(async () => { fireEvent.change(view.getByRole("textbox", { name: translate("fileExplorer.searchFiles") }), { target: { value: "worker" } }); await sleep(200); });
+  await until(() => view.queryByText("worker-search-result.txt"), "the owner-scoped index result renders");
+  assert.equal(view.queryByText("central-decoy.txt"), null);
+  view.unmount();
 });
 
 test("a fresh local chat sends no host id and keeps the pre-hosts draft key", async () => {
@@ -7508,6 +7837,228 @@ test("a 409 deleting a dispatched outbox message shows a notice and keeps the bu
   assert.equal(w.latest.heldMessages.some((held) => held.id === entry.id), true);
 });
 
+/** The worker's report that the server stored (`outbox_add` 200) the copy a Retry held, naming the original it
+ * retired with that add, or that it refused it for good. */
+const storeCopy = () => {
+  const { entry } = world.lastOutboxAdd;
+  world.outbox = world.outbox.filter((held) => held.id !== entry.id && held.id !== entry.replaces);
+  workerPort.onmessage({ data: { outboxStored: { ...entry, state: "held" } } });
+  workerPort.onmessage({ data: { outbox: world.outbox.map((held) => ({ ...held, state: held.state ?? "sending" })) } });
+};
+const refuseCopy = (error) => workerPort.onmessage({ data: { outbox: [{ ...world.lastOutboxAdd.entry, state: "failed", error }] } });
+const removeCalls = (sid) => callsTo("POST", `/api/agent/${sid}`).filter((call) => call.body?.type === "outbox_remove").map((call) => call.body);
+const copiesOf = (message) => world.outbox.filter((held) => held.message === message);
+/** Mounts `sid` as a page load does: /state lists the server's failed entry, which opens the session channel. */
+async function mountWithFailed(sid, entry) {
+  world.holds.push({
+    match: (method, url) => method === "GET" && url === `/api/sessions/${sid}/state`,
+    produce: async () => ({ value: { running: false, outbox: [entry], outboxScope: "test-scope" } }),
+  });
+  const w = await mountSession(sid);
+  assert.equal(w.latest.heldMessages.some((held) => held.id === entry.id && held.state === "failed"), true);
+  return w;
+}
+async function mountWithServerKnownCopy(sid, serverCopy, localEntries) {
+  world.outbox = localEntries;
+  world.holds.push({
+    match: (method, url) => method === "GET" && url === `/api/sessions/${sid}/state`,
+    produce: async () => ({ value: { running: false, outbox: [serverCopy], outboxScope: "test-scope" } }),
+  });
+  const w = await mountSession(sid);
+  await act(async () => {
+    workerPort.onmessage({ data: { outbox: world.outbox.map((entry) => ({ ...entry, state: entry.state ?? "sending" })) } });
+  });
+  await settle();
+  return w;
+}
+
+for (const outcome of ["accepted", "refused"]) test(`Retry of a server-known failed copy keeps C as the root when D is ${outcome}`, async () => {
+  resetWorld();
+  const sid = `server-known-retry-${outcome}`;
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.outboxHold = true;
+  const root = { id: "browser-root", sessionId: sid, scope: "test-scope", mode: "prompt", message: "same intent", state: "failed", createdAt: 1 };
+  const copy = { id: "server-copy", sessionId: sid, scope: "test-scope", mode: "prompt", message: root.message, state: "failed", replaces: root.id, createdAt: 2 };
+  const serverCopy = { id: copy.id, sessionId: sid, mode: copy.mode, message: copy.message, state: "failed", error: "server refusal", createdAt: 2 };
+  const w = await mountWithServerKnownCopy(sid, serverCopy, [root, copy]);
+
+  assert.ok(world.outboxReconciles.some(({ sessionId, confirmedIds }) => sessionId === sid && confirmedIds.includes(copy.id)));
+  assert.equal(world.outbox.some((entry) => entry.id === root.id || entry.id === copy.id), false, "authoritative C consumes its stale local chain");
+  assert.equal(w.latest.heldMessages.some((held) => held.id === root.id), false, "browser-only O is no longer actionable");
+  assert.equal(w.latest.heldMessages.some((held) => held.id === copy.id && held.state === "failed"), true, "server C remains visible");
+
+  await act(async () => { await w.latest.retryHeldMessage(copy.id); });
+  const retry = world.lastOutboxAdd.entry;
+  assert.equal(retry.replaces, copy.id, "the worker receives server C as the explicit retry root");
+
+  if (outcome === "refused") {
+    await act(async () => { refuseCopy("upload_missing"); });
+    assert.equal(w.latest.heldMessages.some((held) => held.id === copy.id && held.local === false && held.state === "failed"), true);
+    assert.equal(w.latest.heldMessages.some((held) => held.id === retry.id && held.local === true && held.state === "failed"), true);
+    assert.equal(w.latest.heldMessages.some((held) => held.id === root.id), false);
+  } else {
+    await act(async () => { storeCopy(); });
+    assert.equal(w.latest.heldMessages.some((held) => held.id === copy.id), false, "the accepted D represents C");
+    assert.equal(w.latest.heldMessages.some((held) => held.id === root.id), false);
+    assert.equal(w.latest.heldMessages.some((held) => held.id === retry.id && held.state === "held"), true);
+  }
+});
+
+test("a settled server retry ID reconciles stale local ancestry without a pending server entry", async () => {
+  resetWorld();
+  const sid = "settled-server-retry";
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.outboxHold = true;
+  const root = { id: "settled-browser-root", sessionId: sid, scope: "test-scope", mode: "prompt", message: "same intent", state: "failed", createdAt: 1 };
+  const copy = { id: "settled-server-copy", sessionId: sid, scope: "test-scope", mode: "prompt", message: root.message, state: "failed", replaces: root.id, createdAt: 2 };
+  const nativeBridge = { id: "settled-native-bridge", sessionId: sid, scope: "test-scope", mode: "prompt", message: "not proven stored locally", state: "sending", createdAt: 3 };
+  world.outbox = [root, copy, nativeBridge];
+  world.holds.push({
+    match: (method, url) => method === "GET" && url === `/api/sessions/${sid}/state`,
+    produce: async () => ({ value: { running: false, outbox: [], outboxSettledIds: [copy.id, nativeBridge.id], nativeSettledIds: [nativeBridge.id] } }),
+  });
+
+  const w = await mountSession(sid);
+  await act(async () => {
+    workerPort.onmessage({ data: { outbox: world.outbox.map((entry) => ({ ...entry, state: "sending" })) } });
+    await settle();
+  });
+
+  assert.ok(world.outboxReconciles.some(({ sessionId, confirmedIds }) => sessionId === sid && confirmedIds.includes(copy.id)));
+  assert.deepEqual(world.outbox.map((entry) => entry.id), [nativeBridge.id], "a native settlement without local proof does not discard its browser row");
+  assert.equal(w.latest.heldMessages.some((held) => held.id === nativeBridge.id), true);
+  assert.equal(w.latest.heldMessages.some((held) => held.id === root.id || held.id === copy.id), false);
+});
+
+test("Retry does not enqueue D when server-known lineage reconciliation fails", async () => {
+  resetWorld();
+  const sid = "server-known-reconcile-fails";
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.outboxHold = true;
+  world.lastOutboxAdd = undefined;
+  world.outboxReconcile = (_message, commit) => commit("Could not reconcile local outbox");
+  const root = { id: "failed-browser-root", sessionId: sid, scope: "test-scope", mode: "prompt", message: "same intent", state: "failed", createdAt: 1 };
+  const copy = { id: "failed-server-copy", sessionId: sid, scope: "test-scope", mode: "prompt", message: root.message, state: "failed", replaces: root.id, createdAt: 2 };
+  const serverCopy = { id: copy.id, sessionId: sid, mode: copy.mode, message: copy.message, state: "failed", createdAt: 2 };
+  const w = await mountWithServerKnownCopy(sid, serverCopy, [root, copy]);
+
+  await act(async () => { await w.latest.retryHeldMessage(copy.id); });
+  assert.equal(world.lastOutboxAdd, undefined, "failed local reconciliation never stores a retry through stale ancestry");
+  assert.deepEqual(world.outbox.map((entry) => entry.id).sort(), [root.id, copy.id].sort());
+  assert.equal(w.latest.heldMessages.some((held) => held.id === copy.id && held.state === "failed"), true);
+  assert.equal(w.latest.notices.some((notice) => notice.type === "error" && /reconcile/i.test(notice.message)), true);
+});
+
+test("Retry holds one identical copy that names the failed original and sends no outbox_remove", async () => {
+  resetWorld();
+  const sid = "outbox-retry";
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.outboxHold = true;
+  const entry = { id: "failed-once", sessionId: sid, mode: "followUp", message: "send me again", uploads: ["up-1"], state: "failed", error: "boom", createdAt: 1 };
+  const w = await mountWithFailed(sid, entry);
+  await act(async () => { await Promise.all([w.latest.retryHeldMessage(entry.id), w.latest.retryHeldMessage(entry.id)]); });
+  const copies = copiesOf("send me again");
+  assert.equal(copies.length, 1, "a double click holds one copy");
+  const [copy] = copies;
+  assert.notEqual(copy.id, entry.id);
+  assert.deepEqual({ mode: copy.mode, message: copy.message, uploads: copy.uploads, sessionId: copy.sessionId, replaces: copy.replaces }, { mode: "followUp", message: "send me again", uploads: ["up-1"], sessionId: sid, replaces: entry.id });
+  assert.deepEqual(removeCalls(sid), [], "the server retires the original when it stores the copy");
+});
+
+test("a stored copy hides its original before the outbox_update: Retry again holds no second copy", async () => {
+  resetWorld();
+  const sid = "outbox-retry-stored-first";
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.outboxHold = true;
+  const entry = { id: "failed-stored", sessionId: sid, mode: "prompt", message: "only once", state: "failed", createdAt: 1 };
+  const w = await mountWithFailed(sid, entry);
+  let adds = 0;
+  world.outboxCommit = (commit) => { adds += 1; commit(); };
+  await act(async () => { await w.latest.retryHeldMessage(entry.id); });
+  const retry = w.latest.retryHeldMessage;
+  // The receipt, then a Retry before React rendered it and before the server's outbox_update drops the original.
+  await act(async () => { storeCopy(); await retry(entry.id); });
+  assert.equal(adds, 1);
+  assert.equal(w.latest.heldMessages.some((held) => held.id === entry.id), false, "the original leaves the view with the receipt");
+  await act(async () => { await w.latest.retryHeldMessage(entry.id); });
+  assert.equal(adds, 1, "no copy after the stored one");
+  assert.deepEqual(removeCalls(sid), []);
+});
+
+for (const restart of ["remount", "reload"]) {
+  test(`after a ${restart}, Retry on an original whose copy still waits in the outbox holds no second copy`, async () => {
+    resetWorld();
+    const sid = `outbox-retry-${restart}`;
+    primeSession(sid, [userMsg("u0", "before")]);
+    world.outboxHold = true;
+    const entry = { id: `failed-${restart}`, sessionId: sid, mode: "prompt", message: "pending copy", state: "failed", createdAt: 1 };
+    const first = await mountWithFailed(sid, entry);
+    await act(async () => { await first.latest.retryHeldMessage(entry.id); });
+    assert.equal(copiesOf("pending copy").length, 1);
+    first.unmount();
+    const w = await mountWithFailed(sid, entry);
+    // A reload: a new page hears the worker's list of what IndexedDB holds.
+    if (restart === "reload") await act(async () => { workerPort.onmessage({ data: { outbox: world.outbox.map((held) => ({ ...held, state: "sending" })) } }); });
+    await act(async () => { await w.latest.retryHeldMessage(entry.id); });
+    assert.equal(copiesOf("pending copy").length, 1, "the copy in IndexedDB names this original");
+    assert.deepEqual(removeCalls(sid), []);
+  });
+}
+
+test("a Retry whose copy the server refuses keeps the failed original", async () => {
+  resetWorld();
+  const sid = "outbox-retry-server-refused";
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.outboxHold = true;
+  const entry = { id: "failed-files", sessionId: sid, mode: "prompt", message: "with a file", uploads: ["up-9"], state: "failed", createdAt: 1 };
+  const w = await mountWithFailed(sid, entry);
+  await act(async () => { await w.latest.retryHeldMessage(entry.id); });
+  await act(async () => { refuseCopy("upload_missing"); });
+  assert.deepEqual(removeCalls(sid), []);
+  assert.equal(w.latest.heldMessages.some((held) => held.id === entry.id && held.state === "failed"), true);
+});
+
+test("a Delete of the original while its copy waits shows no error when the copy is stored", async () => {
+  resetWorld();
+  const sid = "outbox-retry-delete-race";
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.outboxHold = true;
+  const entry = { id: "failed-raced", sessionId: sid, mode: "prompt", message: "raced", state: "failed", createdAt: 1 };
+  const w = await mountWithFailed(sid, entry);
+  world.holds.push({
+    match: (method, _url, body) => method === "POST" && body?.type === "outbox_remove",
+    produce: async () => ({ status: 200, value: { success: true, data: { removed: true } } }),
+  });
+  const notices = w.latest.notices.length;
+  await act(async () => { await w.latest.retryHeldMessage(entry.id); });
+  await act(async () => { await w.latest.deleteHeldMessage(entry.id); });
+  await act(async () => { storeCopy(); });
+  assert.deepEqual(removeCalls(sid), [{ type: "outbox_remove", id: entry.id }]);
+  assert.equal(w.latest.notices.length, notices);
+});
+
+test("Retry of this browser's failed message carries its images and upload proofs and leaves its row to the worker", async () => {
+  resetWorld();
+  const sid = "outbox-retry-local";
+  primeSession(sid, [userMsg("u0", "before")]);
+  const w = await mountSession(sid);
+  await act(async () => { await w.latest.handleSend("open channel"); });
+  world.outboxHold = true;
+  const images = [{ type: "image", data: "aGk=", mimeType: "image/png" }];
+  const local = { id: "local-failed", sessionId: sid, scope: "test-scope", mode: "steer", message: "with files", images, uploads: ["up-2"], uploadProofs: { "up-2": "proof-2" }, state: "failed", createdAt: 1 };
+  world.outbox = [local];
+  await act(async () => { workerPort.onmessage({ data: { outbox: [local] } }); });
+  let drops = 0;
+  world.outboxDrop = (commit) => { drops += 1; commit(); };
+  await act(async () => { await w.latest.retryHeldMessage(local.id); });
+  const copy = world.lastOutboxAdd.entry;
+  assert.notEqual(copy.id, local.id);
+  assert.deepEqual({ mode: copy.mode, message: copy.message, images: copy.images, uploads: copy.uploads, uploadProofs: copy.uploadProofs, replaces: copy.replaces }, { mode: "steer", message: "with files", images, uploads: ["up-2"], uploadProofs: { "up-2": "proof-2" }, replaces: local.id });
+  await act(async () => { storeCopy(); });
+  assert.equal(drops, 0, "the worker drops the original in the commit that deletes the stored copy");
+  assert.equal(w.latest.heldMessages.some((held) => held.id === local.id), false);
+});
+
 test("mounting a session with an outbox snapshot subscribes without starting omp and shows its held messages", async () => {
   resetWorld();
   const sid = "outbox-mount";
@@ -7954,6 +8505,56 @@ test("dismissing an uncertain bridge deletes the browser copy the worker still h
   assert.deepEqual(w.latest.heldMessages, []);
   assert.equal(world.outbox.some((held) => held.id === entry.id), false, "the browser copy is gone, so a reload cannot bring the row back");
   assert.equal(world.calls.some((call) => ["prompt", "steer", "follow_up", "outbox_remove"].includes(call.body?.type)), false, "dismissal neither resends nor touches the server row");
+});
+test("Retry of a native-settled server copy waits for lineage reconciliation before creating D", async (t) => {
+  resetWorld();
+  const sid = "native-settled-retry-lineage";
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.agents.set(sid, { running: true, state: { isStreaming: true, supportsClientMessageIds: true } });
+  world.outboxHold = true;
+  world.lastOutboxAdd = undefined;
+  const root = { id: "native-retry-root", sessionId: sid, mode: "followUp", message: "retry this", state: "failed", createdAt: 1 };
+  const copy = { ...root, id: "native-retry-copy", state: "failed", replaces: root.id, createdAt: 2 };
+  world.outbox = [root, copy];
+  world.clientMessageStatuses.set(sid, clientMessageStatus({ unresolvedClientMessageIds: [copy.id] }));
+  const pendingReconciliations = [];
+  world.outboxReconcile = (message, commit) => pendingReconciliations.push({ message, commit, released: false });
+  const release = async (reconciliation) => {
+    if (reconciliation.released) return;
+    reconciliation.released = true;
+    await act(async () => { reconciliation.commit(); await settle(); });
+  };
+  t.after(async () => {
+    for (const reconciliation of pendingReconciliations) await release(reconciliation);
+  });
+
+  const w = await mountSession(sid);
+  const es = lastEs();
+  await act(() => es.open());
+  await settle();
+  await act(() => workerPort.onmessage({ data: { outbox: world.outbox.map((entry) => ({ ...entry, scope: "test-scope" })) } }));
+  await act(() => es.emit({ type: "outbox_update", entries: [], settledIds: [copy.id], nativeSettledIds: [copy.id] }));
+  await until(() => w.latest.heldMessages.some((held) => held.id === copy.id && held.state === "failed" && held.mayHaveBeenSent),
+    "the native-settled copy becomes an uncertain bridge");
+  const proactiveReconciliations = pendingReconciliations.length;
+  assert.ok(proactiveReconciliations > 0, "the empty settled snapshot starts local lineage cleanup");
+
+  let retry;
+  await act(async () => { retry = w.latest.retryHeldMessage(copy.id); await Promise.resolve(); });
+  await until(() => pendingReconciliations.length > proactiveReconciliations, "Retry waits on its own reconciliation acknowledgement");
+  assert.equal(world.lastOutboxAdd, undefined, "D is not held before the worker commits reconciliation");
+  const retryReconciliation = pendingReconciliations.at(-1);
+  assert.deepEqual(retryReconciliation.message.confirmedIds, [copy.id]);
+
+  await release(retryReconciliation);
+  await retry;
+  assert.equal(world.lastOutboxAdd.entry.replaces, copy.id, "D names the native-settled C");
+  for (const reconciliation of pendingReconciliations) await release(reconciliation);
+
+  await act(async () => { refuseCopy("upload_missing"); });
+  assert.equal(w.latest.heldMessages.some((held) => held.id === copy.id && held.local === false && held.state === "failed"), true,
+    "refusing D leaves server bridge C visible");
+  assert.equal(w.latest.heldMessages.some((held) => held.id === root.id), false, "the browser-only O is no longer actionable");
 });
 
 test("an offline send follows its held bubble when the worker list arrives before the commit ACK", async () => {

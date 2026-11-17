@@ -1,5 +1,6 @@
 // Types mirrored from oh-my-pi coding-agent session-entries (v3 format).
-import type { RpcAskDialogAnswer, RpcAskDialogQuestion, TodoPhase } from "./pi-types";
+import type { HtmlFormData, RpcAskDialogQuestion, TodoPhase } from "./pi-types";
+import type { MessageOrigin, SessionOriginRef } from "./message-origin";
 
 // omp-web cannot import the Bun-only @oh-my-pi packages, so the on-disk
 // shapes are re-declared here. Legacy pi v1/v2 fields are kept optional.
@@ -78,6 +79,8 @@ export interface UserMessage {
   clientMessageId?: string;
   /** Rendered from a `branch_summary` entry, not a real prompt: omp cannot branch at it. */
   branchSummary?: true;
+  /** Server-authored provenance, stored outside the native message entry and never supplied by browser commands. */
+  origin?: MessageOrigin;
 }
 
 export interface AssistantMessage {
@@ -186,102 +189,102 @@ export type AgentMessage =
   | PythonExecutionMessage
   | FileMentionMessage;
 
-export type ExtensionUiRequest =
+/** omp's `ExtensionUIDialogOptions` as the runner sends them (no signal or callbacks). */
+export interface UiDialogOptions {
+  timeout?: number;
+  /** `input`: mask the entered text. */
+  secret?: boolean;
+  /** omp's checkbox list (ask multi-select): `checkedIndices` is the authoritative checked state. */
+  selectionMarker?: "radio" | "checkbox";
+  checkedIndices?: number[];
+  /** Leading options that get a marker; the rest are actions such as Other and Done. */
+  markableCount?: number;
+}
+
+// JSON turns an omitted middle argument into null.
+type UiDialogOptionsArg = UiDialogOptions | null;
+
+export type UiSelectItem = string | { label: string; description?: string };
+
+/** omp's `ExtensionApprovalPrompt`: a title line then details. */
+export interface UiApprovalPrompt {
+  full: string;
+  compact: string;
+  session?: string;
+  grants?: { scope: "folder" | "target"; label: string; alwaysLabel: string }[];
+}
+
+export type UiApprovalAnswer = "once" | "session" | "deny" | { grant: "folder" | "target"; always: boolean };
+
+/** omp's `ExtensionAskDialogSubmitResult`. */
+export interface UiAskDialogResult {
+  kind: "submit";
+  results: {
+    id: string;
+    question: string;
+    options: string[];
+    multi: boolean;
+    selectedOptions: string[];
+    customInput?: string;
+  }[];
+}
+
+/** omp's `ExtensionFormDialogResult`. */
+export interface UiFormDialogResult {
+  data: HtmlFormData;
+}
+
+export type AgentConfirmPayload =
   | {
-      type: "extension_ui_request";
-      id: string;
-      method: "select";
-      title: string;
-      options: string[];
-      timeout?: number;
-      expiresAt?: number;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "confirm";
-      title: string;
+      kind: "send_to_session";
+      from: SessionOriginRef;
+      to: SessionOriginRef | null;
+      delivery: "prompt" | "steer" | "followUp";
       message: string;
-      timeout?: number;
-      expiresAt?: number;
     }
   | {
-      type: "extension_ui_request";
-      id: string;
-      method: "input";
-      title: string;
-      placeholder?: string;
-      secret?: boolean;
-      password?: boolean;
-      timeout?: number;
-      expiresAt?: number;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "editor";
-      title: string;
-      prefill?: string;
-      /** omp sets this for plain-text answers (ask "Other"); render as prose, not code. */
-      promptStyle?: boolean;
-      timeout?: number;
-      expiresAt?: number;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "ask";
-      questions: RpcAskDialogQuestion[];
-      timeout?: number;
-      expiresAt?: number;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "notify";
-      message: string;
-      notifyType?: "info" | "warning" | "error";
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "setStatus";
-      statusKey: string;
-      statusText?: string;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "setWidget";
-      widgetKey: string;
-      widgetLines?: string[];
-      widgetPlacement?: "aboveEditor" | "belowEditor";
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "setTitle";
-      title: string;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "set_editor_text";
-      text: string;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "custom";
-      lines: string[];
-      closed?: boolean;
+      kind: "new_session";
+      from: SessionOriginRef;
+      host: { id: string; label: string };
+      cwd: string;
+      name: string | null;
+      message: string | null;
     };
 
-export type ExtensionUiResponse =
-  | { type: "extension_ui_response"; id: string; value: string }
-  | { type: "extension_ui_response"; id: string; confirmed: boolean }
-  | { type: "extension_ui_response"; id: string; cancelled: true }
-  | { type: "extension_ui_response"; id: string; answers: RpcAskDialogAnswer[] };
+/** What an omp dialog method returns; a cancel sends no value. */
+export type UiDialogValue = string | boolean | UiAskDialogResult | UiFormDialogResult | UiApprovalAnswer;
+
+/**
+ * A dialog the runner opened: `method` is omp's `ExtensionUIContext` method, `args` its positional
+ * arguments. omp-web's own confirms carry string ids. `expiresAt` (epoch ms) is set when it times out.
+ */
+export type UiDialogRequest = { type: "ui_request"; id: number | string; expiresAt?: number } & (
+  | { method: "select"; args: [title: string, options: UiSelectItem[], dialogOptions?: UiDialogOptionsArg] }
+  | { method: "confirm"; args: [title: string, message: string, dialogOptions?: UiDialogOptionsArg]; serverPayload?: AgentConfirmPayload }
+  | { method: "input"; args: [title: string, placeholder?: string | null, dialogOptions?: UiDialogOptionsArg] }
+  | {
+      method: "editor";
+      args: [title: string, prefill?: string | null, dialogOptions?: UiDialogOptionsArg, editorOptions?: { promptStyle?: boolean } | null];
+    }
+  | { method: "askDialog"; args: [questions: RpcAskDialogQuestion[], dialogOptions?: UiDialogOptionsArg] }
+  /** omp's whole-form ask: the agent's `<form>` HTML, rendered as controls, never as markup. */
+  | { method: "formDialog"; args: [html: string, dialogOptions?: UiDialogOptionsArg] }
+  | { method: "approve"; args: [prompt: UiApprovalPrompt, dialogOptions?: UiDialogOptionsArg] }
+);
+
+/** A presentation call from the runner. */
+export type UiPresentationFrame = { type: "ui" } & (
+  | { method: "notify"; message: string; notifyType?: "info" | "warning" | "error" }
+  | { method: "setStatus"; statusKey: string; statusText?: string }
+  | { method: "setWidget"; widgetKey: string; widgetLines?: string[]; widgetPlacement?: "aboveEditor" | "belowEditor" }
+  | { method: "setTitle"; title: string }
+  | { method: "set_editor_text"; text: string }
+  | { method: "setWorkingMessage"; message?: string }
+  /** A custom component's rendered lines; keys go back as `ui_input`. */
+  | { method: "custom"; id: number; lines: string[]; closed?: boolean }
+);
+
+export type UiCustomFrame = Extract<UiPresentationFrame, { method: "custom" }>;
 
 export interface ExtensionStatusItem {
   key: string;
@@ -463,6 +466,9 @@ export interface SessionInfo {
   /** Host the session's file lives on ("local" for this machine). Set by the
    *  all-hosts session list; a host's own list leaves it out. */
   hostId?: string;
+  /** Registered logical identity; physical owner/cwd/projectRoot remain unchanged. */
+  poolId?: string;
+  projectId?: string;
 }
 
 /** Metadata for a gzip-compressed session in OMP's archive tree. */
@@ -511,6 +517,13 @@ export interface ManagedProject {
   launchConfig?: ProjectLaunchConfig;
   /** Host the project lives on ("local" for this machine). Set by GET /api/projects. */
   hostId?: string;
+  /** Logical pool target; path/hostId, when present, are diagnostic only. */
+  poolId?: string;
+  projectId?: string;
+  projectKey?: string;
+  origin?: string;
+  name?: string;
+  defaultRef?: string;
 }
 
 export interface SessionContext {
@@ -566,6 +579,7 @@ export interface OutboxEntry {
   message: string;
   images?: { type: "image"; data: string; mimeType: string }[];
   uploads?: string[];
+  origin?: MessageOrigin;
   state: "held" | "waiting_host" | "delivering" | "failed" | "delivered";
   error?: string;
   /** A lost reply: omp may have it; never resent by itself. */

@@ -325,6 +325,7 @@ html.omp .omp-wordmark {
 html.dark:not([data-theme]):not(.omp),
 html[data-theme="dark"],
 html.theme-dark {
+  color-scheme: dark;
   --bg: #1B1916;
   --bg-panel: #231F1B;
   --bg-hover: #2B2721;
@@ -1898,10 +1899,7 @@ html[data-touch-targets="accessible"] :is(.image-lightbox-stepper button, .image
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
-/* New-session workspace picker: keep the destination legible without turning
-   it into a second prominent form. The folder badge and path provide a quiet
-   visual hierarchy while the native select preserves keyboard and platform
-   behavior. */
+/* New-session destination controls and their themed option lists. */
 .new-session-workspace {
   display: grid;
   gap: 8px;
@@ -1961,7 +1959,33 @@ html[data-touch-targets="accessible"] :is(.image-lightbox-stepper button, .image
   color: var(--accent);
   pointer-events: none;
 }
-.new-session-workspace-control select {
+.themed-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.themed-select-trigger:hover:not(:disabled) { background: var(--bg-hover); }
+.themed-select-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.themed-select-trigger[aria-invalid="true"] { border-color: var(--status-error); }
+.themed-select-trigger:disabled { opacity: 0.6; cursor: not-allowed; }
+.themed-select-value { flex: 1; min-width: 0; }
+.themed-select-chevron { flex-shrink: 0; color: var(--text-dim); }
+.workspace-select-trigger .themed-select-chevron { display: none; }
+.workspace-select-trigger {
   width: 100%;
   min-width: 0;
   height: 46px;
@@ -1969,7 +1993,8 @@ html[data-touch-targets="accessible"] :is(.image-lightbox-stepper button, .image
   overflow: hidden;
   border: 0;
   outline: 0;
-  appearance: none;
+  display: flex;
+  align-items: center;
   background: transparent;
   color: var(--text);
   cursor: pointer;
@@ -1977,14 +2002,77 @@ html[data-touch-targets="accessible"] :is(.image-lightbox-stepper button, .image
   font-size: 15px;
   font-weight: 500;
   line-height: 1.2;
+  text-align: left;
+}
+.themed-select-value {
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.new-session-workspace-control select option {
+.themed-select-item-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.themed-select-positioner {
+  z-index: 1100;
+  min-width: var(--anchor-width);
+  width: max-content;
+  max-width: calc(100vw / var(--ui-scale, 1) - 24px);
+}
+.themed-select-popup {
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
   background: var(--bg-panel);
   color: var(--text);
-  font-family: var(--font-mono);
+  box-shadow: var(--shadow-pop);
+}
+.themed-select-list {
+  max-height: min(320px, calc(var(--available-height) - 8px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-padding: 4px;
+}
+.themed-select-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  outline: none;
   font-size: 13px;
+  line-height: 1.4;
+  cursor: pointer;
+  user-select: none;
+}
+.themed-select-item[data-highlighted] {
+  background: var(--bg-hover);
+}
+.themed-select-item[data-selected] {
+  font-weight: 600;
+}
+.themed-select-item[data-disabled] {
+  color: var(--text-dim);
+  cursor: not-allowed;
+}
+.themed-select-item[data-action] {
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--text-muted);
+}
+.themed-select-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+@media (max-width: 640px) {
+  .themed-select-item {
+    min-height: 44px;
+  }
 }
 .new-session-workspace-chevron {
   position: absolute;
@@ -3043,7 +3131,7 @@ html.dark .dropdown-surface :is(select, option) {
 }
 
 /* Dropdowns take at most half the card and ellipsize long option labels. */
-.settings-card-control:has(> select) {
+.settings-card-control:has(> .themed-select-trigger) {
   flex-shrink: 1;
   max-width: 50%;
 }
@@ -3110,17 +3198,17 @@ html.dark .dropdown-surface :is(select, option) {
 }
 
 @media (max-width: 640px) {
-  /* Stack dropdown rows so the select spans the full card below its label. */
-  .settings-card:has(> .settings-card-control > select),
+  /* Stack dropdown rows so the control spans the full card below its label. */
+  .settings-card:has(> .settings-card-control > .themed-select-trigger),
   .settings-card:has(> .settings-card-control > .compaction-method-order) {
     flex-direction: column;
     align-items: stretch;
     gap: 8px;
   }
-  .settings-card-control:has(> select) {
+  .settings-card-control:has(> .themed-select-trigger) {
     max-width: none;
   }
-  .settings-card-control > select {
+  .settings-card-control > .themed-select-trigger {
     width: 100%;
   }
 }
@@ -4662,6 +4750,79 @@ html[data-touch-targets="accessible"] .right-panel-toolbar {
 }
 .skip-link:focus { transform: translateY(0); box-shadow: var(--shadow-pop); }
 
+.git-change-mention-action { background: transparent; color: var(--text-muted); }
+.git-change-mention-action:disabled { color: var(--text-dim); }
+.git-change-mention-action:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+
+.file-explorer-row:not([aria-disabled="true"]):not([aria-current="true"]):hover {
+  background: var(--bg-hover);
+}
+.file-explorer-row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.file-explorer-row-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 14px;
+  flex-shrink: 0;
+}
+.file-explorer-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.file-explorer-row-action,
+.file-explorer-row-action-slot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
+  width: 20px;
+  height: 20px;
+}
+.file-explorer-row-action {
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  text-decoration: none;
+}
+.file-explorer-row-action:hover {
+  background: var(--bg-selected);
+  color: var(--text);
+}
+.file-explorer-row-action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  color: var(--text);
+}
+@media (hover: hover) and (pointer: fine) {
+  .file-explorer-row-actions {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .file-explorer-row:hover .file-explorer-row-actions,
+  .file-explorer-row:focus-within .file-explorer-row-actions,
+  .file-explorer-row[aria-current="true"] .file-explorer-row-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+@media (max-width: 640px) {
+  .file-explorer-row-action,
+  .file-explorer-row-action-slot {
+    flex-basis: 44px;
+    width: 44px;
+    height: 44px;
+  }
+}
+
 /* Touch target density options (Settings -> Touch Targets). */
 html[data-touch-targets="accessible"] :is(
   .shell-toolbar-btn,
@@ -4827,6 +4988,110 @@ html[data-touch-targets="accessible"] .extension-dialog-footer > button {
   html:not([data-touch-targets="compact"]):not([data-touch-targets="accessible"]) .extension-dialog-footer > button {
     min-height: 40px;
   }
+}
+
+/* omp's ask dialogs: one choice-row look for select, approve, ask and the
+   agent's own forms. A chosen or pre-checked row is tinted; Recommended stays
+   a text tag so it never reads as a selection. */
+.extension-dialog-header { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.extension-dialog-body { padding: 16px; }
+@media (max-width: 640px) {
+  .extension-dialog-header { padding: 10px 12px; }
+  .extension-dialog-body { padding: 12px; }
+}
+.extension-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
+}
+.extension-choice > input { flex-shrink: 0; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--accent-strong); cursor: pointer; }
+.extension-choice-mark { flex-shrink: 0; width: 16px; text-align: center; color: var(--text-dim); }
+.extension-choice[data-checked] .extension-choice-mark { color: var(--accent); }
+@media (hover: hover) {
+  .extension-choice:not(:disabled, [data-checked], :has(input:checked)):hover {
+    background: var(--bg-hover);
+    border-color: color-mix(in srgb, var(--text-muted) 35%, var(--border));
+  }
+}
+.extension-choice:is([data-checked], :has(input:checked)) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-panel));
+}
+/* The Other row's text box has no frame of its own, so the row shows its focus. */
+.extension-choice:has(textarea:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+html.omp .extension-choice:has(textarea:focus-visible) { outline-color: var(--accent-2); }
+.extension-choice:disabled { cursor: default; opacity: 0.6; }
+/* omp's trailing "Done selecting" row is an action, not one more answer. */
+.extension-choice-action { justify-content: center; border-style: dashed; background: transparent; color: var(--text-muted); font-weight: 600; }
+.extension-choice textarea::placeholder,
+.extension-field::placeholder { color: var(--text-dim); opacity: 1; }
+.extension-field {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 36px;
+  padding: 7px 12px;
+  /* At least 3:1 against the fill on the darkest themes (omp, warm dark). */
+  border: 1px solid color-mix(in srgb, var(--text-muted) 55%, var(--border));
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+}
+.extension-field:focus-visible { border-radius: 8px; outline-offset: 1px; }
+.extension-dialog-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 20px;
+}
+.extension-dialog-form p { margin: 0 0 4px; color: var(--text-muted); }
+.extension-dialog-form pre { margin: 0; max-width: 100%; overflow-x: auto; }
+.extension-dialog-form fieldset { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.extension-dialog-form legend { margin-bottom: 8px; padding: 0; font-weight: 600; }
+/* A field's own label opens a new block: more room above it than below it. */
+.extension-dialog-form label:not(.extension-choice, .extension-choice > label) { margin-top: 8px; color: var(--text-muted); font-size: 12px; font-weight: 600; }
+.extension-dialog-form fieldset + fieldset,
+.extension-dialog-form .extension-field + .extension-choice { margin-top: 10px; }
+.extension-choice > label { flex: 1; min-width: 0; cursor: pointer; }
+.extension-choice-text { flex: 1; min-width: 0; }
+.extension-dialog-form :user-invalid { border-color: var(--status-error); }
+.extension-dialog-button {
+  min-height: 32px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.extension-dialog-button:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.extension-dialog-button-primary { border-color: var(--accent-strong); background: var(--accent-strong); color: var(--on-accent); }
+.extension-dialog-button-primary:hover:not(:disabled) { background: var(--accent-strong); color: var(--on-accent); filter: brightness(1.12); }
+.extension-dialog-button-primary:disabled { background: var(--bg-subtle); color: var(--text-dim); cursor: not-allowed; opacity: 0.65; }
+html[data-touch-targets="accessible"] :is(.extension-choice, .extension-field) { min-height: 44px; }
+@media (max-width: 640px) and (pointer: coarse) and (hover: none) {
+  html:not([data-touch-targets="compact"]):not([data-touch-targets="accessible"]) :is(.extension-choice, .extension-field) { min-height: 40px; }
 }
 
 /* Pagination restores history without replaying entrance motion. */
