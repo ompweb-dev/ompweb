@@ -16,7 +16,7 @@ Current state: `runner/omp-build.json` pins the fork release `v18.20.0-int.20261
 |---|---|---|
 | `ompweb-dev/oh-my-pi` (the fork) | the omp round on branch `fork-ci` (workflows, config, fixups, repair prompt, helper scripts); releases `v<upstream>-int.<stamp>.g<sha7>` with binaries and an npm package zip; `integration-release`; `apple-sdk` mirror; escalation issues | Environment `omp-round` (only `fork-ci`): `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OMP_FORK_TOKEN` (fallback only, F3). Everything else uses the workflow's own `GITHUB_TOKEN` |
 | `ompweb-dev/ompweb` | `runner/` pinned to one fork release's packages; every (pre)release re-pins to the newest `integration-release` build; the omp row follows ompweb | none |
-| `andrebrait/integration-ci` | the `integration` script (single copy); graphify, superpowers and ompweb builds; its omp workflows, scripts, config, fixups, releases and omp secrets are deleted after cut-over | omp secrets removed |
+| `andrebrait/integration-ci` | the `integration` script (single copy); superpowers and ompweb builds; its omp workflows, scripts, config, fixups, releases and omp secrets are deleted after cut-over | omp secrets removed |
 
 ## Fork
 
@@ -115,7 +115,7 @@ The script stays only in integration-ci. Changes there (also used by the round t
 - `CI_CONFIG_REF` (default `origin/main`): the ref `ci_build` fetches and diffs the config and `.github` against before dispatching (today hard-coded `origin main`).
 - Tests in `integration.test.sh` for both.
 
-Host wiring (the build host): a worktree of `fork-ci`. `~/.config/integration` becomes a directory: per-file symlinks into `integration-ci/config` for graphify, superpowers, ompweb, the pin scripts, `fixups/root--git--ompweb` and the `.retired-*` dirs; `root--git--oh-my-pi.sh` and `fixups/root--git--oh-my-pi` link into the `fork-ci` worktree. `ci_build` resolves the config's repository through `readlink -f`, so it diffs that worktree against `origin/fork-ci`.
+Host wiring (the build host): a worktree of `fork-ci`. `~/.config/integration` becomes a directory: per-file symlinks into `integration-ci/config` for superpowers, ompweb, the pin scripts, `fixups/root--git--ompweb` and the `.retired-*` dirs; `root--git--oh-my-pi.sh` and `fixups/root--git--oh-my-pi` link into the `fork-ci` worktree. `ci_build` resolves the config's repository through `readlink -f`, so it diffs that worktree against `origin/fork-ci`.
 
 `integration build` for oh-my-pi dispatches `omp.yml` on the fork; the reuse lookup reads `project: oh-my-pi` from `fork-ci`'s `omp.yml` and finds zips in the fork's rolling `oh-my-pi` release. `DEPLOY_CMD` is unchanged. Deploying an auto round, in the local oh-my-pi checkout: `git fetch origin && git branch -f integration origin/integration-release && integration build && integration deploy`. The first such deploy after F9 is the bootstrap install on the build host.
 
@@ -206,7 +206,7 @@ Before W3 the omp row ran `omp update` through `resolveOmpBin()`, i.e. `ompweb-o
 
 ## integration-ci cleanup
 
-After one green scheduled round in the fork and one green ompweb pre-release on it: delete `.github/workflows/omp-auto.yml`, `omp.yml`; `.github/actions/omp-agent`, `omp-round`; `scripts/{collect-round,commit-fixups,publish-round,push-rebased}.sh`; `prompts/omp-repair.md`; `config/root--git--oh-my-pi.sh`; `config/fixups/root--git--oh-my-pi/`; the `oh-my-pi` and `apple-sdk` releases; README's oh-my-pi section; the secrets `OMP_FORK_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` if no remaining workflow references them. `docs/specs/2026-11-11-omp-auto-integration-design.md` gets "superseded by the fork's `fork-ci` branch; see ompweb-dev/ompweb `docs/specs/2026-11-12-omp-build-in-ompweb-design.md`". Kept: `integration` (F8), `changelog-merge`, `integration.test.sh`, `publish.yml`, `ompweb.yml` (with W1's fetch line), `graphify.yml`, `superpowers.yml`, the `omp-auto` label and old issues.
+After one green scheduled round in the fork and one green ompweb pre-release on it: delete `.github/workflows/omp-auto.yml`, `omp.yml`; `.github/actions/omp-agent`, `omp-round`; `scripts/{collect-round,commit-fixups,publish-round,push-rebased}.sh`; `prompts/omp-repair.md`; `config/root--git--oh-my-pi.sh`; `config/fixups/root--git--oh-my-pi/`; the `oh-my-pi` and `apple-sdk` releases; README's oh-my-pi section; the secrets `OMP_FORK_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` if no remaining workflow references them. `docs/specs/2026-11-11-omp-auto-integration-design.md` gets "superseded by the fork's `fork-ci` branch; see ompweb-dev/ompweb `docs/specs/2026-11-12-omp-build-in-ompweb-design.md`". Kept: `integration` (F8), `changelog-merge`, `integration.test.sh`, `publish.yml`, `ompweb.yml` (with W1's fetch line), `superpowers.yml`, the `omp-auto` label and old issues.
 
 ## Rollout and rollback
 
