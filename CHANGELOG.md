@@ -6,11 +6,14 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+## [v0.7.3] - 2026-11-18
+
 ### Fixed
 
 - **A linked host on 0.7.1 or older updates normally again.** Once this server's own release was published, Settings → Hosts refused the normal update of an older linked host's daemon with "This host requires explicitly approved recovery": the forced-recovery method the server now offers such a host was applied to every update, not only to **Force update**. A normal update goes through that host's own updater again. This machine's older daemon is still updated with **Force update**, as before.
 - **The Windows tray in the npm package is built from the release's sources.** Releases shipped a committed `bin/omp-web-tray.exe` last rebuilt on 2026-11-14, so 0.7.2's tray still started the launcher inside the installation directory and could keep an in-app update from renaming it (#530). The release workflow now builds the tray from the tagged `native/tray` (`scripts/build-tray.sh`) and refuses one that does not carry the tagged commit; every PR builds it too.
 - **A slow or unstable link no longer blocks an update on the omp runner download.** A runner download that drops, stalls for 60 s or gets a server error resumes with an HTTP `Range` request where it stopped. A failed attempt keeps its partial file in the agent directory's runner folder (`omp-web/omp/<version>/.partial-…`), so a retry of the update continues it instead of starting the ~240 MB download over, binary hosts included (#531). The error names the runner's SHA-256 and a path where a runner downloaded by hand is checked and installed on the next attempt.
+- **Adding a message to the outbox takes its database's write lock once.** Pruning delivered entries ran as a separate write before each add, so with several servers sharing one agent directory an add could wait past the lock timeout and fail with "database is locked" (seen on Windows). The prune now runs inside the add's own transaction.
 
 ## [v0.7.2] - 2026-11-18
 
