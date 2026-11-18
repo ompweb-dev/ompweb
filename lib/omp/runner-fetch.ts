@@ -93,13 +93,27 @@ export async function downloadRunner(pin: Pin, asset: string, target: string): P
       if (ready) { rmSync(mine, { force: true }); renameSync(placed, mine); }
       rmSync(placed, { force: true });
       // Else this process's own partial (an earlier call's), or one claimed from a gone process: complete, or continued.
-      if (!ready) ready = (existsSync(mine) || claimPartial(kept, mine)) && await fileSha256(mine) === sha256;
+      const claimed = !ready && !existsSync(mine) && claimPartial(kept, mine);
+      if (!ready) ready = existsSync(mine) && await fileSha256(mine) === sha256;
       if (!ready) {
         const digest = await downloadHostUpdateFile(url, mine, HOST_RELEASE_MAX_MEMBER, undefined, true);
         if (digest !== `sha256:${sha256}`) { rmSync(mine, { force: true }); throw new Error(`its SHA-256 is not the one ${OMP_RUNNER_CHECKSUMS} lists`); }
       }
-      chmodSync(mine, 0o755);
-      moveInto(mine, target);
+      if (claimed) {
+        // A claimed file may still be open in a process that reused its owner's pid: install a checked copy, a file no
+        // other process holds, so nothing written to the claimed one afterwards can reach the installed runner.
+        const copy = `${target}.${process.pid}.${Date.now()}.partial`;
+        try {
+          copyFileSync(mine, copy);
+          if (await fileSha256(copy) !== sha256) throw new Error(`its SHA-256 changed while it was installed; retry`);
+          chmodSync(copy, 0o755);
+          renameSync(copy, target);
+        } finally { rmSync(copy, { force: true }); }
+        rmSync(mine, { force: true });
+      } else {
+        chmodSync(mine, 0o755);
+        moveInto(mine, target);
+      }
     };
     const queued = (runnerDownloads.get(mine) ?? Promise.resolve()).catch(() => {}).then(work);
     runnerDownloads.set(mine, queued);
