@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, createReadStream, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, createReadStream, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import packageJson from "../../package.json";
@@ -26,34 +26,22 @@ const KEPT_PARTIAL = ".partial-";
 const keptPartial = (sha256: string, asset: string) => join(ompRunnerRoot(), `${KEPT_PARTIAL}${sha256.slice(0, 16)}-${asset}`);
 const downloadBase = ({ repo, tag }: Pin) => `https://github.com/${repo}/releases/download/${tag}`;
 
-/** Creates `lock` holding this process's pid, complete from the moment it exists (a reader never sees it empty). */
-function createLock(lock: string): boolean {
-  const draft = `${lock}.${process.pid}.${Date.now()}`;
-  writeFileSync(draft, String(process.pid), { mode: 0o600 });
-  try { linkSync(draft, lock); return true; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
-  finally { rmSync(draft, { force: true }); }
-}
-
-/** Holds `lock` for this process while `run` runs, or runs nothing and returns null while another process holds it.
- * Correctness never rests on the lock (downloadRunner checks the finished file as it is on disk): a lost race costs one
- * attempt, never a wrong runner. */
-async function withPartialLock<T>(lock: string, run: () => Promise<T>): Promise<T | null> {
-  if (!createLock(lock)) {
-    let owner: string;
-    try { owner = readFileSync(lock, "utf8"); } catch { return null; }
-    if (isProcessAlive(Number(owner))) return null;
-    // Its process is gone (killed by an updater's time limit, say). Move the lock aside and take over only if what was
-    // moved is still that dead owner's: a process that took it over meanwhile has a live pid in it, and gets it back.
-    const stale = `${lock}.${process.pid}.stale`;
-    try { renameSync(lock, stale); } catch { return null; }
-    const moved = readFileSync(stale, "utf8");
-    if (moved !== owner) { try { linkSync(stale, lock); } catch { /* a third process holds it now */ } rmSync(stale, { force: true }); return null; }
-    rmSync(stale, { force: true });
-    if (!createLock(lock)) return null;
+/**
+ * Takes over the partial download of `kept` that no live process is writing: the file placed by hand at `kept` itself,
+ * or `<kept>.<pid>` of a process that is gone (killed by an updater's time limit, say), by renaming it to `mine`. A rename
+ * succeeds for one claimant only, and a live process's file is never touched, so two processes never write one file.
+ * Returns whether `mine` now holds such bytes.
+ */
+function claimPartial(kept: string, mine: string): boolean {
+  const prefix = `${basename(kept)}.`;
+  let names: string[];
+  try { names = readdirSync(dirname(kept)); } catch { return false; }
+  for (const name of names) {
+    const pid = name.startsWith(prefix) ? Number(name.slice(prefix.length)) : NaN;
+    if (name !== basename(kept) && !(Number.isSafeInteger(pid) && pid > 0 && !isProcessAlive(pid))) continue;
+    try { renameSync(join(dirname(kept), name), mine); return true; } catch { /* another process claimed it first */ }
   }
-  try { return await run(); }
-  finally { try { if (readFileSync(lock, "utf8") === String(process.pid)) rmSync(lock); } catch { /* already gone */ } }
+  return false;
 }
 
 async function fileSha256(file: string): Promise<string> {
@@ -72,10 +60,9 @@ function moveInto(from: string, to: string): void {
 
 /** Downloads `asset` of the fork release `pin` to `target` (atomically, executable) once its SHA-256 matches the one the
  * release's OMP_RUNNER_CHECKSUMS lists; returns that SHA-256. A failure names the file it was fetching. The download
- * goes to `.partial-<sha256 prefix>-<asset>` in this version's runner directory (a stable place: a compiled release's own
- * directory is an updater's staging directory, removed with a failed attempt), which a failed attempt keeps, so the next
- * one continues it rather than starting over on a slow link (#531); a second process fetching the same file meanwhile
- * uses a partial of its own beside `target`. */
+ * goes to `.partial-<sha256 prefix>-<asset>.<pid>` in this version's runner directory (a stable place: a compiled
+ * release's own directory is an updater's staging directory, removed with a failed attempt), which a failed attempt
+ * keeps, so the next one claims and continues it rather than starting over on a slow link (#531). */
 export async function downloadRunner(pin: Pin, asset: string, target: string): Promise<string> {
   let url = `${downloadBase(pin)}/${OMP_RUNNER_CHECKSUMS}`;
   let expected: string | undefined;
@@ -86,30 +73,23 @@ export async function downloadRunner(pin: Pin, asset: string, target: string): P
     const sha256 = expected;
     mkdirSync(dirname(target), { recursive: true });
     url = `${downloadBase(pin)}/${asset}`;
-    const download = async (partial: string, resume: boolean) => {
-      try {
-        const digest = await downloadHostUpdateFile(url, partial, HOST_RELEASE_MAX_MEMBER, undefined, resume);
-        if (digest !== `sha256:${sha256}`) { rmSync(partial, { force: true }); throw new Error(`its SHA-256 is not the one ${OMP_RUNNER_CHECKSUMS} lists`); }
-        chmodSync(partial, 0o755);
-        moveInto(partial, target);
-      } catch (error) {
-        if (!resume) rmSync(partial, { force: true });
-        throw error;
-      }
-    };
     const kept = keptPartial(sha256, asset);
+    // This process's own partial (an earlier call's) first, else one it claims from a gone process.
+    const mine = `${kept}.${process.pid}`;
     mkdirSync(dirname(kept), { recursive: true });
-    // A complete runner already there (placed by hand, or an attempt killed before it moved it) needs no request.
-    const placed = async () => {
-      if (existsSync(kept) && await fileSha256(kept) === sha256) { chmodSync(kept, 0o755); moveInto(kept, target); return; }
-      await download(kept, true);
-    };
-    if (await withPartialLock(`${kept}.lock`, placed) === null) await download(`${target}.${process.pid}.${Date.now()}.partial`, false);
+    const claimed = existsSync(mine) || claimPartial(kept, mine);
+    // A complete runner (placed by hand, or an attempt killed before it moved it) needs no request.
+    if (!claimed || await fileSha256(mine) !== sha256) {
+      const digest = await downloadHostUpdateFile(url, mine, HOST_RELEASE_MAX_MEMBER, undefined, true);
+      if (digest !== `sha256:${sha256}`) { rmSync(mine, { force: true }); throw new Error(`its SHA-256 is not the one ${OMP_RUNNER_CHECKSUMS} lists`); }
+    }
+    chmodSync(mine, 0o755);
+    moveInto(mine, target);
     return sha256;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const missing = /\(404\)/.test(reason) ? ` (${pin.repo} release ${pin.tag} attaches no ${basename(url)})` : "";
-    // The kept partial is where every attempt resumes from: a complete file there is checked and installed as is.
+    // Every attempt claims a file placed there: a complete one is checked and installed as is.
     const seed = expected ? `, or place ${asset} (SHA-256 ${expected}) at ${keptPartial(expected, asset)}` : "";
     throw new Error(`Could not fetch ompweb's omp from ${url}: ${reason}${missing}. Check this machine's connection to GitHub (a retry continues the download where it stopped)${seed}, or set OMP_WEB_OMP_BIN to an ompweb-omp binary.`);
   }
