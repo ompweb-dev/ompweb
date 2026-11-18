@@ -34,6 +34,12 @@ jobs:
 
       - run: npm install --global npm@^11.5.1
       - run: npm ci
+      # The package's Windows tray, built from this tag's native/tray rather than the committed copy (#530).
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.x
+      - name: Build the Windows tray
+        run: sh scripts/build-tray.sh
       # The omp runner this release ships against and records: the newest published release of the fork (ompweb-dev/oh-my-pi,
       # which builds and releases it) that attaches every platform's runner and whose ompweb-omp.json names this ompweb's
       # RUNNER_PROTOCOL, written into omp-runner.json here (the npm package and the binaries bake it in; not committed back).

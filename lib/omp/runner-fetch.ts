@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import packageJson from "../../package.json";
 import { downloadHostUpdateFile, fetchHostUpdateBytes, HOST_RELEASE_MAX_MEMBER } from "../hosts/update-worker";
+import { isProcessAlive } from "../process-identity";
 import { createChildProcessEnvironment } from "../project-command-env";
 import { isRecord } from "../type-guards";
 import { fetchedOmpBin, OMP_RUNNER_ASSET, OMP_RUNNER_PIN, OMP_TAG, ompRunnerPath, ompRunnerRoot, readOmpPointer, resolveOmpBin, RUNNER_PROTOCOL, writeOmpPointer } from "./omp-cli";
@@ -19,29 +20,69 @@ export const OMP_RUNNER_CHECKSUMS = "ompweb-omp.sha256";
 export const OMP_RUNNER_INFO = "ompweb-omp.json";
 
 type Pin = typeof OMP_RUNNER_PIN;
+/** Prefix of a runner download a failed attempt left for the next one (downloadRunner). */
+const KEPT_PARTIAL = ".partial-";
 const downloadBase = ({ repo, tag }: Pin) => `https://github.com/${repo}/releases/download/${tag}`;
 
+/** Holds `lock` for this process while `run` runs, or runs nothing and returns null while a live process holds it. */
+async function withPartialLock<T>(lock: string, run: () => Promise<T>): Promise<T | null> {
+  try { writeFileSync(lock, String(process.pid), { flag: "wx", mode: 0o600 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || isProcessAlive(Number(readFileSync(lock, "utf8")))) return null;
+    // Its process is gone (killed by an updater's time limit, say). Only the process whose rename moves it away takes
+    // the partial over: two that both saw it dead cannot both remove a lock and write one partial.
+    const stale = `${lock}.${process.pid}.stale`;
+    try { renameSync(lock, stale); } catch { return null; }
+    rmSync(stale, { force: true });
+    try { writeFileSync(lock, String(process.pid), { flag: "wx", mode: 0o600 }); } catch { return null; }
+  }
+  try { return await run(); } finally { rmSync(lock, { force: true }); }
+}
+
+/** Moves a finished download into place; across filesystems (a compiled binary's directory) by copy and rename. */
+function moveInto(from: string, to: string): void {
+  try { return renameSync(from, to); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error; }
+  const copy = `${to}.${process.pid}.${Date.now()}.partial`;
+  try { copyFileSync(from, copy); chmodSync(copy, 0o755); renameSync(copy, to); } finally { rmSync(copy, { force: true }); }
+  rmSync(from, { force: true });
+}
+
 /** Downloads `asset` of the fork release `pin` to `target` (atomically, executable) once its SHA-256 matches the one the
- * release's OMP_RUNNER_CHECKSUMS lists; returns that SHA-256. A failure names the file it was fetching. */
+ * release's OMP_RUNNER_CHECKSUMS lists; returns that SHA-256. A failure names the file it was fetching. The download
+ * goes to `.partial-<sha256 prefix>-<asset>` in this version's runner directory (a stable place: a compiled release's own
+ * directory is an updater's staging directory, removed with a failed attempt), which a failed attempt keeps, so the next
+ * one continues it rather than starting over on a slow link (#531); a second process fetching the same file meanwhile
+ * uses a partial of its own beside `target`. */
 export async function downloadRunner(pin: Pin, asset: string, target: string): Promise<string> {
-  const partial = `${target}.${process.pid}.${Date.now()}.partial`;
   let url = `${downloadBase(pin)}/${OMP_RUNNER_CHECKSUMS}`;
+  let expected: string | undefined;
   try {
     const sums = (await fetchHostUpdateBytes(url, 64 * 1024, 30_000)).toString("utf8");
-    const expected = sums.split("\n").map((line) => line.trim().split(/\s+\*?/)).find(([, name]) => name === asset)?.[0];
+    expected = sums.split("\n").map((line) => line.trim().split(/\s+\*?/)).find(([, name]) => name === asset)?.[0];
     if (!expected || !/^[a-f0-9]{64}$/.test(expected)) throw new Error(`${OMP_RUNNER_CHECKSUMS} lists no ${asset}`);
+    const sha256 = expected;
     mkdirSync(dirname(target), { recursive: true });
     url = `${downloadBase(pin)}/${asset}`;
-    const digest = await downloadHostUpdateFile(url, partial, HOST_RELEASE_MAX_MEMBER);
-    if (digest !== `sha256:${expected}`) throw new Error(`its SHA-256 is not the one ${OMP_RUNNER_CHECKSUMS} lists`);
-    chmodSync(partial, 0o755);
-    renameSync(partial, target);
-    return expected;
+    const download = async (partial: string, resume: boolean) => {
+      try {
+        const digest = await downloadHostUpdateFile(url, partial, HOST_RELEASE_MAX_MEMBER, undefined, resume);
+        if (digest !== `sha256:${sha256}`) { rmSync(partial, { force: true }); throw new Error(`its SHA-256 is not the one ${OMP_RUNNER_CHECKSUMS} lists`); }
+        chmodSync(partial, 0o755);
+        moveInto(partial, target);
+      } catch (error) {
+        if (!resume) rmSync(partial, { force: true });
+        throw error;
+      }
+    };
+    const kept = join(ompRunnerRoot(), `${KEPT_PARTIAL}${sha256.slice(0, 16)}-${asset}`);
+    mkdirSync(dirname(kept), { recursive: true });
+    if (await withPartialLock(`${kept}.lock`, () => download(kept, true)) === null) await download(`${target}.${process.pid}.${Date.now()}.partial`, false);
+    return sha256;
   } catch (error) {
-    rmSync(partial, { force: true });
     const reason = error instanceof Error ? error.message : String(error);
     const missing = /\(404\)/.test(reason) ? ` (${pin.repo} release ${pin.tag} attaches no ${basename(url)})` : "";
-    throw new Error(`Could not fetch ompweb's omp from ${url}: ${reason}${missing}. Check this machine's connection to GitHub, or set OMP_WEB_OMP_BIN to an ompweb-omp binary.`);
+    const seed = expected ? `, or place ${asset} (SHA-256 ${expected}) at ${target}` : "";
+    throw new Error(`Could not fetch ompweb's omp from ${url}: ${reason}${missing}. Check this machine's connection to GitHub (a retry continues the download where it stopped)${seed}, or set OMP_WEB_OMP_BIN to an ompweb-omp binary.`);
   }
 }
 
