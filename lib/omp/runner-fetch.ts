@@ -99,7 +99,7 @@ export async function downloadRunner(pin: Pin, asset: string, target: string): P
         chmodSync(copy, 0o755);
         renameSync(copy, target);
       } finally { rmSync(copy, { force: true }); }
-      rmSync(mine, { force: true });
+      try { rmSync(mine, { force: true }); } catch { /* still open elsewhere (Windows): left to its claimant */ }
     };
     const queued = (runnerDownloads.get(mine) ?? Promise.resolve()).catch(() => {}).then(work);
     runnerDownloads.set(mine, queued);
