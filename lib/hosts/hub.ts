@@ -1823,8 +1823,9 @@ export async function updateHostSoftware(id: string, target: HostUpdateTarget, v
   }
   const candidate = checked[target];
   const link = linkFor(id);
-  // A recovery force method is what Force uses; an old daemon that can update itself still does so for a normal update.
-  const recovery = candidate.forceMethod === "recovery" && options.force === true || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
+  // This machine's old daemon is updated only by recovery, which Force confirms. A linked host's old daemon still updates
+  // itself for a normal update: the recovery helper its Force uses is offered beside that, not instead of it.
+  const recovery = candidate.forceMethod === "recovery" && (options.force === true || id === LOCAL_HOST_ID) || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
   const pinnedRecovery = options.releasePin !== undefined && recovery;
   if (!matching && (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version && !pinnedRecovery)) {
     // An omp update names its blocker (ompweb_update_active, omp_install_active...) for a caller that must not read English.
