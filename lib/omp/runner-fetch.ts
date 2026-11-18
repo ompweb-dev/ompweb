@@ -27,8 +27,8 @@ const keptPartial = (sha256: string, asset: string) => join(ompRunnerRoot(), `${
 const downloadBase = ({ repo, tag }: Pin) => `https://github.com/${repo}/releases/download/${tag}`;
 
 /**
- * Takes over the partial download of `kept` that no live process is writing: the file placed by hand at `kept` itself,
- * or `<kept>.<pid>` of a process that is gone (killed by an updater's time limit, say), by renaming it to `mine`. A rename
+ * Takes over a partial download of `kept` that no live process is writing, `<kept>.<pid>` of a process that is gone
+ * (killed by an updater's time limit, say), by renaming it to `mine`. A rename
  * succeeds for one claimant only, and a live process's file is never touched, so two processes never write one file.
  * Returns whether `mine` now holds such bytes.
  */
@@ -38,7 +38,7 @@ function claimPartial(kept: string, mine: string): boolean {
   try { names = readdirSync(dirname(kept)); } catch { return false; }
   for (const name of names) {
     const pid = name.startsWith(prefix) ? Number(name.slice(prefix.length)) : NaN;
-    if (name !== basename(kept) && !(Number.isSafeInteger(pid) && pid > 0 && !isProcessAlive(pid))) continue;
+    if (!(Number.isSafeInteger(pid) && pid > 0 && !isProcessAlive(pid))) continue;
     try { renameSync(join(dirname(kept), name), mine); return true; } catch { /* another process claimed it first */ }
   }
   return false;
@@ -74,12 +74,18 @@ export async function downloadRunner(pin: Pin, asset: string, target: string): P
     mkdirSync(dirname(target), { recursive: true });
     url = `${downloadBase(pin)}/${asset}`;
     const kept = keptPartial(sha256, asset);
-    // This process's own partial (an earlier call's) first, else one it claims from a gone process.
     const mine = `${kept}.${process.pid}`;
     mkdirSync(dirname(kept), { recursive: true });
-    const claimed = existsSync(mine) || claimPartial(kept, mine);
-    // A complete runner (placed by hand, or an attempt killed before it moved it) needs no request.
-    if (!claimed || await fileSha256(mine) !== sha256) {
+    // A runner placed by hand at `kept` comes first, whatever this or another attempt left: claimed by rename, it is
+    // installed when its SHA-256 matches and dropped when it does not.
+    const placed = `${mine}.placed`;
+    let ready = false;
+    try { renameSync(kept, placed); ready = await fileSha256(placed) === sha256; } catch { /* nothing placed, or claimed by another process */ }
+    if (ready) { rmSync(mine, { force: true }); renameSync(placed, mine); }
+    rmSync(placed, { force: true });
+    // Else this process's own partial (an earlier call's), or one claimed from a gone process: complete, or continued.
+    if (!ready) ready = (existsSync(mine) || claimPartial(kept, mine)) && await fileSha256(mine) === sha256;
+    if (!ready) {
       const digest = await downloadHostUpdateFile(url, mine, HOST_RELEASE_MAX_MEMBER, undefined, true);
       if (digest !== `sha256:${sha256}`) { rmSync(mine, { force: true }); throw new Error(`its SHA-256 is not the one ${OMP_RUNNER_CHECKSUMS} lists`); }
     }
