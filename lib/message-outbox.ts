@@ -548,11 +548,13 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
 
   const now = Date.now();
   const database = db();
-  pruneDelivered(database, now - KEEP_DELIVERED_MS);
   const keys = sessionKeys(sessionId);
   let result: AddResult;
   try {
     result = database.transaction((): AddResult => {
+      // Inside the add's own write lock: a separate autocommit DELETE took the lock a second time per add, and failing
+      // to get it (busy past busy_timeout with several servers adding at once) failed the whole add with a 500.
+      pruneDelivered(database, now - KEEP_DELIVERED_MS);
       const concurrent = row(id);
       if (concurrent) {
         if (!entryBelongsToSession(concurrent, sessionId)) return { kind: "conflict" };
