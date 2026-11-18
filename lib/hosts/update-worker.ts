@@ -287,7 +287,7 @@ export async function downloadHostUpdateFile(url: string, file: string, maxBytes
         // A server may send less of a range than asked for: ask for the rest.
         if (total !== undefined && size < total) {
           failures = size > before ? 0 : failures + 1;
-          if (failures > DOWNLOAD_RETRIES) throw new ReleaseRefusal("Release download stopped short of its size");
+          if (failures > DOWNLOAD_RETRIES || Date.now() >= deadline) throw new ReleaseRefusal("Release download stopped short of its size");
           continue;
         }
         if (!resume) return `sha256:${hash.digest("hex")}`;

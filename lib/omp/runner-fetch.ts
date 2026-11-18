@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, createReadStream, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import packageJson from "../../package.json";
@@ -55,6 +56,12 @@ async function withPartialLock<T>(lock: string, run: () => Promise<T>): Promise<
   finally { try { if (readFileSync(lock, "utf8") === String(process.pid)) rmSync(lock); } catch { /* already gone */ } }
 }
 
+async function fileSha256(file: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
 /** Moves a finished download into place; across filesystems (a compiled binary's directory) by copy and rename. */
 function moveInto(from: string, to: string): void {
   try { return renameSync(from, to); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error; }
@@ -92,7 +99,12 @@ export async function downloadRunner(pin: Pin, asset: string, target: string): P
     };
     const kept = keptPartial(sha256, asset);
     mkdirSync(dirname(kept), { recursive: true });
-    if (await withPartialLock(`${kept}.lock`, () => download(kept, true)) === null) await download(`${target}.${process.pid}.${Date.now()}.partial`, false);
+    // A complete runner already there (placed by hand, or an attempt killed before it moved it) needs no request.
+    const placed = async () => {
+      if (existsSync(kept) && await fileSha256(kept) === sha256) { chmodSync(kept, 0o755); moveInto(kept, target); return; }
+      await download(kept, true);
+    };
+    if (await withPartialLock(`${kept}.lock`, placed) === null) await download(`${target}.${process.pid}.${Date.now()}.partial`, false);
     return sha256;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
