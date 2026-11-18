@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Fixed
+
+- **Force update of a 0.7.x host no longer joins its own recovery channel.** The legacy recovery's omp was listed by the daemon like any session, so this server adopted it: its `get_state` (command id 1, like the bootstrap's) was answered with an id-1 reply that the recovery reader took for the bootstrap's result, which closed the channel seconds in and lost the real exit code. A failed bootstrap then showed only as "no receipt within 30 minutes". The recovery channel (matched by its operation id) is now left alone, so the bootstrap's own result is read.
+
 ## [v0.7.2] - 2026-11-18
 
 ### Upgrading from 0.7.1 or older

@@ -877,6 +877,9 @@ function reattach(link: Link, listed: HelloChannel[], refreshExisting = true): v
       if (refreshExisting || identityChanged) existing.deliverResync();
       continue;
     }
+    // The legacy recovery's own channel runs its bootstrap, not a session: a wrapper adopting it numbers its commands from 1 like the
+    // bootstrap, so the recovery reader takes the wrapper's get_state reply for the bootstrap's, closes the channel and drops the real result.
+    if (hello.creationId !== undefined && hello.creationId === link.recovery?.id) continue;
     if ([...link.pending.values()].some(op => op.op === "open" && op.sessionId === sessionId)) continue;
     const child = new RemoteRpcTransport(link.id, ch, sessionId);
     child.spawned = true;
