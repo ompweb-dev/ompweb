@@ -213,24 +213,26 @@ export function requireHostUpdateRecovery(id: string, error: string): void {
 
 /** A refusal that a new request would only repeat (an HTTP error, a size or destination check): never resumed. */
 class ReleaseRefusal extends Error {}
-/** `from` > 0 asks for the bytes after `from`; `onStart(resumed)` reports whether the server sent only those (206) or the
- * whole file again, before the first chunk. `idle` aborts a response that sends nothing for that long. */
-async function readHostUpdate(url: string, maxBytes: number, timeout: number, onChunk: (chunk: Uint8Array) => void, from = 0, onStart?: (resumed: boolean) => void, idle = timeout): Promise<void> {
+/** `from` > 0 asks for the bytes after `from`; `onStart(resumed, total)` reports whether the server sent only those (206,
+ * with the file's whole size when its Content-Range names it) or the whole file again, before the first chunk. `idle`
+ * aborts a response that sends nothing for that long. */
+async function readHostUpdate(url: string, maxBytes: number, timeout: number, onChunk: (chunk: Uint8Array) => void, from = 0, onStart?: (resumed: boolean, total?: number) => void, idle = timeout): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   const stall = setTimeout(() => controller.abort(), idle);
   try {
     const response = await fetch(url, { signal: controller.signal, cache: "no-store", headers: { "User-Agent": "ompweb-host-updater", ...(from > 0 ? { Range: `bytes=${from}-` } : {}) } });
     // 416: nothing lies after `from`; the caller's digest check decides whether what it holds is the file.
-    if (from > 0 && response.status === 416) { await response.body?.cancel(); onStart?.(true); return; }
-    const resumed = from > 0 && response.status === 206 && (response.headers.get("content-range") ?? "").startsWith(`bytes ${from}-`);
+    if (from > 0 && response.status === 416) { onStart?.(true); return; }
+    const range = /^bytes (\d+)-\d+\/(\d+|\*)$/.exec(response.headers.get("content-range") ?? "");
+    const resumed = from > 0 && response.status === 206 && Number(range?.[1]) === from;
     // A server error, 408 or 429 is worth another request; any other refusal is not.
     if (!response.ok || !response.body) throw new (response.status >= 500 || [408, 429].includes(response.status) ? Error : ReleaseRefusal)(`Release request failed (${response.status})`);
     if (response.status === 206 && !resumed) throw new ReleaseRefusal(`Release request failed (${response.status})`);
     if (response.url && (!response.url.startsWith("https://") || !["raw.githubusercontent.com", "api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com", "registry.npmjs.org"].includes(new URL(response.url).hostname))) throw new ReleaseRefusal("Unexpected release download destination");
     const limit = resumed ? maxBytes - from : maxBytes;
     if (Number(response.headers.get("content-length")) > limit) throw new ReleaseRefusal("Release response is too large");
-    onStart?.(resumed);
+    onStart?.(resumed, resumed && range?.[2] !== "*" ? Number(range![2]) : undefined);
     const reader = response.body.getReader();
     let size = 0;
     try {
@@ -243,7 +245,11 @@ async function readHostUpdate(url: string, maxBytes: number, timeout: number, on
         onChunk(item.value);
       }
     } catch (error) { await reader.cancel().catch(() => {}); throw error; }
-  } finally { clearTimeout(timer); clearTimeout(stall); }
+  } finally {
+    clearTimeout(timer);
+    clearTimeout(stall);
+    controller.abort(); // a refused response's body is never read: release its connection
+  }
 }
 export async function fetchHostUpdateBytes(url: string, maxBytes: number, timeout = 5000): Promise<Buffer> {
   const chunks: Uint8Array[] = [];
@@ -257,7 +263,8 @@ const DOWNLOAD_RETRIES = 3;
 /**
  * Streams the response into `file` (never whole in memory); returns its `sha256:<hex>` digest. A request that drops or
  * stalls is resumed with an HTTP `Range` request where it stopped, within `timeout` for the whole call. With `resume`,
- * `file` may already hold the start of the download (an earlier call's bytes), which is continued the same way.
+ * `file` may already hold the start of the download (an earlier call's bytes), which is continued the same way, and the
+ * digest is then that of the whole file as it is on disk once complete, whoever else wrote to it.
  */
 export async function downloadHostUpdateFile(url: string, file: string, maxBytes: number, timeout = DOWNLOAD_TIMEOUT_MS, resume = false): Promise<string> {
   const deadline = Date.now() + timeout;
@@ -271,11 +278,22 @@ export async function downloadHostUpdateFile(url: string, file: string, maxBytes
     if (size > maxBytes) { ftruncateSync(fd, 0); hash = createHash("sha256"); size = 0; }
     for (let failures = 0; ;) {
       const before = size;
+      let total: number | undefined;
       try {
-        await readHostUpdate(url, maxBytes, Math.max(1, deadline - Date.now()), (chunk) => { writeSync(fd, chunk, 0, chunk.byteLength, size); hash.update(chunk); size += chunk.byteLength; }, size, (resumed) => {
+        await readHostUpdate(url, maxBytes, Math.max(1, deadline - Date.now()), (chunk) => { writeSync(fd, chunk, 0, chunk.byteLength, size); hash.update(chunk); size += chunk.byteLength; }, size, (resumed, whole) => {
+          total = whole;
           if (!resumed && size > 0) { ftruncateSync(fd, 0); hash = createHash("sha256"); size = 0; }
         }, Math.min(DOWNLOAD_STALL_MS, timeout));
-        return `sha256:${hash.digest("hex")}`;
+        // A server may send less of a range than asked for: ask for the rest.
+        if (total !== undefined && size < total) {
+          failures = size > before ? 0 : failures + 1;
+          if (failures > DOWNLOAD_RETRIES) throw new ReleaseRefusal("Release download stopped short of its size");
+          continue;
+        }
+        if (!resume) return `sha256:${hash.digest("hex")}`;
+        const disk = createHash("sha256");
+        for (let read, at = 0; (read = readSync(fd, buffer, 0, buffer.length, at)) > 0; at += read) disk.update(buffer.subarray(0, read));
+        return `sha256:${disk.digest("hex")}`;
       } catch (error) {
         failures = size > before ? 0 : failures + 1;
         if (error instanceof ReleaseRefusal || failures > DOWNLOAD_RETRIES || Date.now() >= deadline) throw error;

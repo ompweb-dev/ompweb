@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import packageJson from "../../package.json";
@@ -22,21 +22,37 @@ export const OMP_RUNNER_INFO = "ompweb-omp.json";
 type Pin = typeof OMP_RUNNER_PIN;
 /** Prefix of a runner download a failed attempt left for the next one (downloadRunner). */
 const KEPT_PARTIAL = ".partial-";
+const keptPartial = (sha256: string, asset: string) => join(ompRunnerRoot(), `${KEPT_PARTIAL}${sha256.slice(0, 16)}-${asset}`);
 const downloadBase = ({ repo, tag }: Pin) => `https://github.com/${repo}/releases/download/${tag}`;
 
-/** Holds `lock` for this process while `run` runs, or runs nothing and returns null while a live process holds it. */
+/** Creates `lock` holding this process's pid, complete from the moment it exists (a reader never sees it empty). */
+function createLock(lock: string): boolean {
+  const draft = `${lock}.${process.pid}.${Date.now()}`;
+  writeFileSync(draft, String(process.pid), { mode: 0o600 });
+  try { linkSync(draft, lock); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
+  finally { rmSync(draft, { force: true }); }
+}
+
+/** Holds `lock` for this process while `run` runs, or runs nothing and returns null while another process holds it.
+ * Correctness never rests on the lock (downloadRunner checks the finished file as it is on disk): a lost race costs one
+ * attempt, never a wrong runner. */
 async function withPartialLock<T>(lock: string, run: () => Promise<T>): Promise<T | null> {
-  try { writeFileSync(lock, String(process.pid), { flag: "wx", mode: 0o600 }); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || isProcessAlive(Number(readFileSync(lock, "utf8")))) return null;
-    // Its process is gone (killed by an updater's time limit, say). Only the process whose rename moves it away takes
-    // the partial over: two that both saw it dead cannot both remove a lock and write one partial.
+  if (!createLock(lock)) {
+    let owner: string;
+    try { owner = readFileSync(lock, "utf8"); } catch { return null; }
+    if (isProcessAlive(Number(owner))) return null;
+    // Its process is gone (killed by an updater's time limit, say). Move the lock aside and take over only if what was
+    // moved is still that dead owner's: a process that took it over meanwhile has a live pid in it, and gets it back.
     const stale = `${lock}.${process.pid}.stale`;
     try { renameSync(lock, stale); } catch { return null; }
+    const moved = readFileSync(stale, "utf8");
+    if (moved !== owner) { try { linkSync(stale, lock); } catch { /* a third process holds it now */ } rmSync(stale, { force: true }); return null; }
     rmSync(stale, { force: true });
-    try { writeFileSync(lock, String(process.pid), { flag: "wx", mode: 0o600 }); } catch { return null; }
+    if (!createLock(lock)) return null;
   }
-  try { return await run(); } finally { rmSync(lock, { force: true }); }
+  try { return await run(); }
+  finally { try { if (readFileSync(lock, "utf8") === String(process.pid)) rmSync(lock); } catch { /* already gone */ } }
 }
 
 /** Moves a finished download into place; across filesystems (a compiled binary's directory) by copy and rename. */
@@ -74,14 +90,15 @@ export async function downloadRunner(pin: Pin, asset: string, target: string): P
         throw error;
       }
     };
-    const kept = join(ompRunnerRoot(), `${KEPT_PARTIAL}${sha256.slice(0, 16)}-${asset}`);
+    const kept = keptPartial(sha256, asset);
     mkdirSync(dirname(kept), { recursive: true });
     if (await withPartialLock(`${kept}.lock`, () => download(kept, true)) === null) await download(`${target}.${process.pid}.${Date.now()}.partial`, false);
     return sha256;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const missing = /\(404\)/.test(reason) ? ` (${pin.repo} release ${pin.tag} attaches no ${basename(url)})` : "";
-    const seed = expected ? `, or place ${asset} (SHA-256 ${expected}) at ${target}` : "";
+    // The kept partial is where every attempt resumes from: a complete file there is checked and installed as is.
+    const seed = expected ? `, or place ${asset} (SHA-256 ${expected}) at ${keptPartial(expected, asset)}` : "";
     throw new Error(`Could not fetch ompweb's omp from ${url}: ${reason}${missing}. Check this machine's connection to GitHub (a retry continues the download where it stopped)${seed}, or set OMP_WEB_OMP_BIN to an ompweb-omp binary.`);
   }
 }
