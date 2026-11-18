@@ -13,6 +13,7 @@
  * Host frames:
  *   host → omp  {t:"login_input_response", id, value}   value: string, or null/absent for cancelled
  */
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -32,10 +33,12 @@ import {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 } from "@oh-my-pi/pi-coding-agent/task";
 import type { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import type { CommandContext, CommandTable, FrameTable } from "./types";
 
 const LOGIN_INPUT_TIMEOUT_MS = 600_000;
+/** The `disabled_cause` a paused account carries; only tombstones with it are resumed. */
+const PAUSED_CAUSE = "paused in omp-web";
 /** Settled subagents whose transcript stays readable, and ids remembered from a previous session. */
 const MAX_RETAINED_SUBAGENTS = 256;
 
@@ -423,6 +426,82 @@ export const agentsCommands: CommandTable = {
 		const { removed, remainingSource } = await logoutCredential(session, providerId, credentialId);
 		if (!removed) throw new Error(`logout: credential ${credentialId} is not stored for ${providerId}`);
 		return { remainingSource };
+	},
+
+	/** Every stored OAuth account with the identity omp's account policies match, paused ones included. */
+	get_usage_accounts: async ({ session }) => {
+		const { credentials } = session.modelRegistry.authStorage;
+		await credentials.reload();
+		const accounts = credentials
+			.list()
+			.flatMap(({ id, provider, credential }) =>
+				credential.type === "oauth"
+					? [{
+							credentialId: id,
+							provider,
+							email: credential.email,
+							accountId: credential.accountId,
+							projectId: credential.projectId,
+							orgId: credential.orgId,
+							paused: false,
+						}]
+					: [],
+			);
+		for (const row of await credentials.listDisabled()) {
+			if (row.cause !== PAUSED_CAUSE) continue;
+			accounts.push({
+				credentialId: row.id,
+				provider: row.provider,
+				email: row.email,
+				accountId: row.accountId,
+				projectId: undefined,
+				orgId: row.orgId,
+				paused: true,
+			});
+		}
+		return { accounts };
+	},
+
+	/**
+	 * Pause keeps the credential as an omp tombstone, so no process picks it and nothing is signed out.
+	 * omp has no call that revives a tombstone; resuming clears the cause in agent.db, which bumps omp's
+	 * change revision so every process reloads.
+	 */
+	set_account_paused: async ({ session }, args) => {
+		const { providerId, credentialId, paused } = args;
+		if (
+			typeof providerId !== "string" ||
+			typeof credentialId !== "number" ||
+			!Number.isInteger(credentialId) ||
+			typeof paused !== "boolean"
+		) {
+			throw new Error("set_account_paused: providerId must be a string, credentialId an integer and paused a boolean");
+		}
+		const { modelRegistry } = session;
+		const { credentials } = modelRegistry.authStorage;
+		await credentials.reload();
+		if (paused) {
+			const active = credentials.list(providerId).some(row => row.id === credentialId && row.credential.type === "oauth");
+			if (!active || !(await credentials.disable(credentialId, PAUSED_CAUSE))) {
+				throw new Error(`set_account_paused: no active OAuth account ${credentialId} for ${providerId}`);
+			}
+		} else {
+			const db = new Database(getAgentDbPath());
+			try {
+				db.run("PRAGMA busy_timeout = 5000");
+				const { changes } = db.run(
+					"UPDATE auth_credentials SET disabled_cause = NULL, updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = ? AND provider = ? AND disabled_cause = ?",
+					[credentialId, providerId, PAUSED_CAUSE],
+				);
+				if (changes !== 1) throw new Error(`set_account_paused: account ${credentialId} for ${providerId} is not paused`);
+			} finally {
+				db.close();
+			}
+			await credentials.reload();
+		}
+		await modelRegistry.refreshProvider(providerId, "online");
+		await session.refreshScopedModels();
+		return {};
 	},
 };
 

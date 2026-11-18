@@ -168,6 +168,8 @@ export function AppShell({ appName }: { appName: string }) {
   const [explorerRefreshKey, setExplorerRefreshKey] = useState(0);
   const [explorerRefreshing, setExplorerRefreshing] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
+  // A new object per request, so asking for the same provider again re-selects it.
+  const [settingsProvider, setSettingsProvider] = useState<{ id: string } | null>(null);
   const [archiveBrowserOpen, setArchiveBrowserOpen] = useState(false);
   const [modelsRefreshKey, setModelsRefreshKey] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -2040,6 +2042,10 @@ export function AppShell({ appName }: { appName: string }) {
       usageVisible={providerUsageVisible}
       settingsOpen={Boolean(settingsTab)}
       onOpenSettings={() => setSettingsTab((prev) => prev ? null : "general")}
+      onOpenProviderSettings={(provider) => {
+        setSettingsProvider({ id: provider });
+        setSettingsTab("providers");
+      }}
       onOpenArchive={() => setArchiveBrowserOpen(true)}
       navigation={sidebarNavigation}
       updateAvailable={Boolean(appUpdate?.updateAvailable)}
@@ -2247,6 +2253,7 @@ export function AppShell({ appName }: { appName: string }) {
             remoteHost={settingsHostId !== undefined}
             cluster={clusterSettings}
             sessionId={selectedSession?.id ?? null}
+            providerFocus={settingsProvider}
             onModelsSaved={() => setModelsRefreshKey((k) => k + 1)}
             onPluginsReloaded={() => setSessionKey((k) => k + 1)}
             appUpdate={appUpdate}

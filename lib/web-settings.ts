@@ -36,6 +36,10 @@ export interface WebServerSettings {
   browserTransport: BrowserTransport;
   /** Days a sent upload stays in its session's `local://uploads/` on every host; `null` keeps them for ever (docs/specs/2026-11-02-file-uploads-design.md, U6). */
   uploadRetentionDays: number | null;
+  /** Names for accounts in the sidebar's provider usage, keyed by `ProviderUsageAccount.key`. */
+  accountNames: Record<string, string>;
+  /** Order of the sidebar's provider usage rows (`ProviderUsageAccount.key`); unlisted rows follow in omp's order. */
+  accountOrder: string[];
 }
 
 const DEFAULTS: WebServerSettings = {
@@ -46,6 +50,8 @@ const DEFAULTS: WebServerSettings = {
   agentEnv: {},
   browserTransport: "ws",
   uploadRetentionDays: DEFAULT_UPLOAD_RETENTION_DAYS,
+  accountNames: {},
+  accountOrder: [],
 };
 
 /** What every hello and `transport` frame tells the browser. */
@@ -53,8 +59,8 @@ export function browserTransportState(settings = loadWebServerSettings()): Brows
   return { transport: settings.browserTransport };
 }
 
-/** String-valued entries only — the allow-list lives in lib/omp/agent-env.ts. */
-function readAgentEnvRecord(value: unknown): Record<string, string> {
+/** String-valued entries only — agentEnv's allow-list lives in lib/omp/agent-env.ts. */
+function readStringRecord(value: unknown): Record<string, string> {
   if (!isRecord(value)) return {};
   const entries: Array<[string, string]> = [];
   for (const [name, entry] of Object.entries(value)) {
@@ -96,9 +102,11 @@ function normalizeSettings(raw: Record<string, unknown>): WebServerSettings {
     agentToolsEnabled: raw.agentToolsEnabled === true,
     githubWritesUnasked: raw.githubWritesUnasked === true,
     githubActionsPermissions: readGithubActionsPermissions(raw.githubActionsPermissions),
-    agentEnv: readAgentEnvRecord(raw.agentEnv),
+    agentEnv: readStringRecord(raw.agentEnv),
     browserTransport: BROWSER_TRANSPORTS.find((transport) => transport === raw.browserTransport) ?? "ws",
     uploadRetentionDays: isUploadRetentionDays(raw.uploadRetentionDays) ? raw.uploadRetentionDays : DEFAULT_UPLOAD_RETENTION_DAYS,
+    accountNames: readStringRecord(raw.accountNames),
+    accountOrder: Array.isArray(raw.accountOrder) ? raw.accountOrder.filter((key): key is string => typeof key === "string") : [],
   };
 }
 

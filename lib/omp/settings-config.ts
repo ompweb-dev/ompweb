@@ -80,6 +80,38 @@ export function readAnthropicSlowMode(): boolean {
   }
 }
 
+/** omp's `auth.accountPolicies` (entries kept as written) and the global `retry.usageReservePct`. */
+export function readAccountPolicyConfig(): { policies: unknown[]; reservePct: number } {
+  const data = readDocument().doc.toJS();
+  if (!isRecord(data)) return { policies: [], reservePct: 10 };
+  const auth = isRecord(data.auth) ? data.auth : {};
+  const retry = isRecord(data.retry) ? data.retry : {};
+  // omp's migration also accepts top-level dotted keys, nested values winning.
+  const policies = auth.accountPolicies ?? data["auth.accountPolicies"];
+  const reservePct = retry.usageReservePct ?? data["retry.usageReservePct"];
+  return {
+    policies: Array.isArray(policies) ? policies : [],
+    reservePct: typeof reservePct === "number" && Number.isFinite(reservePct) ? Math.max(0, Math.min(100, reservePct)) : 10,
+  };
+}
+
+export function writeAccountPolicies(policies: unknown[]): void {
+  const { path, doc } = readDocument();
+  if (doc.contents !== null && !isMap(doc.contents)) throw new Error(`${path} must contain a YAML mapping`);
+  if (policies.length > 0) doc.setIn(["auth", "accountPolicies"], policies);
+  else {
+    doc.deleteIn(["auth", "accountPolicies"]);
+    const auth = doc.get("auth");
+    if (isMap(auth) && auth.items.length === 0) doc.delete("auth");
+  }
+  // A dotted key would otherwise hand the old policies back once the nested one is gone.
+  doc.delete("auth.accountPolicies");
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(temp, doc.toString(), "utf8");
+  renameSync(temp, path);
+}
+
 /** Returns the persisted native OMP values only; omitted keys keep OMP defaults. */
 export function readNativeSettings(): { path: string; settings: NativeSettings } {
   const { path, doc } = readDocument();

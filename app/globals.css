@@ -2662,6 +2662,54 @@ span.token.table {
   overflow: hidden;
 }
 
+.provider-usage-card {
+  transition: background var(--dur-med) var(--ease-out-warm);
+}
+
+.provider-usage-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  overflow: hidden;
+  max-width: 140px;
+  opacity: 1;
+  transform: scale(1);
+  transform-origin: right center;
+  transition: max-width var(--dur-med) var(--ease-out-warm),
+              opacity var(--dur-fast) var(--ease-out-warm),
+              transform var(--dur-med) var(--ease-out-warm),
+              margin-left var(--dur-med) var(--ease-out-warm);
+}
+
+.provider-usage-badges.is-hidden {
+  max-width: 0;
+  opacity: 0;
+  transform: scale(0.92);
+  margin-left: -6px;
+  pointer-events: none;
+}
+
+.provider-usage-action-btn {
+  transition: background var(--dur-fast) var(--ease-out-warm),
+              color var(--dur-fast) var(--ease-out-warm),
+              border-color var(--dur-fast) var(--ease-out-warm),
+              opacity var(--dur-fast) var(--ease-out-warm);
+}
+
+.provider-usage-action-btn:hover:not(:disabled) {
+  background: var(--bg-hover) !important;
+  border-color: var(--text-dim) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .accordion-flow,
+  .provider-usage-card,
+  .provider-usage-badges,
+  .provider-usage-action-btn {
+    transition: none !important;
+  }
+}
 .chevron-smooth {
   transition: transform var(--dur-med) var(--ease-out-warm);
 }

@@ -6,8 +6,13 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Added
+
+- **Provider Usage shows one row per account with every limit window at once.** Splits such as Anthropic's Fable bucket or Antigravity's model quotas merge into their account; open a row for each split's reset time. The 5H/7D switch is gone. Each quota gets its own meter line; drag an account to reorder, double-click it to rename it. An open row sets the account's usage limit (omp's per-account reserve: above it omp uses the provider's other accounts first), marks it preferred (omp's account priority: used first while below its limit), pauses it without signing out, and opens it in API Keys & Providers.
+
 ### Fixed
 
+- **Provider Usage keeps accounts visible when their limits are unavailable.** Paused accounts can still be resumed, and a failed quota fetch no longer removes stored account names. Signing out drops the account instead of leaving its cached limits behind.
 - **Windows updates no longer fail when the update status is read while it is written.** Host update state, the server worker's status and upgrade plans retry their atomic replacement for a moment when a concurrent reader holds the file, as the server's own update state already did.
 - **GitHub workflow watches no longer regress to stale run states.** Workflow updates retain GitHub's run timestamp and ignore older snapshots for the same or an earlier attempt, so a delayed `queued` response cannot follow a newer `in_progress` delivery.
 - **Keep sidebar transcript results aligned with expandable hits on every linked host.** Each daemon now searches its own active conversations, ignoring abandoned branches and pre-compaction messages.
