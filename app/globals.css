@@ -3782,6 +3782,7 @@ html[data-touch-targets="accessible"] .right-panel-toolbar {
   }
   .right-panel-toolbar {
     --right-panel-close-width: 44px;
+    --tab-height: 44px;
   }
   html:root .shell-toolbar-btn.right-panel-close-button {
     padding-top: env(safe-area-inset-top, 0px) !important;
@@ -3793,7 +3794,7 @@ html[data-touch-targets="accessible"] .right-panel-toolbar {
   .right-panel-toolbar > div:first-child {
     display: flex;
     align-items: center;
-    min-height: 44px;
+    min-height: var(--tab-height);
   }
   .right-panel-toolbar > [role="toolbar"] > button {
     min-width: 40px;
@@ -3801,10 +3802,6 @@ html[data-touch-targets="accessible"] .right-panel-toolbar {
   }
   .right-panel-toolbar .tabbar-scroll {
     width: 100%;
-  }
-  .right-panel-toolbar .tabbar-scroll,
-  .right-panel-toolbar .tabbar-tab {
-    height: 44px !important;
   }
 }
 

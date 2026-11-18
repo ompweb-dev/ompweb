@@ -212,11 +212,10 @@ export function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, explorerSel
       className="tabbar-scroll"
       style={{
         display: "flex",
-        alignItems: "flex-end",
         background: "var(--bg-panel)",
+        // Let a classic horizontal scrollbar take space below the tabs.
         overflowX: "auto",
         flexShrink: 0,
-        height: "var(--tab-height)",
       }}
     >
       {onSelectNotifications && (
