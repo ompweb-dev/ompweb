@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Fixed
+
+- **An idle 0.6.0–0.7.1 host takes its normal update again.** Once the v0.7.2 release (and with it the recovery helper for these daemons) was published, the server marked every such host as needing recovery and refused its plain update with "This host requires explicitly approved recovery", so only Force worked. A plain update now runs the daemon's own updater, as before; recovery is used only for an explicit Force (or an approved release pin or phase these daemons cannot enforce). Host update tests no longer depend on what GitHub currently publishes.
+
 ## [v0.7.2] - 2026-11-18
 
 ### Upgrading from 0.7.1 or older

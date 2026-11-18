@@ -1823,7 +1823,8 @@ export async function updateHostSoftware(id: string, target: HostUpdateTarget, v
   }
   const candidate = checked[target];
   const link = linkFor(id);
-  const recovery = candidate.forceMethod === "recovery" || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
+  // A plain update of an old daemon runs its own updater: Force and a pin or phase it cannot enforce are what recovery is for.
+  const recovery = (options.force || options.releasePin !== undefined) && candidate.forceMethod === "recovery" || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
   const pinnedRecovery = options.releasePin !== undefined && recovery;
   if (!matching && (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version && !pinnedRecovery)) {
     // An omp update names its blocker (ompweb_update_active, omp_install_active...) for a caller that must not read English.
