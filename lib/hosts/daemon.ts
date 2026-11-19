@@ -2,7 +2,7 @@ import { lstatSync, realpathSync, mkdirSync, watch } from "node:fs";
 import { access, constants } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { getOmpVersion } from "../omp/omp-cli";
+import { getOmpVersion, resolveOmpBin } from "../omp/omp-cli";
 import { getAgentDir, getSessionsDir } from "../omp/paths";
 import { ProjectPathError } from "../project-registry";
 import { isValidSessionId } from "../session-file-references-core";
@@ -98,6 +98,8 @@ export interface HostDaemon {
 }
 /** `hostSocket`: where omps started from a TUI attach (`hostSocketPath()`); unset, none can. */
 type DaemonOptions = { allowHttp: boolean; url?: string; token?: string; links?: HostLink[]; hostSocket?: string };
+/** How often a daemon whose omp version read found nothing reads it again. */
+export const OMP_VERSION_RETRY_MS = 30_000;
 export function runHostDaemon(options: DaemonOptions): HostDaemon {
   const explicit = options.url !== undefined && options.token !== undefined ? [{ url: options.url, token: options.token }] : options.links;
   const initial = explicit ?? readHostLinks();
@@ -549,6 +551,20 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       operationsInFlight--;
       if (!stopped) for (const link of links.values()) link.start();
     });
+  // The hello is the only place a server reads the version, and a null one marks the host "omp not installed": a
+  // runner whose first fetch or (Windows antivirus) first start outlasted the startup read is retried until it answers,
+  // then every link redials to say so.
+  const versionRetry = setInterval(() => {
+    if (ompVersion !== null || stopped) { clearInterval(versionRetry); return; }
+    resolveOmpBin(true);
+    void getOmpVersion().then(version => {
+      if (version === null || ompVersion !== null || stopped) return;
+      ompVersion = version;
+      clearInterval(versionRetry);
+      for (const link of links.values()) link.redial("omp version changed");
+    }).catch(error => log("could not read omp version: " + reason(error)));
+  }, OMP_VERSION_RETRY_MS);
+  versionRetry.unref?.();
   const started = Promise.all([startupSweep, startupRecovery, versionRead, hostSocket]).then(() => {});
   return { stop: () => shutdown(0), done, control, started };
 }
