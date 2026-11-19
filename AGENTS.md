@@ -408,6 +408,7 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
   The daemon owns lifecycle, streaming snapshots and first-answer dialog settlement.
   Web callbacks choose the last-active eligible server and are not blindly retried.
   `channels_changed` discovers background runs; `sessions_changed` invalidates lists;
+  `omp_version` reports omp found after a hello that said none (the daemon retries the read, 30 s doubling to 5 min);
   one link is the automatic notification publisher.
   Cross-server fences live in the daemon: a history edit takes the acknowledged
   `editLease` op before preflight, and a `peer_message_command` marker makes another server's identical echo
