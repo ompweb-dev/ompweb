@@ -82,7 +82,7 @@ async function main(argv: string[]): Promise<number> {
     sweepOmpRunners();
     // Sessions need the runner; until it is here they fail with OMP_NOT_FOUND. The daemon joins this fetch, tries it
     // again while omp is missing and tells its servers once omp answers.
-    void ensureOmpRunner().catch((error: unknown) => console.error(`ompweb host: ${error instanceof Error ? error.message : String(error)}`));
+    void ensureOmpRunner().catch(() => {}); // the daemon joins it and logs a failure
     // Windows has no host socket yet (a current-user named pipe is open in the runner spec).
     daemon = runHostDaemon({ allowHttp: argv.includes("--allow-http"), hostSocket: process.platform === "win32" ? undefined : hostSocketPath(), ensureRunner: ensureOmpRunner });
     // Worker cutover starts fail-closed; ordinary hosts have no maintenance environment.
