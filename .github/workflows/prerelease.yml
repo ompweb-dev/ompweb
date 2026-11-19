@@ -39,25 +39,18 @@ jobs:
           cache: npm
 
       - run: npm ci
-      - run: npm run build
-      # The omp the runners compile against: the fork's newest integration build, not runner/omp-build.json's pin
-      # (not committed back). No such release or a runner that fails tsc against it fails the release.
-      - name: Find the newest omp integration build
+      # The omp runner every binary bundles and records: the newest published release of the fork (ompweb-dev/oh-my-pi,
+      # which builds and releases it) that attaches every platform's runner and whose ompweb-omp.json names this ompweb's
+      # RUNNER_PROTOCOL, written into omp-runner.json here (the binaries bake it in; not committed back). None fails the
+      # release. The build below downloads each platform's runner (SHA-256-checked) from it.
+      - name: Pin the newest omp runner of the fork
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sha=$(gh api repos/ompweb-dev/oh-my-pi/commits/integration-release --jq .sha)
-          tag=$(gh api --paginate 'repos/ompweb-dev/oh-my-pi/releases?per_page=100' --jq '.[].tag_name' \
-            | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+-int\.[0-9]{12}\.g${sha:0:7}\$" | head -n 1 || true)
-          if [ -z "$tag" ]; then
-            echo "::error::ompweb-dev/oh-my-pi has no integration release for integration-release ($sha)"
-            exit 1
-          fi
-          echo "OMP_TAG=$tag" >> "$GITHUB_ENV"
-      # Without GH_TOKEN: bun install runs the omp packages' scripts.
-      - name: Pin the runner to it
-        run: npx bun runner/scripts/use-omp-build.ts "$OMP_TAG" && (cd runner && npx bun x tsc -p .)
+          npx bun scripts/fetch-runner.ts --latest linux-x64
+          echo "OMP_TAG=$(node -p 'require("./omp-runner.json").tag')" >> "$GITHUB_ENV"
+      - run: npm run build
       - name: Pin the binary release identity
         run: |
           now=$(date -u +%s)

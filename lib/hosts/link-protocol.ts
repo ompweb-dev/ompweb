@@ -86,6 +86,7 @@ export type HostUriScheme = { scheme: string; writable: boolean };
  * positional, so an omitted optional argument never turns into `null`. */
 export const SESSION_OP_PARAMS: { readonly [K in keyof SessionOps]: readonly string[] } = {
   listSessions: [],
+  searchSessions: ["query"],
   listSessionIdsForRestore: [],
   readSession: ["id", "options"],
   readContext: ["id", "leafId", "options"],

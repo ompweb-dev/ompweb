@@ -503,7 +503,7 @@ export async function toggleAutostart(enable: boolean): Promise<{ success: boole
         $sc = $wsh.CreateShortcut('${startupLnk.replace(/'/g, "''")}')
         $sc.TargetPath = '${wscriptExe.replace(/'/g, "''")}'
         $sc.Arguments = '"${launchVbs.replace(/"/g, '`"')}" -Startup'
-        $sc.WorkingDirectory = '${repoRoot.replace(/'/g, "''")}'
+        $sc.WorkingDirectory = '${homedir().replace(/'/g, "''")}'
         if (Test-Path '${icoPath.replace(/'/g, "''")}') { $sc.IconLocation = '${icoPath.replace(/'/g, "''")},0' }
         $sc.Description = 'omp-web Background Tray Service'
         $sc.Save()
@@ -559,7 +559,8 @@ export async function startTrayService(options: { openBrowser?: boolean } = {}):
       const nativeArgs: string[] = [];
       if (options.openBrowser) nativeArgs.push("-OpenBrowser");
       const child = spawn(nativeExe, nativeArgs, {
-        cwd: getRepoRoot(),
+        // Never from inside the installation: a cwd there blocks the next replacement on Windows.
+        cwd: homedir(),
         detached: true,
         stdio: "ignore",
         windowsHide: true,
@@ -600,7 +601,7 @@ export async function startTrayService(options: { openBrowser?: boolean } = {}):
   return new Promise<{ success: boolean; message?: string }>((resolve) => {
     try {
       const child = spawn(wscriptExe, vbsArgs, {
-        cwd: repoRoot,
+        cwd: homedir(),
         detached: true,
         stdio: "ignore",
         windowsHide: true,

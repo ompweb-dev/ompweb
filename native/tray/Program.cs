@@ -253,10 +253,22 @@ class TrayApplication : IDisposable
 
         if (_nodeExe == null) _nodeExe = FindNodeExecutable();
 
+        // Never from inside the installation: a cwd there blocks the next replacement on Windows.
+        var workingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrWhiteSpace(workingDirectory))
+        {
+            // An empty value starts the child in the target's directory (or in this process's
+            // current one), and both of those are the installation.
+            WriteLog("USERPROFILE is empty: refusing to start the web server inside the installation.");
+            _state = "Stopped";
+            UpdateTrayUI();
+            return;
+        }
+
         var psi = new ProcessStartInfo
         {
             FileName = _nodeExe,
-            WorkingDirectory = _repoRoot,
+            WorkingDirectory = workingDirectory,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -271,10 +283,16 @@ class TrayApplication : IDisposable
         else
         {
             var bunLauncher = Path.Combine(_repoRoot, "bin", "bun-runtime.js");
-            psi.Arguments = $"\"{bunLauncher}\" --hot server/dev.ts -H {_effectiveHostname} -p {_effectivePort}";
+            // The working directory is outside the installation, so both the dev entry and the config
+            // (Bun reads bunfig.toml from the working directory) are passed as absolute paths.
+            var bunfig = Path.Combine(_repoRoot, "bunfig.toml");
+            var devEntry = Path.Combine(_repoRoot, "server", "dev.ts");
+            psi.Arguments = $"\"{bunLauncher}\" \"--config={bunfig}\" --hot \"{devEntry}\" -H {_effectiveHostname} -p {_effectivePort}";
         }
 
         psi.EnvironmentVariables["OMP_WEB_PORT"] = _effectivePort.ToString();
+        // The child runs outside the installation, so name it explicitly (dev mode derives its root from this).
+        psi.EnvironmentVariables["OMP_WEB_PACKAGE_DIR"] = _repoRoot;
         psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = _effectiveHostname;
         psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1";
         psi.EnvironmentVariables["PORT"] = _effectivePort.ToString();

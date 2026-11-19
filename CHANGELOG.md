@@ -9,12 +9,41 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 ### Fixed
 
 - **Running subagents recover without reactivating the chat.** Every event-stream reconnect refreshes the live roster, including reconnects after a new prompt on the same connection. Progress for an unknown running child requests an authoritative roster snapshot instead of silently disappearing; concurrent recovery reads are shared, and responses from a finished run cannot resurrect its children.
-- **GitHub workflow watches no longer regress to stale run states.** Workflow updates retain GitHub's run timestamp and ignore older snapshots for the same or an earlier attempt, so a delayed `queued` response cannot follow a newer `in_progress` delivery.
+- **In-app updates work again on a Windows install without administrator rights.** The update looked for the service supervising the host daemon among its parent processes and skipped Task Scheduler's `svchost.exe` by its executable path, which Windows does not show to a non-administrator. It then took the daemon started by the `omp-web-host` scheduled task for the `Schedule` service, could not control that service and refused the update with `not_controllable` (#537). Service hosts are now recognized by process name, so the scheduled task is found.
 
-## [v0.7.2] - 2026-11-14
+## [v0.7.3] - 2026-11-18
 
 ### Fixed
 
+- **A linked host on 0.7.1 or older updates normally again.** Once this server's own release was published, Settings → Hosts refused the normal update of an older linked host's daemon with "This host requires explicitly approved recovery": the forced-recovery method the server now offers such a host was applied to every update, not only to **Force update**. A normal update goes through that host's own updater again. This machine's older daemon is still updated with **Force update**, as before.
+- **The Windows tray in the npm package is built from the release's sources.** Releases shipped a committed `bin/omp-web-tray.exe` last rebuilt on 2026-11-14, so 0.7.2's tray still started the launcher inside the installation directory and could keep an in-app update from renaming it (#530). The release workflow now builds the tray from the tagged `native/tray` (`scripts/build-tray.sh`) and refuses one that does not carry the tagged commit; every PR builds it too.
+- **A slow or unstable link no longer blocks an update on the omp runner download.** A runner download that drops, stalls for 60 s or gets a server error resumes with an HTTP `Range` request where it stopped. A failed attempt keeps its partial file in the agent directory's runner folder (`omp-web/omp/<version>/.partial-…`), so a retry of the update continues it instead of starting the ~240 MB download over, binary hosts included (#531). The error names the runner's SHA-256 and a path where a runner downloaded by hand is checked and installed on the next attempt.
+- **Adding a message to the outbox takes its database's write lock once.** Pruning delivered entries ran as a separate write before each add, so with several servers sharing one agent directory an add could wait past the lock timeout and fail with "database is locked" (seen on Windows). The prune now runs inside the add's own transaction.
+
+## [v0.7.2] - 2026-11-18
+
+### Upgrading from 0.7.1 or older
+
+- **Start ompweb again after the in-app update.** The updater of 0.6.0, 0.7.0 and 0.7.1 installs the new version and reports success, but an `ompweb` you started yourself (no systemd, launchd or tray supervisor) does not come back: the old launcher exits with the server. If the page does not return, run `ompweb` again. The cause is in the old version's own updater, which this release cannot change.
+- **Then update each host with Force.** A 0.7.x host daemon sharing the installation is shown in Settings → Hosts after the restart; its normal update is refused while the package was replaced under it, so use **Force update** to move it to this release.
+
+### Added
+
+- **Update omp on a host without a new ompweb release.** Settings → Hosts shows "Update omp to …" for a host whose omp is older than the newest published release of the oh-my-pi fork whose runner speaks this ompweb's runner protocol (`RUNNER_PROTOCOL`; a release that speaks another one is never offered). The daemon downloads the runner into a fresh staging directory, checks its SHA-256, its `--runner-info` protocol and `--smoke-test` there, and only then moves it into place and points new sessions at it; any failure leaves the runner in use and its pointer as they were, and running sessions are not interrupted. A caller's `operationId` names one omp update: a replay returns the stored operation and installs nothing again, and a conflicting request, or a replay of an attempt a later one superseded, is refused (`operation_conflict`). An omp update keeps its own record and never touches an ompweb update's: the two never run together, and each is refused with a machine-readable blocker (`ompweb_update_active`, `omp_install_active`) while the other runs.
+- **Race-free GitHub watch registration.** `watch_github` returns the metadata snapshot used as a new watch's baseline, so agents can inspect existing comments, reviews, threads and CI before relying on later watch updates.
+- **Clearly attributed automated messages.** Cross-session agent-tool messages and GitHub watcher updates now render as source-labelled cards instead of looking like messages typed by the user. Attribution is server-authored, survives queues, retries and reloads, and links to the source session or GitHub item.
+
+### Changed
+
+- **The omp runner is built and released by the oh-my-pi fork.** `runner/` and its workflows are gone from this repository: the fork's `oml` build compiles `ompweb-omp` for every platform and attaches it to its releases with `ompweb-omp.sha256` and `ompweb-omp.json` (the runner protocol). Root `omp-runner.json` pins the fork release an ompweb build fetches its runner from (`ompweb fetch-omp`, and in the background when it is missing), SHA-256-checked; source checkouts, CI, smoke tests and binary builds download it (`scripts/fetch-runner.ts`, `npm run fetch-omp`) instead of building it, and releases and prereleases record the newest published fork release with a matching protocol. `OMP_WEB_OMP_BIN` still overrides it. A source checkout needs `npm run fetch-omp` once per pin, not a runner build.
+
+### Fixed
+
+- **In-app updates can replace an npm-global Windows install started by the tray.** The update stops the tray program in the package and any node or bun process still using that install, without ending the update itself, and runs the install from outside the package so Windows can rename it. When the tray started the server, it is started again in the logged-on session and starts the one server; otherwise the server is started directly and still told which install to serve.
+- **Windows updates no longer fail when the update status is read while it is written.** Host update state, the server worker's status and upgrade plans retry their atomic replacement for a moment when a concurrent reader holds the file, as the server's own update state already did.
+- **A host update's failed candidate is stopped on Windows even when it got the old daemon's pid.** Windows can reuse a freed pid, so the restarted candidate could receive the pid the update had inspected; the stop then refused the plan as inconsistent ("Invalid upgrade process plan: current instance does not match the inspected process"), left the candidate running and required recovery instead of restoring the previous release. A stop checks the instance it acts on against the live process, so a recycled pid is still refused.
+- **GitHub workflow watches no longer regress to stale run states.** Workflow updates retain GitHub's run timestamp and ignore older snapshots for the same or an earlier attempt, so a delayed `queued` response cannot follow a newer `in_progress` delivery.
+- **Keep sidebar transcript results aligned with expandable hits on every linked host.** Each daemon now searches its own active conversations, ignoring abandoned branches and pre-compaction messages.
 - **Restore HTTP LAN and VPN access.** Browser UUID generation now works without secure-context-only `crypto.randomUUID()`, preventing the "Something went wrong" crash when opening the app or creating a session.
 - **GUI server updates work for owned binary releases again.** Settings → System prepares a server-and-host compatibility plan before approval, pins the release artifacts and checks service stop/start permissions before incompatible hosts move. Incompatible hosts must have a verified migration or recovery path; the local host participates in the initial migration and a shared-installation cutover. Progress survives a server restart, and failed replacement retains the previous installation for rollback. Uncertain shutdowns retain their update claim and report recovery rather than starting a second update.
 - **Old supervised hosts have an explicit forced recovery path.** Settings → Hosts offers Force update when recovery is available. Confirmation warns that sessions and subagents may end. A fixed, integrity-checked bootstrap uses the historical runner channel without enabling old application traffic. Windows uses native PowerShell/.NET and process/service/task controls; Linux and macOS retain their own supervisor semantics. Force never bypasses release integrity, ownership, process identity, update disablement or service permissions.
@@ -29,11 +58,6 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 - **Local-host startup ignores unrelated services.** Installation paths match at directory boundaries, and daemon detection distinguishes the host subcommand from directory names or server argument values.
 - **Open live subagent transcripts without waiting forever.** Transcript pages now read the subagent's on-disk artifact directly instead of waiting for its busy agent process to answer first.
 - **Select reasoning effort for fallback models.** Settings → Models → Native OMP Retry & Fallback now stores each fallback as `provider/model:effort`, while leaving the effort unset uses the model default.
-
-### Added
-
-- **Race-free GitHub watch registration.** `watch_github` returns the metadata snapshot used as a new watch's baseline, so agents can inspect existing comments, reviews, threads and CI before relying on later watch updates.
-- **Clearly attributed automated messages.** Cross-session agent-tool messages and GitHub watcher updates now render as source-labelled cards instead of looking like messages typed by the user. Attribution is server-authored, survives queues, retries and reloads, and links to the source session or GitHub item.
 
 ## [v0.7.1] - 2026-11-14
 

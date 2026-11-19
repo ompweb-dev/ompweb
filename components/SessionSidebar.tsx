@@ -17,7 +17,7 @@ import { HOST_STATUS_COLOR, hostName, hostStatusText } from "./host-status";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { initialSessionMatches } from "@/lib/initial-navigation";
 import type { SearchMatchTarget } from "./SessionSearchMatches";
-import { compileSearchQuery, FIRST_MESSAGE_WEIGHT, scoreSearchFields, searchField, TITLE_WEIGHT } from "@/lib/session-search";
+import { compileSearchQuery, scoreSearchFields, searchField, TITLE_WEIGHT } from "@/lib/session-search";
 import { Archive, ArrowDownUp, ArrowLeft, ArrowRight, Check, ChevronRight, FileUp, Loader2, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, X } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { openEventStream } from "@/lib/event-stream";
@@ -956,10 +956,10 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       }
       const scores = new Map<string, number>();
       for (const s of list) {
-        // Server scores cover the same title fields plus the transcript; a
-        // session newer than the server's answer falls back to its title.
+        // Server scores cover the title plus the active transcript; a session
+        // newer than the server's answer falls back to its title.
         const score = serverScores?.[s.id]
-          ?? scoreSearchFields([searchField(s.name ?? "", TITLE_WEIGHT), searchField(s.firstMessage, FIRST_MESSAGE_WEIGHT)], query);
+          ?? scoreSearchFields([searchField(s.name ?? "", TITLE_WEIGHT)], query);
         if (score !== null) scores.set(s.id, score);
       }
       list = list.filter((s) => scores.has(s.id));

@@ -101,7 +101,7 @@ Order: I1 → K1–K4 → K5 → K6 → W1+W2+I2 (PR B) → W3 (PR C) → K7 →
 
 - [ ] Replace the `~/.config/integration` symlink with a directory: per-file symlinks into the integration-ci checkout's `config/` for everything but the omp config and fixups (keep `.retired-*`); `root--git--oh-my-pi.sh` and `fixups/root--git--oh-my-pi` → the `fork-ci` worktree's `config/…`.
 - [x] In the oh-my-pi checkout: `git fetch origin && git branch -f integration origin/integration-release && integration build && integration deploy`.
-- [ ] Verify: the deployed omp's `--version` prints the stamped version; `HOME=$(mktemp -d) <deployed omp> update --check` asks `api.github.com/repos/ompweb-dev/oh-my-pi` and reports up to date; `integration prs` still finds the graphify, superpowers and ompweb configs. Other machines on older fork binaries: install this release by hand once.
+- [ ] Verify: the deployed omp's `--version` prints the stamped version; `HOME=$(mktemp -d) <deployed omp> update --check` asks `api.github.com/repos/ompweb-dev/oh-my-pi` and reports up to date; `integration prs` still finds the superpowers and ompweb configs. Other machines on older fork binaries: install this release by hand once.
 
 ### Task W1 (ompweb): runner against the fork's packages (spec W1)
 
@@ -147,7 +147,7 @@ Order: I1 → K1–K4 → K5 → K6 → W1+W2+I2 (PR B) → W3 (PR C) → K7 →
 
 - [ ] Delete the files listed in the spec's cleanup section; superseded line in `docs/specs/2026-11-11-omp-auto-integration-design.md`; trim README's oh-my-pi section; `bash integration.test.sh` passes. Commit `omp: the round moved to the fork's fork-ci branch`; push `main`.
 - [ ] `gh release delete oh-my-pi -R andrebrait/integration-ci --cleanup-tag --yes`; same for `apple-sdk`; `gh secret delete` `OMP_FORK_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` if `grep -rn 'secrets\.' .github` no longer names them.
-- [ ] Verify: `integration build` for graphify, superpowers and ompweb still finds its config.
+- [ ] Verify: `integration build` for superpowers and ompweb still finds its config.
 
 ## Rollback
 

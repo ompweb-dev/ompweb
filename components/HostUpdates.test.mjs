@@ -13,13 +13,13 @@ const info = {
 };
 
 /** Render the real host row and record every request it sends. */
-async function renderHost(t, host, ompweb = {}, operation = null) {
+async function renderHost(t, host, ompweb = {}, operation = null, omp = {}) {
   const requests = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     requests.push({ url: String(url), method: init?.method ?? "GET", body: init?.body });
-    if (init?.method === "POST") return Response.json({ accepted: true, operation: { state: "running", target: "ompweb", version: "0.7.1" } });
-    return Response.json({ ...info, operation, ompweb: { ...info.ompweb, ...ompweb } });
+    if (init?.method === "POST") return Response.json({ accepted: true, operation: { state: "running", target: JSON.parse(init.body).target, version: "0.7.1" } });
+    return Response.json({ ...info, operation, ompweb: { ...info.ompweb, ...ompweb }, omp: { ...info.omp, ...omp } });
   };
   const container = document.createElement("div");
   document.body.append(container);
@@ -177,4 +177,52 @@ test("uncertain shutdown recovery shows its durable error instead of polling Upd
   assert.equal(button(container, "Force update"), undefined);
   assert.equal(container.querySelector('[role="status"]'), null);
   assert.deepEqual(posts(requests), []);
+});
+
+const runnerChannel = { currentVersion: "18.22.0-int.202611171027.gec3956c", availableVersion: "18.23.0-int.202611201200.gabc1234", updateAvailable: true, canUpdate: true, blockedReason: null, runnerChannel: true };
+
+test("omp has its own row: Update omp posts the omp target after a confirmation that says sessions are not interrupted", async (t) => {
+  const { container, requests } = await renderHost(t, modern, { updateAvailable: false, canUpdate: false }, null, runnerChannel);
+  assert.ok(container.textContent.includes("Current: 18.22.0-int.202611171027.gec3956c"), container.textContent);
+  assert.ok(container.textContent.includes("Available: 18.23.0-int.202611201200.gabc1234"));
+  assert.equal(button(container, "Update"), undefined, "ompweb has no update of its own here");
+  const update = button(container, "Update omp to 18.23.0-int.202611201200.gabc1234");
+  assert.ok(update && !update.disabled);
+
+  act(() => update.click());
+  assert.ok(document.body.textContent.includes("not interrupted"), "the confirmation says running sessions are not interrupted");
+  assert.deepEqual(posts(requests), [], "opening the confirmation must not submit");
+  await act(async () => dialogButton("Update").click());
+  await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+  assert.equal(posts(requests).length, 1);
+  assert.deepEqual(JSON.parse(posts(requests)[0].body), { target: "omp", version: "18.23.0-int.202611201200.gabc1234" }, "an omp update has no force");
+});
+
+test("a blocked omp update cannot be started", async (t) => {
+  const { container } = await renderHost(t, modern, {}, null, { ...runnerChannel, canUpdate: false, blockedReason: "Another host update is in progress" });
+  assert.equal(button(container, "Update omp to 18.23.0-int.202611201200.gabc1234").disabled, true);
+  assert.ok(container.textContent.includes("Blocked: Another host update is in progress"));
+  assert.equal(button(container, "Force update"), undefined);
+});
+
+test("a daemon without the runner channel says omp updates with ompweb and offers no omp update", async (t) => {
+  const { container } = await renderHost(t, modern);
+  assert.ok(container.textContent.includes("Updated with ompweb"), container.textContent);
+  assert.ok(![...container.querySelectorAll("button")].some((candidate) => candidate.textContent.includes("Update omp")));
+});
+
+test("an omp update's own record is shown beside ompweb's: running it is watched, a failure is reported, and neither hides the other", async (t) => {
+  const ompOperation = { id: "omp-op", target: "omp", version: "18.23.0-int.202611201200.gabc1234", state: "running" };
+  const settled = { id: "ompweb-op", target: "ompweb", version: "0.7.0", state: "succeeded" };
+  const running = await renderHost(t, modern, {}, settled, { ...runnerChannel, canUpdate: false, operation: ompOperation });
+  assert.ok(running.container.textContent.includes("Updating omp runtime to 18.23.0-int.202611201200.gabc1234"), running.container.textContent);
+  assert.equal(button(running.container, "Check updates").disabled, true, "an omp update in flight is watched like an ompweb one");
+});
+
+test("a failed omp update is reported next to a settled ompweb update", async (t) => {
+  const failed = { id: "omp-op", target: "omp", version: "18.23.0-int.202611201200.gabc1234", state: "failed", error: "its SHA-256 is not the one listed" };
+  const { container } = await renderHost(t, modern, {}, { id: "ompweb-op", target: "ompweb", version: "0.7.0", state: "succeeded" }, { ...runnerChannel, operation: failed });
+  const alert = container.querySelector('[role="alert"]');
+  assert.ok(alert.textContent.includes("its SHA-256 is not the one listed"), container.textContent);
+  assert.ok(container.textContent.includes("Update completed."), "ompweb's own result is still there");
 });

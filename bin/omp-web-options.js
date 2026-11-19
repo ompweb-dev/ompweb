@@ -6,6 +6,8 @@ const { parseArgs } = require("util");
 const { hashPassword, isPasswordHash } = require("./omp-web-password-hash");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { isLoopbackHost } = require("./network-addresses");
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const os = require("node:os");
 
 const TRUE_VALUES = new Set(["1", "true", "yes", "on"]);
 
@@ -175,4 +177,13 @@ function checkLaunchSecurity(launchOptions) {
   return passwordHash;
 }
 
-module.exports = { checkLaunchSecurity, parseLaunchOptions, printHelp };
+// The server must not start inside the installation: on Windows a live process whose working
+// directory is the package blocks the rename an in-place update performs
+// (ERROR_SHARING_VIOLATION). The entry point and OMP_WEB_PACKAGE_DIR are absolute, so the
+// server does not need the installation as its directory.
+function serverWorkingDirectory(home = os.homedir()) {
+  if (!home) throw new Error("Cannot start ompweb: the home directory is empty, and the server must not run inside its installation.");
+  return home;
+}
+
+module.exports = { checkLaunchSecurity, parseLaunchOptions, printHelp, serverWorkingDirectory };

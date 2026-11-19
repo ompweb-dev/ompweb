@@ -811,12 +811,12 @@ test("passive tool context from a session file renders on the batch's last tool 
   assert.match(cut, /↳ <\/span>Context \(system-reminder · rule=ts-set-map\): Use a Rec<\/div>/);
   assert.doesNotMatch(cut, /&lt;|reason=/);
   // Expanded, the wrapper becomes a nested card: its title as the header, the body below.
-  wrapped.set("call-2", { ...toolResults.get("call-2"), passiveContext: '<system-reminder source="graphify">\nMANDATORY: run `graphify query`.\n</system-reminder>' });
+  wrapped.set("call-2", { ...toolResults.get("call-2"), passiveContext: '<system-reminder source="example">\nMANDATORY: run `example query`.\n</system-reminder>' });
   const card = render(React.createElement(MessageView, { message: single, toolResults: wrapped }));
   fireEvent.click(card.getAllByRole("button", { expanded: false }).at(-1));
   const nested = card.container.querySelector(".tool-call-details .tool-call-context-card");
-  assert.equal(nested?.querySelector(".tool-call-context-title")?.textContent, "↳ system-reminder · source=graphify");
-  assert.equal(nested?.querySelector(".tool-call-context-body")?.textContent, "MANDATORY: run `graphify query`.");
+  assert.equal(nested?.querySelector(".tool-call-context-title")?.textContent, "↳ system-reminder · source=example");
+  assert.equal(nested?.querySelector(".tool-call-context-body")?.textContent, "MANDATORY: run `example query`.");
   // The marked message is no row of its own; the unmarked one still is.
   assert.equal(messages[4].customType, "passive-tool-context");
   assert.equal(html(messages[4]), "");

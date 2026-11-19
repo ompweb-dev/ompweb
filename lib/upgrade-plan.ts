@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
 import { getAgentDir } from "./omp/paths";
@@ -9,7 +9,7 @@ import { checkNpmUpdate, detectInstallMethod } from "./npm-update";
 import { isUpdateDisabled } from "./update-policy";
 import { requestHostControl } from "./hosts/host-control";
 import { getHostSoftwareUpdates, getHostUpgradeInventory, updateHostSoftware, type HostUpgradeInventory } from "./hosts/hub";
-import { assertOwnedPath, fetchHostUpdateBytes, HOST_VERSION_PATTERN, validateApprovedReleasePin } from "./hosts/update-worker";
+import { assertOwnedPath, fetchHostUpdateBytes, HOST_VERSION_PATTERN, replaceFileSync, validateApprovedReleasePin } from "./hosts/update-worker";
 import { HostOpError } from "./hosts/link-protocol";
 import type { ApprovedReleasePin, HostUpdateCompatibility } from "./hosts/update-types";
 import type { UpgradeApproval, UpgradeParticipant, UpgradePlan } from "./upgrade-types";
@@ -102,7 +102,7 @@ function writePlan(plan: UpgradePlan): void {
   if (existsSync(path)) assertOwnedPath(path);
   const temporary = `${path}.${randomUUID()}.tmp`;
   writeFileSync(temporary, JSON.stringify(plan), { flag: "wx", mode: 0o600 });
-  try { renameSync(temporary, path); } finally { if (existsSync(temporary)) unlinkSync(temporary); }
+  try { replaceFileSync(temporary, path); } finally { if (existsSync(temporary)) unlinkSync(temporary); }
 }
 
 function validParticipant(value: unknown): value is UpgradeParticipant {

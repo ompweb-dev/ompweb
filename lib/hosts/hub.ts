@@ -51,7 +51,7 @@ import type { SessionOps } from "./session-ops";
 import { confirmPooledChild, pooledStartForChild } from "./pool-starts";
 import { loadPools, type HostPool } from "./pools";
 import { validateHostTools } from "./shared-requests";
-import type { ApprovedReleasePin, HostSoftwareUpdate, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "./update-types";
+import type { ApprovedReleasePin, HostOmpUpdate, HostSoftwareUpdate, HostUpdateBlocker, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "./update-types";
 import { isUpdateDisabled } from "../update-policy";
 import { WORKSPACE_OP_PARAMS, type WorkspaceFileEvent, type WorkspaceOps } from "../workspace-types";
 import { validWorkspaceResult } from "./workspace-results";
@@ -1101,6 +1101,9 @@ function validResult(op: keyof SessionOps, result: unknown, args: unknown[]): bo
     // Media bytes only ever arrive through the blob leg.
     case "readMedia":
       return value instanceof Uint8Array;
+    case "searchSessions":
+      return isRecord(value) && Object.entries(value).every(([id, score]) =>
+        isValidSessionId(id) && typeof score === "number" && Number.isFinite(score));
     // Main uses these paths (spawn cwd, project keys): they must be strings.
     case "validateCwd":
       return isRecord(value) && typeof value.cwd === "string" && typeof value.projectRoot === "string" && (value.projectKey === undefined || typeof value.projectKey === "string");
@@ -1197,6 +1200,7 @@ const ORPHAN_SENSITIVE_OPS: Partial<Record<keyof SessionOps, true>> = { archiveS
 
 /** A clone/fetch may outlast ordinary operations, but preparation still has a bounded deadline. */
 const POOL_PREPARE_TIMEOUT_MS = 10 * 60_000;
+const SESSION_SEARCH_TIMEOUT_MS = 5_000;
 
 function remoteSessionOps(hostId: string): SessionOps {
   const ops: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
@@ -1206,8 +1210,9 @@ function remoteSessionOps(hostId: string): SessionOps {
         return { ok: false, status: 400, code: "invalid_hash", error: "Invalid media hash" };
       }
       if (ORPHAN_SENSITIVE_OPS[op]) await orphanExit(hostId, String(args[0]));
-      const result = await request(hostId, op, Object.fromEntries(params.map((name, i) => [name, args[i]])),
-        op === "preparePoolProject" ? POOL_PREPARE_TIMEOUT_MS : linkTimings.opTimeoutMs);
+      const timeout = op === "preparePoolProject" ? POOL_PREPARE_TIMEOUT_MS
+        : op === "searchSessions" ? SESSION_SEARCH_TIMEOUT_MS : linkTimings.opTimeoutMs;
+      const result = await request(hostId, op, Object.fromEntries(params.map((name, i) => [name, args[i]])), timeout);
       if (op === "listSessionIdsForRestore") {
         if (Array.isArray(result) && result.every((id) => typeof id === "string" && id.length > 0)) return result;
         throw new HostOpError(502, "host_bad_result", `${labelOf(hostId)} sent an incomplete active-session inventory`);
@@ -1661,6 +1666,22 @@ function softwareUpdate(value: unknown): value is HostSoftwareUpdate & Record<st
     && nullableString(value.blockedReason) && typeof value.updateCommand === "string";
 }
 
+/** What a daemon that declares the runner channel reports for omp; anything else it sends is dropped. */
+function ompRunnerUpdate(value: Record<string, unknown>): HostOmpUpdate {
+  const blockers = value.blockers as Record<string, unknown>[] | undefined;
+  const operation = value.operation;
+  if (!nullableString(value.currentVersion) || !nullableString(value.availableVersion) || typeof value.updateAvailable !== "boolean" || typeof value.canUpdate !== "boolean" || !nullableString(value.blockedReason)
+    || !(blockers === undefined || Array.isArray(blockers) && blockers.every((blocker) => isRecord(blocker) && typeof blocker.code === "string" && typeof blocker.message === "string" && typeof blocker.forceable === "boolean"))
+    || !(operation === undefined || operation === null || updateOperation(operation))) {
+    throw new HostOpError(502, "host_bad_result", "The host returned an invalid update status");
+  }
+  return {
+    currentVersion: value.currentVersion, availableVersion: value.availableVersion, updateAvailable: value.updateAvailable, canUpdate: value.canUpdate, blockedReason: value.blockedReason, runnerChannel: true,
+    ...(blockers ? { blockers: blockers.map(({ code, message, forceable }) => ({ code, message, forceable }) as HostUpdateBlocker) } : {}),
+    ...(operation === undefined ? {} : { operation }),
+  };
+}
+
 function updateOperation(value: unknown): value is HostUpdateOperation {
   return isRecord(value) && typeof value.id === "string" && value.id.length > 0 && value.id.length <= 128
     && (value.target === "ompweb" || value.target === "omp") && typeof value.version === "string"
@@ -1721,8 +1742,9 @@ export async function getHostSoftwareUpdates(id: string, force = false, compatib
     || !(result.operation === null || updateOperation(result.operation))) {
     throw new HostOpError(502, "host_bad_result", "The host returned an invalid update status");
   }
-  // A daemon from before omp updated with ompweb reports a full update status for omp: keep only its version.
-  const info = { ...result, omp: { currentVersion: result.omp.currentVersion } } as unknown as HostUpdateInfo;
+  // A daemon that predates the runner channel reports only the omp version (and one older still reports a full update status for omp, which it ran as `omp update`): keep just the version unless the daemon declares the runner channel.
+  const omp = result.omp.runnerChannel === true ? ompRunnerUpdate(result.omp) : { currentVersion: result.omp.currentVersion };
+  const info = { ...result, omp } as unknown as HostUpdateInfo;
   const protocol = info.ompweb.protocolVersion;
   if ((!releasePin || info.ompweb.supportsReleasePin === true) && info.ompweb.updateAvailable && (protocol === null || protocol < compatibility.min || protocol > compatibility.max)) {
     return { ...info, ompweb: { ...info.ompweb, canUpdate: false, canForceUpdate: false, blockedReason: protocol === null
@@ -1801,10 +1823,13 @@ export async function updateHostSoftware(id: string, target: HostUpdateTarget, v
   }
   const candidate = checked[target];
   const link = linkFor(id);
-  const recovery = candidate.forceMethod === "recovery" || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
+  // This machine's old daemon is updated only by recovery, which Force confirms. A linked host's old daemon still updates
+  // itself for a normal update: the recovery helper its Force uses is offered beside that, not instead of it.
+  const recovery = candidate.forceMethod === "recovery" && (options.force === true || id === LOCAL_HOST_ID) || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
   const pinnedRecovery = options.releasePin !== undefined && recovery;
   if (!matching && (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version && !pinnedRecovery)) {
-    throw new HostOpError(409, "host_update_blocked", candidate.blockedReason ?? "The available version changed; check for updates again");
+    // An omp update names its blocker (ompweb_update_active, omp_install_active...) for a caller that must not read English.
+    throw new HostOpError(409, target === "omp" ? candidate.blockers?.[0]?.code ?? "host_update_blocked" : "host_update_blocked", candidate.blockedReason ?? "The available version changed; check for updates again");
   }
   if (recovery && !options.force) throw new HostOpError(409, "host_update_blocked", "This host requires explicitly approved recovery");
   if (options.force && recovery && id === LOCAL_HOST_ID) {

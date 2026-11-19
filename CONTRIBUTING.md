@@ -8,30 +8,13 @@ Thanks for your interest in contributing!
 
 ```bash
 npm install
-npx bun runner/scripts/use-omp-build.ts && (cd runner && npx bun install --frozen-lockfile)   # ompweb's omp build; npm test needs it too
+npm run fetch-omp   # ompweb's omp runner, from the oh-my-pi fork release omp-runner.json pins (SHA-256-checked)
 npm run dev   # http://127.0.0.1:30178, Bun hot reload
 ```
 
-For live sessions, build the runner for this machine with `npx bun runner/scripts/build-binary.ts`: ompweb finds
-`runner/release/ompweb-omp-<os>-<arch>` by itself (`OMP_WEB_OMP_BIN` overrides it). A stock `omp` does not
-speak ompweb's channel.
-
-The repository tracks a [graphify](https://github.com/Graphify-Labs/graphify) code
-graph in `graphify-out/graph.json`. To keep it current, install the graphify release
-that built it (`uv tool install graphifyy==0.9.99`; releases build different graphs
-from the same code, so bump this together with a rebuilt graph) and run
-`sh scripts/setup-hooks.sh` once per clone. The script enables the tracked
-`.githooks/pre-commit`, which rebuilds the graph and stages it with every commit
-that stages anything else, and registers graphify's merge driver for `graph.json`.
-The first commit in a new clone or worktree rebuilds from scratch (about two
-minutes); later ones take about a second. Set `GRAPHIFY_SKIP_HOOK=1` to commit
-without the rebuild. The rebuild reads the working tree, so unstaged code ends up in
-the committed graph: to commit only part of your changes, `git stash --keep-index
---include-untracked` first. The hook refuses `git commit <path>`, whose temporary
-index would leave the rebuilt graph unstaged; stage with `git add` and run a plain
-`git commit`. Git runs no pre-commit hook for rebases, cherry-picks or
-merges that complete without conflicts: run `PYTHONHASHSEED=0 graphify update .`
-afterwards and commit the graph.
+For live sessions the dev server and `ompweb host` need that runner: `npm run fetch-omp` puts it where they find it by
+themselves (`OMP_WEB_OMP_BIN` overrides it, e.g. with a runner built from the fork). A stock `omp` does not
+speak ompweb's channel. The runner's source is in the fork (`packages/ompweb-runner` of `ompweb-dev/oh-my-pi`), not here.
 
 ## Checks (must pass before submitting)
 
@@ -68,7 +51,7 @@ The jsdom dependency stays on 29.x for now; moving to a newer major is a separat
   `lib/i18n/locales/{en,zh-CN,zh-TW,ja}.json`.
 - **Architecture**: the ompweb server and daemon never import `@oh-my-pi/*` or `@earendil-works/*`
   packages (Bun-only). Live agent features go through the `ompweb-omp` child process
-  (`runner/`) over ompweb's channel; see `DESIGN.md` and `AGENTS.md` for the full contract.
+  (built and released by the oh-my-pi fork) over ompweb's channel; see `DESIGN.md` and `AGENTS.md` for the full contract.
 
 ## Pull requests
 

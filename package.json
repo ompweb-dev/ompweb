@@ -1,6 +1,6 @@
 {
   "name": "@kahme247/ompweb",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Web UI for the oh-my-pi (omp) coding agent",
   "homepage": "https://github.com/ompweb-dev/ompweb#readme",
   "repository": {
@@ -34,13 +34,15 @@
     "proxy.ts",
     "instrumentation.node.ts",
     "tsconfig.json",
-    "package.json"
+    "package.json",
+    "omp-runner.json"
   ],
   "scripts": {
     "dev": "bun --hot server/dev.ts -H 127.0.0.1 -p 30178",
     "dev:lan": "bun --hot server/dev.ts -H 0.0.0.0 -p 30178",
     "build": "bun scripts/build-client.ts",
     "build:binary": "npm run build && bun scripts/build-binary.ts",
+    "fetch-omp": "node bin/omp-web.js fetch-omp",
     "start": "bun server/main.ts -H 127.0.0.1 -p 30177",
     "start:lan": "bun server/main.ts -H 0.0.0.0 -p 30177",
     "test": "bun test --parallel --timeout 30000 ./app ./bin ./components ./hooks ./lib ./scripts ./server ./tests",

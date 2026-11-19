@@ -17,7 +17,7 @@ import {
   atomicWrite, attemptsDir, ensureSecureRoot, isActiveLease, LEASE_MS, leasePath, markerPath, patchStatus, readStateJson, removeSecureEmptyDirectory, removeSecureFile,
   renewLease, resolveSelfUpdateTempRoot, secureDirectory, secureRegularFile, SelfUpdateError, statusPath, type SelfUpdateStatus, type StoredStatus,
 } from "./self-update-state";
-import { type UpgradeLaunch, assertUpgradeProcessControl, inspectUpgradeProcess, launchDetachedUpgrade, secureUpgradeDirectory } from "./upgrade-process";
+import { type UpgradeLaunch, assertUpgradeProcessControl, cwdOutsideInstall, inspectUpgradeProcess, installSpawnCwd, launchDetachedUpgrade, secureUpgradeDirectory } from "./upgrade-process";
 import { approveUpgradePlan, getApprovedReleasePin, getUpgradePlan, prepareUpgradePlan, removeUpgradePlan, upgradePlannedHosts } from "./upgrade-plan";
 import type { UpgradeApproval, UpgradePlan } from "./upgrade-types";
 import { DISABLE_AUTOUPDATE_ENV_VAR, isUpdateDisabled } from "./update-policy";
@@ -338,15 +338,18 @@ function serverRestart(install: ServerInstall): { launch: Omit<UpgradeLaunch, "e
   const hostname = process.env.OMP_WEB_HOSTNAME;
   if (!port || !hostname) throw new SelfUpdateError("self_update_unsupported", "The server's listen address is unknown, so it cannot be restarted", 409);
   const listen = ["-p", port, "-H", hostname];
-  if (install.method === "binary") return { launch: { command: join(install.installDir, serverBinaryName()), args: [...listen, "--no-open"], cwd: process.cwd() }, viaLauncher: false };
-  if (process.env.OMP_WEB_LAUNCHER_PID) return { launch: { command: install.runtime, args: [join(install.installDir, "bin", "omp-web.js"), ...listen, "--no-open"], cwd: install.installDir }, viaLauncher: true };
-  return { launch: { command: process.execPath, args: [join(install.installDir, "server", "main.ts"), ...listen], cwd: install.installDir }, viaLauncher: false };
+  const cwd = cwdOutsideInstall(install.installDir);
+  if (install.method === "binary") return { launch: { command: join(install.installDir, serverBinaryName()), args: [...listen, "--no-open"], cwd }, viaLauncher: false };
+  if (process.env.OMP_WEB_LAUNCHER_PID) return { launch: { command: install.runtime, args: [join(install.installDir, "bin", "omp-web.js"), ...listen, "--no-open"], cwd }, viaLauncher: true };
+  return { launch: { command: process.execPath, args: [join(install.installDir, "server", "main.ts"), ...listen], cwd }, viaLauncher: false };
 }
 
 /** The server's environment for its restart, with its web password hash and every setting. Written owner-only and removed by the worker; never argv. */
-function restartEnvironment(): Record<string, string> {
+function restartEnvironment(installDir: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !PLUMBING_ENV.includes(name.toUpperCase())) env[name] = value;
+  // Direct `server/main.ts` has no launcher to name the install, and its cwd is outside it.
+  env.OMP_WEB_PACKAGE_DIR = installDir;
   return env;
 }
 /** The helper's environment: no web secrets (it runs npm, candidate preflights and a daemon), no launcher plumbing. */
@@ -414,12 +417,12 @@ async function workerLaunch(job: CommitJob, attemptDir: string, descriptor: stri
     chmodSync(target, 0o700);
     return target;
   };
-  if (install.method === "binary") return { command: copyRuntime(process.execPath), args: ["server-update-worker", descriptor], cwd: attemptDir, env };
+  if (install.method === "binary") return { command: copyRuntime(process.execPath), args: ["server-update-worker", descriptor], cwd: installSpawnCwd(), env };
   const bundle = await Bun.build({ entrypoints: [fileURLToPath(new URL("./server-update-worker.ts", import.meta.url))], target: "node", format: "esm", outdir: attemptDir, naming: "worker.mjs" });
   if (!bundle.success) throw new Error(`Could not build the update worker: ${bundle.logs.map(String).join("; ")}`);
   // A runtime inside the package (Windows locks a running .exe) would be replaced under the worker.
   const runtime = insideInstall(install.installDir, install.runtime) ? copyRuntime(install.runtime) : install.runtime;
-  return { command: runtime, args: [join(attemptDir, "worker.mjs"), "--server-update-descriptor", descriptor], cwd: attemptDir, env };
+  return { command: runtime, args: [join(attemptDir, "worker.mjs"), "--server-update-descriptor", descriptor], cwd: installSpawnCwd(), env };
 }
 
 /** After the commit returned: stage and preflight the release, update the plan's other hosts, then hand over to the detached worker. */
@@ -470,7 +473,7 @@ async function coordinate(job: CommitJob): Promise<void> {
       interruptSessions: job.interruptSessions,
     };
     atomicWrite(join(attemptDir, "descriptor.json"), JSON.stringify(descriptor));
-    atomicWrite(join(attemptDir, "launch-env.json"), JSON.stringify(restartEnvironment()));
+    atomicWrite(join(attemptDir, "launch-env.json"), JSON.stringify(restartEnvironment(install.installDir)));
     const pid = await launchDetachedUpgrade(await workerLaunch(job, attemptDir, join(attemptDir, "descriptor.json")));
     patchStatus(attemptId, { ...(pid === undefined ? {} : { workerPid: pid }), coordinatorPid: undefined });
   } catch (error) {
@@ -528,7 +531,7 @@ async function startSelfUpdate(attemptId: string, approval: UpgradeApproval, res
     const serverUrl = links.length === 1 ? links[0].replace(/\/+$/, "") : null;
     if (localHost.kind !== "separate" && !serverUrl) throw unsupported("The local host's link to this server could not be identified");
     await controllable("The detached update worker cannot be started safely", () =>
-      launchDetachedUpgrade({ command: process.execPath, args: ["--version"], cwd: install.installDir, env: helperEnvironment() }));
+      launchDetachedUpgrade({ command: process.execPath, args: ["--version"], cwd: installSpawnCwd(), env: helperEnvironment() }));
     // Unknown activity is not consent: only explicit Force permits interruption.
     const interruptSessions = confirmed.force && localHost.kind === "shared" && local !== null && (local.sessionProcesses !== 0 || local.activeTurns !== 0);
 

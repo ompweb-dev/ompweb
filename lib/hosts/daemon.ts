@@ -150,7 +150,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
       let operation: HostUpdateOperation | null = null;
       try { operation = getHostUpdateOperation(); }
       catch (error) { if (!updateStateWarningLogged) log("could not read host update status: " + reason(error)); updateStateWarningLogged = true; }
-      if (operation?.target === "ompweb" && hostUpdateBlocksNewWork(operation)) throw new HostOpError(409, "host_updating", "This host is updating its daemon; new sessions must wait");
+      if (hostUpdateBlocksNewWork(operation)) throw new HostOpError(409, "host_updating", "This host is updating its daemon; new sessions must wait");
       const resolved = launch.creationId === undefined ? resolveSpawnCwdResult(launch.recordedCwd ?? launch.cwd) : { cwd: launch.cwd, fellBack: false };
       // A sharing session never starts on this host's own logins: no link, or no usable broker, refuses.
       if (launch.credentialsServer !== undefined && !links.has(launch.credentialsServer)) throw new HostOpError(409, "credentials_link_gone", "The web server that shares its credentials with this session is no longer linked to this host");
@@ -465,7 +465,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
         return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true, args.targetCompatibility === undefined ? undefined : updateCompatibility(args.targetCompatibility), releasePin);
       }
       case "updateSoftware":
-        if (args.target !== "ompweb" || typeof args.version !== "string") throw new HostOpError(400, "invalid_request", "Invalid host update");
+        if ((args.target !== "ompweb" && args.target !== "omp") || typeof args.version !== "string") throw new HostOpError(400, "invalid_request", "Invalid host update");
         return startHostUpdate(args.target, args.version, updateCompatibility(args.compatibility), updateRequest(args));
       case "preparePoolProject": {
         if (hostUpdateBlocksNewWork(getHostUpdateOperation())) throw new HostUpdateError("host_updating", "This host is updating; new project preparation must wait");

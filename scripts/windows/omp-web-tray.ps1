@@ -38,6 +38,16 @@ Add-Type -AssemblyName System.Drawing
 # -----------------------------------------------------------------------------
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
 $PkgJsonPath = Join-Path $RepoRoot "package.json"
+
+# The updater replaces this installation in place, and Windows refuses to rename a
+# directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
+# Every path below is absolute, so the server and the shortcuts start outside it.
+$LaunchWorkingDirectory = $env:USERPROFILE
+# An empty value would make the child inherit the process's own directory, which is the
+# installation; refuse instead of silently reintroducing the lock.
+if ([string]::IsNullOrWhiteSpace($LaunchWorkingDirectory)) {
+    throw "USERPROFILE is empty: refusing to start omp-web from inside its installation directory."
+}
 $PkgVersion = "0.0.0"
 if (Test-Path $PkgJsonPath) {
     try {
@@ -236,7 +246,7 @@ function Start-WebServer {
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $NodeExe
-    $psi.WorkingDirectory = $RepoRoot
+    $psi.WorkingDirectory = $LaunchWorkingDirectory
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $false
@@ -246,13 +256,17 @@ function Start-WebServer {
         $launcherJs = Join-Path $RepoRoot "bin\omp-web.js"
         $inner = "`"$NodeExe`" `"$launcherJs`" -p $EffectivePort -H $EffectiveHostname --no-open"
     } else {
-        $inner = "`"$NodeExe`" `"$(Join-Path $RepoRoot 'bin\bun-runtime.js')`" --hot server\dev.ts -H $EffectiveHostname -p $EffectivePort"
+        # The working directory is outside the installation, so both the dev entry and the config
+        # (Bun reads bunfig.toml from the working directory) are passed as absolute paths.
+        $inner = "`"$NodeExe`" `"$(Join-Path $RepoRoot 'bin\bun-runtime.js')`" `"--config=$(Join-Path $RepoRoot 'bunfig.toml')`" --hot `"$(Join-Path $RepoRoot 'server\dev.ts')`" -H $EffectiveHostname -p $EffectivePort"
     }
     $psi.FileName = $env:ComSpec
     $psi.Arguments = "/d /s /c `"$inner >> `"$childOutLog`" 2>&1`""
 
     # Environment variables
     $psi.EnvironmentVariables["OMP_WEB_PORT"] = [string]$EffectivePort
+    # The child runs outside the installation, so name it explicitly (dev mode derives its root from this).
+    $psi.EnvironmentVariables["OMP_WEB_PACKAGE_DIR"] = $RepoRoot
     $psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = [string]$EffectiveHostname
     $psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1"
     $psi.EnvironmentVariables["PORT"] = [string]$EffectivePort
@@ -363,7 +377,7 @@ function Set-AutostartShortcut([bool]$enable) {
             $shortcut = $wsh.CreateShortcut($startupLnk)
             $shortcut.TargetPath = $wscriptExe
             $shortcut.Arguments = "`"$launchVbs`" -Startup"
-            $shortcut.WorkingDirectory = $RepoRoot
+            $shortcut.WorkingDirectory = $LaunchWorkingDirectory
             if (Test-Path $IcoPath) {
                 $shortcut.IconLocation = "$IcoPath,0"
             }

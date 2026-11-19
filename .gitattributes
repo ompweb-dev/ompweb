@@ -35,4 +35,3 @@
 *.pdf   binary
 *.zip   binary
 *.gz    binary
-graphify-out/graph.json merge=graphify linguist-generated=true -diff

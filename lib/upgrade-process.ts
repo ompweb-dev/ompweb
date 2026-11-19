@@ -2,7 +2,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync, type Stats } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
 import { promisify } from "node:util";
@@ -93,7 +93,7 @@ function assertTrustedFile(path: string, what: string): void {
 
 // ---------------------------------------------------------------- processes
 
-interface ProcessInfo { pid: number; ppid: number; state: string; exe: string; args: string[]; cwd: string | null; created: string | null }
+interface ProcessInfo { pid: number; ppid: number; state: string; exe: string; args: string[]; cwd: string | null; created: string | null; name?: string }
 
 /** CommandLineToArgvW's rules: whitespace separates arguments, quotes group, backslashes escape only before a quote. */
 function splitWindowsCommandLine(line: string): string[] {
@@ -192,8 +192,8 @@ async function listProcesses(): Promise<ProcessInfo[]> {
     return rows;
   }
   if (process.platform === "win32") {
-    const out = await powershell(`$rows = @(Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; ppid = [int]$_.ParentProcessId; exe = [string]$_.ExecutablePath; cmd = [string]$_.CommandLine; created = $(if ($_.CreationDate) { [string]$_.CreationDate.ToUniversalTime().Ticks } else { '' }) } })\nConvertTo-Json -Compress -InputObject $rows`, 120000);
-    return parseJson<{ pid: number; ppid: number; exe: string; cmd: string; created: string }[]>(out, "process list").map((row) => ({ pid: row.pid, ppid: row.ppid, state: "R", exe: row.exe, args: splitWindowsCommandLine(row.cmd), cwd: null, created: row.created || null }));
+    const out = await powershell(`$rows = @(Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; ppid = [int]$_.ParentProcessId; name = [string]$_.Name; exe = [string]$_.ExecutablePath; cmd = [string]$_.CommandLine; created = $(if ($_.CreationDate) { [string]$_.CreationDate.ToUniversalTime().Ticks } else { '' }) } })\nConvertTo-Json -Compress -InputObject $rows`, 120000);
+    return parseJson<{ pid: number; ppid: number; name: string; exe: string; cmd: string; created: string }[]>(out, "process list").map((row) => ({ pid: row.pid, ppid: row.ppid, state: "R", name: row.name, exe: row.exe, args: splitWindowsCommandLine(row.cmd), cwd: null, created: row.created || null }));
   }
   const env = { ...process.env, LC_ALL: "C" };
   const [commands, names] = await Promise.all([
@@ -511,14 +511,21 @@ async function windowsService(name: string): Promise<WindowsService> {
   const out = await powershell(`$s = @(Get-CimInstance Win32_Service | Where-Object { $_.Name -eq ${psString(name)} } | ForEach-Object { ${SERVICE_FIELDS} })\nif ($s.Count -ne 1) { throw 'Service not found' }\nConvertTo-Json -Compress -InputObject $s[0]`);
   return parseJson<WindowsService>(out, "service");
 }
+/**
+ * The ancestors whose services may supervise this process. A scheduled task's tree hangs under the Schedule service's
+ * svchost (shared by many services), which is never one. Matched by name too: a non-administrator reads no
+ * ExecutablePath for a SYSTEM process.
+ */
+export function supervisorCandidatePids(chain: Pick<ProcessInfo, "pid" | "exe" | "name">[]): number[] {
+  return chain.filter((row) => !/^svchost\.exe$/i.test(row.name ?? "") && !/(^|[\\/])svchost\.exe$/i.test(row.exe)).map((row) => row.pid);
+}
 async function inspectWindowsSupervisor(me: ProcessInfo, rows: ProcessInfo[], installDir: string): Promise<UpgradeSupervisor> {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   const chain = ancestry(byPid, me);
   const normal = (value: string) => value.toLowerCase().replaceAll("\\", "/");
   const scripts = [...new Set(chain.slice(1).flatMap((row) => row.args.slice(1).filter((arg) => /\.(?:ps1|cmd|bat|vbs)$/i.test(arg))))];
   const found = parseJson<{ services: WindowsService[]; tasks: WindowsTask[] }>(await powershell(
-    // A scheduled task's tree hangs under the Schedule service's svchost (shared by many services): never a candidate supervisor.
-    `$ids = @(${chain.filter((row) => !/(^|[\\/])svchost\.exe$/i.test(row.exe)).map((row) => row.pid).join(",")})\n$scripts = ${psStrings(scripts.map(normal))}\n` +
+    `$ids = @(${supervisorCandidatePids(chain).join(",")})\n$scripts = ${psStrings(scripts.map(normal))}\n` +
     `$services = @(Get-CimInstance Win32_Service | Where-Object { $_.ProcessId -and ($ids -contains [int]$_.ProcessId) } | ForEach-Object { ${SERVICE_FIELDS} })\n` +
     `$tasks = @()\nif ($scripts.Count -gt 0) { $tasks = @(Get-ScheduledTask | ForEach-Object { $t = $_; $text = ((@($t.Actions | ForEach-Object { $_.Execute + ' ' + $_.Arguments })) -join ' ').ToLowerInvariant().Replace('\\', '/'); $hit = $false; foreach ($s in $scripts) { if ($text.Contains($s)) { $hit = $true } }; if ($hit) { ${TASK_FIELDS} } }) }\n` +
     `ConvertTo-Json -Compress -Depth 6 -InputObject ([pscustomobject]@{ services = $services; tasks = $tasks })`), "supervisor query");
@@ -663,7 +670,7 @@ function assertPlan(plan: UpgradeProcess): void {
   if (typeof plan.installDir !== "string" || !isAbsolute(plan.installDir)) bad("installDir");
   const current = plan.current;
   if (!current || typeof current !== "object" || (current.pid === null) !== (current.identity === null) || (current.pid !== null && (!Number.isSafeInteger(current.pid) || current.pid <= 1 || typeof current.identity !== "string"))) bad("current instance");
-  if (current.pid === plan.pid && current.identity !== plan.identity) bad("current instance does not match the inspected process");
+  // `current` follows restarts and is checked against the live process when a stop acts on it; Windows may give the restarted instance the inspected pid, so the pid alone says nothing about identity.
   const s = plan.supervisor;
   const text = (value: unknown) => typeof value === "string" && value.length > 0 && value.length <= 4096 && !/[\0-\x1f]/.test(value);
   if (!s || typeof s !== "object") bad("supervisor");
@@ -1030,4 +1037,220 @@ export async function restartUpgradeProcess(plan: UpgradeProcess, launch: Upgrad
   }
   plan.current = instance;
   return instance.pid ?? undefined;
+}
+
+export interface InstallLockRow { pid: number; ppid: number; exe: string; command: string; args?: string[] }
+export interface InstallLockHit { pid: number; kind: "tray" | "runtime" }
+export interface InstallLockSelection { stop: InstallLockHit[]; blocked: InstallLockHit[] }
+
+function slash(value: string): string { return value.replaceAll("\\", "/"); }
+/** A path prefix safe to search for. A drive root or `/` would match every process. */
+function installKey(installDir: string): string | null {
+  const root = slash(installDir).replace(/\/+$/, "").toLowerCase();
+  if (root.length < 3 || root === "/" || /^[a-z]:$/.test(root)) return null;
+  return root;
+}
+function mentionsInstall(text: string, root: string): boolean {
+  const value = slash(text).toLowerCase();
+  let from = 0;
+  while (from < value.length) {
+    const at = value.indexOf(root, from);
+    if (at < 0) return false;
+    const before = at === 0 ? "" : value[at - 1];
+    const after = value[at + root.length] ?? "";
+    if ((before === "" || before === "\0" || /[\s"'=]/.test(before)) && (after === "" || after === "/" || after === "\0" || /[\s"']/.test(after))) return true;
+    from = at + root.length;
+  }
+  return false;
+}
+function ancestorsOf(rows: InstallLockRow[], pid: number): Set<number> {
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const found = new Set<number>();
+  let current = byPid.get(pid);
+  for (let hops = 0; current && hops < 32; hops++) {
+    const parent = byPid.get(current.ppid);
+    if (!parent || parent.pid === current.pid || found.has(parent.pid)) break;
+    found.add(parent.pid);
+    current = parent;
+  }
+  return found;
+}
+/** Every ancestor pid of `pid`, including one that has no row any more. */
+function ancestorPids(rows: InstallLockRow[], pid: number): number[] {
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const found: number[] = [];
+  for (let current = byPid.get(pid), hops = 0; current && hops < 32 && !found.includes(current.ppid); hops++) {
+    found.push(current.ppid);
+    current = byPid.get(current.ppid);
+  }
+  return found;
+}
+function lockKind(row: InstallLockRow, root: string): InstallLockHit["kind"] | null {
+  const path = slash(row.exe || row.command.split("\0").find(Boolean) || "");
+  const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+  const image = Boolean(row.exe) && mentionsInstall(row.exe, root);
+  const trayScript = (name === "powershell.exe" || name === "pwsh.exe") && /omp-web-tray\.(?:ps1|exe)/i.test(slash(row.command)) && mentionsInstall(row.command, root);
+  if ((name === "omp-web-tray.exe" && (image || mentionsInstall(row.command, root))) || trayScript) return "tray";
+  if (image || (/^(node|bun)(\.exe)?$/.test(name) && mentionsInstall(row.command, root))) return "runtime";
+  return null;
+}
+
+/**
+ * Processes that keep an npm install from being renamed: the tray executable in the package (web-service.json has no
+ * pid for it), and node/bun whose image or command line references the install. `sparePids` are not selected.
+ * `protectPids` are the update worker: an ancestor of one is `blocked`, never stopped — stopping it would kill the worker.
+ */
+export function selectInstallLockingProcesses(rows: InstallLockRow[], installDir: string, sparePids: number[], protectPids: number[], onlyTreesOf?: number[]): InstallLockSelection {
+  const root = installKey(installDir);
+  const spare = new Set(sparePids);
+  const protectedAncestors = new Set<number>();
+  for (const pid of protectPids) for (const ancestor of ancestorsOf(rows, pid)) protectedAncestors.add(ancestor);
+  const trays: InstallLockHit[] = [];
+  const rest: InstallLockHit[] = [];
+  const blocked: InstallLockHit[] = [];
+  if (!root) return { stop: [], blocked };
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.pid) || row.pid <= 1 || spare.has(row.pid)) continue;
+    const kind = lockKind(row, root);
+    if (!kind) continue;
+    // A stopped launcher is absent from the table but its survivors keep its pid as ppid (Windows does not reparent), so the chain may end at a pid that is gone.
+    if (onlyTreesOf && !onlyTreesOf.includes(row.pid) && !ancestorPids(rows, row.pid).some((pid) => onlyTreesOf.includes(pid))) continue;
+    const hit = { pid: row.pid, kind };
+    if (protectedAncestors.has(row.pid)) blocked.push(hit);
+    else if (kind === "tray") trays.push(hit);
+    else rest.push(hit);
+  }
+  return { stop: [...trays, ...rest], blocked };
+}
+
+/** Where `npm install` / the update worker must run. A cwd inside the install makes Windows refuse the rename (EBUSY). */
+export function installSpawnCwd(temporary = tmpdir(), installDir?: string): string {
+  if (!temporary || !isAbsolute(temporary)) fail("The temporary directory is empty; refusing to run the update inside its installation");
+  const root = installDir ? installKey(installDir) : null;
+  const value = slash(temporary).replace(/\/+$/, "").toLowerCase();
+  if (root && (value === root || value.startsWith(`${root}/`))) fail("The temporary directory is inside the installation; refusing to use it as the update working directory");
+  return temporary;
+}
+
+/** A directory a restarted server may use. Never the installation: that cwd locks the next rename. */
+export function cwdOutsideInstall(installDir: string, home = homedir(), temporary = tmpdir()): string {
+  const root = installKey(installDir);
+  const outside = (candidate: string) => {
+    if (!candidate || !isAbsolute(candidate)) return false;
+    if (!root) return true;
+    const value = slash(candidate).replace(/\/+$/, "").toLowerCase();
+    return value !== root && !value.startsWith(`${root}/`);
+  };
+  if (outside(home)) return home;
+  if (outside(temporary)) return temporary;
+  return fail("No working directory outside the installation; refusing to start a process that would lock the next update");
+}
+
+
+/** Stops install-locking processes one by one; `onlyTreesOf` limits that to those pids and their descendants. Never `taskkill /T`: a tree kill ends a worker that still descends from the target. */
+export async function stopInstallLockingProcesses(installDir: string, sparePids: number[], phase: "tray" | "all", onlyTreesOf?: number[]): Promise<void> {
+  if (phase === "tray" && process.platform !== "win32") return;
+  const rows = (await listProcesses()).map((row) => ({ pid: row.pid, ppid: row.ppid, exe: row.exe, command: [row.exe, ...row.args].join("\0") }));
+  const selection = selectInstallLockingProcesses(rows, installDir, sparePids, [process.pid], onlyTreesOf);
+  const inPhase = (hit: InstallLockHit) => phase === "all" || hit.kind === "tray";
+  const blocked = selection.blocked.filter(inPhase);
+  if (blocked.length) fail(`Refusing to stop process ${blocked.map((hit) => hit.pid).join(", ")}: the update worker descends from it, and stopping it would end the update`);
+  for (const hit of selection.stop.filter(inPhase)) {
+    await signalProcess(hit.pid, "SIGTERM");
+    await waitStopped(hit.pid);
+  }
+}
+
+export interface TraySupervisor { exe: string; args: string[] }
+export type ServerRestartChoice = { kind: "tray"; command: string; args: string[]; cwd: string } | { kind: "direct" }
+
+/** The tray that started one of `serverPids`, if its image or script is this install. Any other tray is not the supervisor. */
+export function traySupervisor(rows: InstallLockRow[], serverPids: number[], installDir: string): TraySupervisor | null {
+  const root = installKey(installDir);
+  if (!root) return null;
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  for (const pid of serverPids) {
+    for (const ancestor of ancestorsOf(rows, pid)) {
+      const row = byPid.get(ancestor);
+      if (!row || lockKind(row, root) !== "tray") continue;
+      // A parsed command line starts with the executable (argv[0]); it is the command, not an argument to forward.
+      const args = row.args ? row.args.slice(1) : row.command.split("\0").filter((arg) => arg && arg !== row.exe);
+      return { exe: row.exe, args };
+    }
+  }
+  return null;
+}
+
+/** Tray-supervised: start only the tray from the new install (it starts the server). Otherwise the worker starts the server. */
+export function serverRestartChoice(tray: TraySupervisor | null, installDir: string, cwd: string): ServerRestartChoice {
+  if (!tray) return { kind: "direct" };
+  const name = slash(tray.exe).split("/").pop()?.toLowerCase() ?? "";
+  const exeArg = (arg: string) => /omp-web-tray\.exe$/i.test(slash(arg));
+  const scriptArg = (arg: string) => /omp-web-tray\.ps1$/i.test(slash(arg));
+  if (name === "omp-web-tray.exe" || tray.args.some(exeArg)) {
+    return { kind: "tray", command: join(installDir, "bin", "omp-web-tray.exe"), args: tray.args.filter((arg) => !exeArg(arg)), cwd };
+  }
+  return { kind: "tray", command: tray.exe, args: tray.args.map((arg) => scriptArg(arg) ? join(installDir, "scripts", "windows", "omp-web-tray.ps1") : arg), cwd };
+}
+
+/**
+ * Pids the update stops or expects: every tray from this installation that `stopInstallLockingProcesses(.., "tray")` would stop, and
+ * the `cmd.exe` the tray starts the server through (tray → cmd.exe → launcher → bun), which only the descriptor's `serverPids` verify.
+ * Any other `cmd.exe`, even one referencing the install, is not owned.
+ */
+export function selectOwnedTrayPids(rows: InstallLockRow[], installDir: string, sparePids: number[], serverPids: number[]): number[] {
+  const trays = selectInstallLockingProcesses(rows, installDir, sparePids, [process.pid]).stop.filter((hit) => hit.kind === "tray").map((hit) => hit.pid);
+  const wrappers = rows.filter((row) =>
+    slash(row.exe).split("/").pop()?.toLowerCase() === "cmd.exe" && trays.includes(row.ppid)
+    && serverPids.some((pid) => ancestorPids(rows, pid).includes(row.pid))).map((row) => row.pid);
+  return [...trays, ...wrappers];
+}
+
+export async function findInstallTrayPids(installDir: string, sparePids: number[], serverPids: number[]): Promise<number[]> {
+  if (process.platform !== "win32") return []; // the tray is a Windows program; elsewhere there is nothing to find
+  const rows = (await listProcesses()).map((row) => ({ pid: row.pid, ppid: row.ppid, exe: row.exe, command: [row.exe, ...row.args].join("\0") }));
+  return selectOwnedTrayPids(rows, installDir, sparePids, serverPids);
+}
+
+export async function findTraySupervisor(installDir: string, serverPids: number[]): Promise<TraySupervisor | null> {
+  if (process.platform !== "win32") return null;
+  const rows = (await listProcesses()).map((row) => ({ pid: row.pid, ppid: row.ppid, exe: row.exe, command: [row.exe, ...row.args].join("\0"), args: row.args }));
+  return traySupervisor(rows, serverPids, installDir);
+}
+
+export interface InteractiveTrayTask { taskName: string; exe: string; args: string; cwd: string; encoded: string; script: string }
+
+const psLiteral = (value: string): string => `'${value.replaceAll("'", "''")}'`;
+
+/** CommandLineToArgvW's inverse for one argument: quote only when it holds whitespace or a quote. */
+const winArg = (arg: string): string => /[\s"]|^$/.test(arg) ? `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, "$1$1")}"` : arg;
+
+/** A one-shot interactive task (`schtasks /IT`) that starts the selected tray command and exits, so deleting the task does not kill the tray. */
+export function interactiveTrayTask(choice: Pick<Extract<ServerRestartChoice, { kind: "tray" }>, "command" | "args" | "cwd">, operationId: string): InteractiveTrayTask {
+  const { command: exe, cwd } = choice;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(operationId)) fail("Invalid tray relaunch operation id");
+  if (!cwd || cwd.includes("\0")) fail("The tray working directory is empty");
+  const taskName = `ompweb-tray-${operationId}`;
+  const args = choice.args.map(winArg).join(" ");
+  const encoded = encodePowershell(`Start-Process -FilePath ${psLiteral(exe)}${args ? ` -ArgumentList ${psLiteral(args)}` : ""} -WorkingDirectory ${psLiteral(cwd)}`);
+  const script = [
+    `$name = ${psString(taskName)}`,
+    `$cwd = ${psString(cwd)}`,
+    `$arg = ${psString(`-NoProfile -WindowStyle Hidden -EncodedCommand ${encoded}`)}`,
+    // LogonType Interactive is schtasks /IT: the starter runs in the logged-on session, not the non-interactive WMI session.
+    `$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg -WorkingDirectory $cwd`,
+    `$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited`,
+    `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 1)`,
+    `Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Settings $settings -Force | Out-Null`,
+    `try {`,
+    `  Start-ScheduledTask -TaskName $name`,
+    `  for ($i = 0; $i -lt 50; $i++) { if ((Get-ScheduledTask -TaskName $name).State -ne 'Running') { break }; Start-Sleep -Milliseconds 100 }`,
+    `} finally { Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue }`,
+  ].join("\n");
+  return { taskName, exe, args, cwd, encoded, script };
+}
+
+export async function launchInteractiveTray(choice: Parameters<typeof interactiveTrayTask>[0], operationId: string): Promise<void> {
+  if (process.platform !== "win32") fail("An interactive tray can only be relaunched on Windows");
+  await powershell(interactiveTrayTask(choice, operationId).script, 60000);
 }

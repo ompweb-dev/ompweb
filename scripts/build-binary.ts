@@ -1,11 +1,12 @@
-// `npm run build:binary [-- --target bun-<os>-<arch>]` (after the client build and the runner build,
-// `bun runner/scripts/build-binary.ts <os>-<arch>`): compiles server/binary.ts into release/ompweb-<os>-<arch>/ompweb
-// (ompweb.exe for Windows) next to the files it serves, the omp runner it spawns (ompweb-omp; not with --no-runner,
-// where ompweb fetches it from its release, lib/omp/runner-fetch.ts) and the licenses of what it redistributes, then
+// `npm run build:binary [-- --target bun-<os>-<arch>]` (after the client build): compiles server/binary.ts into
+// release/ompweb-<os>-<arch>/ompweb (ompweb.exe for Windows) next to the files it serves, the omp runner it spawns
+// (ompweb-omp, downloaded from the fork release omp-runner.json pins: scripts/fetch-runner.ts; not with --no-runner, where
+// ompweb fetches it from that release itself, lib/omp/runner-fetch.ts) and the licenses of what it redistributes, then
 // archives that directory as release/ompweb-<os>-<arch>.tar.gz (.zip for Windows). Default target: this machine.
 import { cpSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
+import { pinnedRunner } from "./fetch-runner";
 import { bundledPackageDirs, writeLicenses } from "./licenses";
 import packageJson from "../package.json";
 
@@ -47,7 +48,7 @@ if (!result.success) process.exit(1);
 
 // The static root (server/binary.ts): the client, the public files, the KaTeX CSS and fonts (where the server
 // resolves the katex package), and the licenses of what ships. Beside the binary, unless --no-runner: the omp runner
-// it spawns (`ompweb-omp`, lib/omp/omp-cli.ts), built first by runner/scripts/build-binary.ts.
+// it spawns (`ompweb-omp`, lib/omp/omp-cli.ts), downloaded from the pinned fork release.
 const copy = (from: string, to: string) => cpSync(from, path.join(out, to), { recursive: true });
 for (const file of ["dist", "public", "LICENSE"]) copy(path.join(root, file), file);
 const releaseTag = process.env.OMP_WEB_RELEASE_TAG || (process.env.GITHUB_REF_TYPE === "tag" ? process.env.GITHUB_REF_NAME : undefined);
@@ -55,15 +56,7 @@ if (releaseTag) {
   if (!/^(?:v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?|\d{8}T\d{6}Z-[a-f0-9]{7,40})$/.test(releaseTag)) throw new Error("Invalid binary release tag");
   writeFileSync(path.join(out, "build-info.json"), JSON.stringify({ version: packageJson.version, releaseTag }) + "\n");
 }
-if (!values["no-runner"]) {
-  const runnerTarget = name.slice("ompweb-".length);
-  const runner = path.join(root, "runner", "release", `ompweb-omp-${runnerTarget}${windows ? ".exe" : ""}`);
-  if (!existsSync(runner)) {
-    console.error(`No ${path.relative(root, runner)}: run \`bun runner/scripts/build-binary.ts ${runnerTarget}\` first.`);
-    process.exit(1);
-  }
-  copy(runner, windows ? "ompweb-omp.exe" : "ompweb-omp");
-}
+if (!values["no-runner"]) copy(await pinnedRunner(name.slice("ompweb-".length)), windows ? "ompweb-omp.exe" : "ompweb-omp");
 for (const file of new Bun.Glob("app/fonts/*-{OFL.txt,LICENSE.*}").scanSync(root)) copy(path.join(root, file), file);
 const katex = path.dirname(Bun.resolveSync("katex/package.json", root));
 for (const file of ["package.json", "LICENSE", "dist/katex.min.css", "dist/fonts"]) copy(path.join(katex, file), `node_modules/katex/${file}`);

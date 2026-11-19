@@ -2,9 +2,10 @@
 // binary) on a free port with a throwaway HOME, waits for its automatic local host, and checks the shipped
 // bundle, the SPA, a hashed asset, the API, a session listed through the daemon, a live session started through the
 // omp runner (no model call) and the SSE stream, then stops both.
-// <dir>: the repo root (after `npm run build` and `bun runner/scripts/build-binary.ts`) or a packed install;
+// <dir>: the repo root (after `npm run build`) or a packed install; both run the runner of the fork release omp-runner.json
+// pins, downloaded to release/runners/ (scripts/fetch-runner.ts) unless --omp <path> names another;
 // <path>: release/ompweb-<os>-<arch>/ompweb, whose directory holds the static files and the runner (ompweb-omp) unless
-// built --no-runner. Prints one `ok <step>` / `FAIL <step>: <detail>` line per step.
+// built --no-runner (then the pinned one, as above). Prints one `ok <step>` / `FAIL <step>: <detail>` line per step.
 import assert from "node:assert/strict";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -12,6 +13,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { releaseRepo } from "../lib/release-repo";
 import { isProcessAlive } from "../lib/process-identity";
+import { pinnedRunner } from "./fetch-runner";
 
 const { values } = parseArgs({ args: Bun.argv.slice(2), options: { package: { type: "string" }, binary: { type: "string" }, omp: { type: "string" }, "second-server": { type: "boolean" } } });
 const binary = values.binary && path.resolve(values.binary);
@@ -91,13 +93,15 @@ const env: Record<string, string | undefined> = {
 };
 // OMP_WEB_OMP_BIN: an agent shell points it at its own omp; test this install's runner instead.
 for (const name of ["OMP_WEB_PASSWORD", "OMP_WEB_PASSWORD_HASH", "OMP_WEB_OMP_BIN"]) delete env[name];
-// --omp <path>: a packed install, or a --no-runner binary, fetches its runner from its release, which a build under
-// test has not published yet (lib/omp/runner-fetch.ts).
+// --omp <path>, else the pinned release's runner: a packed install, or a --no-runner binary, would fetch the same one itself
+// (lib/omp/runner-fetch.ts), into its throwaway HOME. Only a binary that carries its own (ompweb-omp beside it) uses that.
+const bundled = binary && existsSync(path.join(dir, process.platform === "win32" ? "ompweb-omp.exe" : "ompweb-omp"));
 if (values.omp) env.OMP_WEB_OMP_BIN = path.resolve(values.omp);
+else if (!bundled) env.OMP_WEB_OMP_BIN = await pinnedRunner();
 // A private Windows runner lets cleanup identify this smoke's detached brokers without killing other installs' images.
 let privateRunner: string | undefined;
 if (process.platform === "win32") {
-  const runner = env.OMP_WEB_OMP_BIN || (binary ? path.join(dir, "ompweb-omp.exe") : path.join(dir, "runner", "release", "ompweb-omp-windows-x64.exe"));
+  const runner = env.OMP_WEB_OMP_BIN || path.join(dir, "ompweb-omp.exe");
   if (existsSync(runner)) {
     privateRunner = path.join(temp, "ompweb-omp.exe");
     copyFileSync(runner, privateRunner);
@@ -239,7 +243,7 @@ try {
     await step("a live session starts through the omp runner", async () => {
       const response = await fetch(`${base}/api/agent/${SESSION_ID}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "get_state" }) });
       const text = await response.text();
-      assert(response.status === 200 && text.includes(SESSION_ID), `get_state: status ${response.status} ${text} (no runner? build it with \`bun runner/scripts/build-binary.ts\`)`);
+      assert(response.status === 200 && text.includes(SESSION_ID), `get_state: status ${response.status} ${text} (no runner? \`npm run fetch-omp\` fetches the pinned one)`);
       const state = await (await fetch(`${base}/api/agent/${SESSION_ID}`)).json() as { running?: boolean };
       assert(state.running === true, `GET /api/agent: ${JSON.stringify(state)}`);
     });

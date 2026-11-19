@@ -227,7 +227,7 @@ function patchEstimatedTokensAfter(result: unknown): void {
 
 // ============================================================================
 // AgentSessionWrapper
-// Wraps one session's ompweb-omp runner (its channel, runner/src/channel.ts) with the interface the rest of
+// Wraps one session's ompweb-omp runner (its channel, packages/ompweb-runner/src/channel.ts of the oh-my-pi fork) with the interface the rest of
 // the app expects (same command surface pi-web's in-process wrapper offered).
 // ============================================================================
 

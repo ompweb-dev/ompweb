@@ -34,7 +34,7 @@ A clean, modern web UI for the [oh-my-pi (omp)](https://github.com/can1357/oh-my
 
 ## Requirements
 
-- Nothing else for omp: ompweb runs its own [omp](https://github.com/can1357/oh-my-pi) build, `ompweb-omp`, which reads your `~/.omp` settings, auth and sessions. Every install (npm, npx or the single binary) downloads the `ompweb-omp` of its exact version from that version's [GitHub release](https://github.com/ompweb-dev/ompweb/releases) the first time it starts, checks its SHA-256 and keeps it (beside the single binary, otherwise in `~/.omp/agent/omp-web/omp/<version>/`); `ompweb fetch-omp` does the same on demand. Sessions start once it is there. It exists for linux-x64, linux-arm64, darwin-x64, darwin-arm64 and windows-x64; on any other platform (Linux on musl, Windows on Arm, FreeBSD) ompweb cannot start sessions. A machine that cannot reach GitHub needs `OMP_WEB_OMP_BIN` pointing at a copy of that release's `ompweb-omp-<os>-<arch>`
+- Nothing else for omp: ompweb runs its own [omp](https://github.com/can1357/oh-my-pi) build, `ompweb-omp`, which reads your `~/.omp` settings, auth and sessions. It is built and released by the [oh-my-pi fork](https://github.com/ompweb-dev/oh-my-pi/releases), not by ompweb. Every install (npm, npx or the single binary) downloads the `ompweb-omp` of the fork release its ompweb version pins (`omp-runner.json`) the first time it starts, checks its SHA-256 and keeps it (beside the single binary, otherwise in `~/.omp/agent/omp-web/omp/<version>/<release tag>/`); `ompweb fetch-omp` does the same on demand. Sessions start once it is there. It exists for linux-x64, linux-arm64, darwin-x64, darwin-arm64 and windows-x64; on any other platform (Linux on musl, Windows on Arm, FreeBSD) ompweb cannot start sessions. A machine that cannot reach GitHub needs `OMP_WEB_OMP_BIN` pointing at a copy of that release's `ompweb-omp-<os>-<arch>`
 - Node.js `>= 24`. The server runs on [Bun](https://bun.sh), which installs automatically as a dependency of the npm package (a Bun on your `PATH` is used if the bundled one is missing)
 
 The **Steer**, **Delete** and **Edit** actions on a queued message are commands of the `ompweb-omp` channel (`promote_queued_message`, `remove_queued_message`). Deletion is confirmed by omp before the chip disappears; editing recalls text only after cancellation succeeds. A message that is no longer pending leaves the queue unchanged and displays a notice; ompweb does not send a duplicate steering message.
@@ -155,7 +155,7 @@ Open [http://127.0.0.1:30177](http://127.0.0.1:30177) in your browser.
 ompweb --port 8080                         # Custom port
 ompweb --hostname 0.0.0.0                  # Listen on network
 ompweb hash-password                       # Print the value for OMP_WEB_PASSWORD_HASH
-ompweb fetch-omp                           # Download this version's ompweb-omp from its GitHub release (SHA-256-checked) if it is missing
+ompweb fetch-omp                           # Download the pinned ompweb-omp from its fork release (SHA-256-checked) if it is missing
 ompweb preflight                           # Start the session omp once (as a new session would) and wait for its hello; exit 1 says why it failed
 ompweb --no-open                           # Don't auto-open the browser
 ompweb --install-tray                      # Install Windows System Tray service & Desktop shortcuts
@@ -1042,7 +1042,7 @@ Stop it with `Stop-ScheduledTask ompweb-host`, then end the running host with
 | `OMP_WEB_NO_OPEN` | Set to `1` to prevent auto-opening browser | `0` |
 | `OMP_WEB_DISABLE_AUTOUPDATE` | Set to `1` to disable update checks and in-app updates; restart after changing | `0` |
 | `OMP_WEB_NAME` | Name shown in browser tabs and installed-app names. `url`, `host` or `domain` (any case) uses the hostname the browser connected to, without port; localhost and IP addresses keep `omp web`. Any other value is used as-is. Restart after changing | `omp web` |
-| `OMP_WEB_OMP_BIN` | Path to an `ompweb-omp` build to use instead of the downloaded one: a copy of the release's `ompweb-omp-<os>-<arch>` on a machine that cannot reach GitHub, or `runner/release/ompweb-omp-<os>-<arch>` from a source checkout. A stock `omp` does not work: it does not speak ompweb's channel. The service installers write it into the service environment only when you set it | _the downloaded `ompweb-omp`_ |
+| `OMP_WEB_OMP_BIN` | Path to an `ompweb-omp` build to use instead of the downloaded one: a copy of the fork release's `ompweb-omp-<os>-<arch>` on a machine that cannot reach GitHub, or a runner you built from the fork. A stock `omp` does not work: it does not speak ompweb's channel. The service installers write it into the service environment only when you set it | _the downloaded `ompweb-omp`_ |
 | `PI_CODING_AGENT_DIR` | Custom omp agent directory | `~/.omp/agent` |
 | `OMP_WEB_STT_ENDPOINT` | OpenAI-compatible transcription endpoint URL. Leave unset to transcribe with `OMP_WEB_STT_MODEL` through omp's own credentials | _None_ |
 | `OMP_WEB_STT_KEY` | Optional API key for the STT endpoint | _None_ |
@@ -1165,13 +1165,12 @@ addresses you list in `set_real_ip_from`:
 git clone https://github.com/ompweb-dev/ompweb.git
 cd ompweb
 npm install
-npx bun runner/scripts/use-omp-build.ts && (cd runner && npx bun install --frozen-lockfile)
-npx bun runner/scripts/build-binary.ts   # ompweb's omp build for this machine: runner/release/ompweb-omp-<os>-<arch>
+npm run fetch-omp   # ompweb's omp runner (from the fork release omp-runner.json pins), where the dev server finds it
 npm run dev
 ```
 
-The dev server runs at [http://127.0.0.1:30178](http://127.0.0.1:30178). It finds the runner in
-`runner/release/` by itself; `npm test` and `npm run build:binary` need the runner set up too.
+The dev server runs at [http://127.0.0.1:30178](http://127.0.0.1:30178). It needs
+the runner `npm run fetch-omp` downloaded (once per pin); `npm run smoke` and `npm run build:binary` download theirs themselves.
 
 A dev server does not take over the local daemon: only the production web
 server writes the daemon's `host.json`, so "This machine" shows offline in dev

@@ -100,5 +100,5 @@
 - [ ] Windows CI: real Windows binary startup, detached helper survives caller tree termination, service/task handling, `.exe` replacement and rollback, legacy and modern update paths. Add native macOS recovery validation; do not substitute mocked platform values.
 - [ ] Browser: actual Settings → Hosts normal/Force flow and server-update plan/approval/progress against scratch installations, including a hard protocol incompatibility.
 - [ ] Parent runs narrow integrated tests once, then typecheck/build/browser/targeted native checks as relevant. Do not claim Windows completion until its CI proof arrives through pr-watcher.
-- [ ] Run `graphify update .`; preserve tracked graph output. Dispatch one condensed adversarial reviewer for contract/correctness/test honesty/over-engineering, fix findings, commit and push.
+- [ ] Dispatch one condensed adversarial reviewer for contract/correctness/test honesty/over-engineering, fix findings, commit and push.
 - [ ] Open the PR, register pr-watcher, handle CI and request available authorized Codex/CodeRabbit reviews after green CI. No production deployment or forced live restart without separate approval.

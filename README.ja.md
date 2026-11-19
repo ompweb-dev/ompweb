@@ -34,7 +34,7 @@
 
 ## 必要条件
 
-- omp を別途インストールする必要はありません。ompweb は独自の [omp](https://github.com/can1357/oh-my-pi) ビルド `ompweb-omp` を使い、`~/.omp` の設定、認証、セッションをそのまま使います。どのインストール（npm、npx、単一バイナリ）も、初回起動時に同じバージョンの `ompweb-omp` をそのバージョンの [GitHub リリース](https://github.com/ompweb-dev/ompweb/releases)からダウンロードし、SHA-256 を確認して保存します（単一バイナリでは同じディレクトリ、それ以外は `~/.omp/agent/omp-web/omp/<version>/`）。`ompweb fetch-omp` でも取得できます。対応プラットフォームは linux-x64、linux-arm64、darwin-x64、darwin-arm64、windows-x64 です。それ以外（musl の Linux、Arm 版 Windows、FreeBSD）ではセッションを開始できません。GitHub に接続できないマシンでは、`OMP_WEB_OMP_BIN` にそのリリースの `ompweb-omp-<os>-<arch>` のコピーを指定してください
+- omp を別途インストールする必要はありません。ompweb は独自の [omp](https://github.com/can1357/oh-my-pi) ビルド `ompweb-omp` を使い、`~/.omp` の設定、認証、セッションをそのまま使います。このビルドは ompweb ではなく [oh-my-pi フォーク](https://github.com/ompweb-dev/oh-my-pi/releases)がビルド・リリースします。どのインストール（npm、npx、単一バイナリ）も、初回起動時にその ompweb バージョンが固定しているフォークのリリース（`omp-runner.json`）から `ompweb-omp` をダウンロードし、SHA-256 を確認して保存します（単一バイナリでは同じディレクトリ、それ以外は `~/.omp/agent/omp-web/omp/<version>/<リリースタグ>/`）。`ompweb fetch-omp` でも取得できます。対応プラットフォームは linux-x64、linux-arm64、darwin-x64、darwin-arm64、windows-x64 です。それ以外（musl の Linux、Arm 版 Windows、FreeBSD）ではセッションを開始できません。GitHub に接続できないマシンでは、`OMP_WEB_OMP_BIN` にそのリリースの `ompweb-omp-<os>-<arch>` のコピーを指定してください
 - Node.js `>= 24`。サーバーは [Bun](https://bun.sh) で動作し、npm パッケージの依存関係として自動的にインストールされます（同梱の Bun が見つからない場合は `PATH` 上の Bun を使用します）
 
 キュー内のメッセージに対する **Steer**、**Delete**、**Edit** 操作は `ompweb-omp` チャネルのコマンド（`promote_queued_message`、`remove_queued_message`）です。omp がキャンセルを確認してから表示を削除し、編集時はキャンセル成功後にテキストを入力欄へ戻します。すでにキューに存在しないメッセージでは、キューを変更せず通知を表示します。ompweb が重複したステアリングメッセージを送信することはありません。
@@ -66,7 +66,7 @@ ompweb
 ompweb --port 8080                         # ポート番号指定
 ompweb --hostname 0.0.0.0                  # ネットワーク公開
 ompweb hash-password                      # OMP_WEB_PASSWORD_HASH 用の値を出力
-ompweb fetch-omp                          # このバージョンの ompweb-omp を GitHub リリースからダウンロード（SHA-256 確認、未取得の場合のみ）
+ompweb fetch-omp                          # 固定されたフォークのリリースから ompweb-omp をダウンロード（SHA-256 確認、未取得の場合のみ）
 ompweb preflight                          # 新しいセッションと同じように omp を一度起動して hello を待つ。失敗時は理由を表示して終了コード 1
 ompweb --no-open                           # ブラウザ自動起動を無効化
 ```
@@ -137,7 +137,7 @@ Linux トレイ、Windows サービス）はインストール時に `OMP_WEB_PA
 | `OMP_WEB_NO_OPEN` | `1` でブラウザ自動起動を無効化 | `0` |
 | `OMP_WEB_DISABLE_AUTOUPDATE` | `1` で更新チェックとアプリ内更新を無効化（変更後は再起動） | `0` |
 | `OMP_WEB_NAME` | ブラウザのタブとインストールしたアプリに表示する名前。`url`・`host`・`domain`（大文字小文字を区別しない）を指定すると、ブラウザが接続したホスト名（ポートなし）を使用します（localhost と IP アドレスは `omp web` のまま）。それ以外の値はそのまま使用します（変更後は再起動） | `omp web` |
-| `OMP_WEB_OMP_BIN` | ダウンロード版の代わりに使う `ompweb-omp` ビルドのパス（GitHub に接続できないマシンではリリースの `ompweb-omp-<os>-<arch>` のコピー、ソースチェックアウトでは `runner/release/ompweb-omp-<os>-<arch>`）。通常の `omp` は ompweb のチャネルを話さないため使えません。サービスのインストーラーは、これを設定したときだけサービス環境に書き込みます | _ダウンロードした `ompweb-omp`_ |
+| `OMP_WEB_OMP_BIN` | ダウンロード版の代わりに使う `ompweb-omp` ビルドのパス（GitHub に接続できないマシンではフォークのリリースの `ompweb-omp-<os>-<arch>` のコピー、またはフォークからビルドしたランナー）。通常の `omp` は ompweb のチャネルを話さないため使えません。サービスのインストーラーは、これを設定したときだけサービス環境に書き込みます | _ダウンロードした `ompweb-omp`_ |
 | `PI_CODING_AGENT_DIR` | カスタム omp エージェントディレクトリ | `~/.omp/agent` |
 | `OMP_WEB_STT_ENDPOINT` | OpenAI 互換の音声認識エンドポイント URL。未設定の場合は `OMP_WEB_STT_MODEL` を omp 自身の認証情報で使って文字起こしします | _なし_ |
 | `OMP_WEB_STT_KEY` | STT エンドポイント用の API キー | _なし_ |
@@ -151,12 +151,11 @@ Linux トレイ、Windows サービス）はインストール時に `OMP_WEB_PA
 git clone https://github.com/ompweb-dev/ompweb.git
 cd ompweb
 npm install
-npx bun runner/scripts/use-omp-build.ts && (cd runner && npx bun install --frozen-lockfile)
-npx bun runner/scripts/build-binary.ts   # このマシン用の ompweb の omp ビルド: runner/release/ompweb-omp-<os>-<arch>
+npm run fetch-omp   # ompweb の omp ランナー（omp-runner.json が固定するフォークのリリース）
 npm run dev
 ```
 
-ローカル開発サーバーは [http://127.0.0.1:30178](http://127.0.0.1:30178) で起動します。`runner/release/` のランナーは自動的に見つかります。`npm test` と `npm run build:binary` にもランナーのセットアップが必要です。
+ローカル開発サーバーは [http://127.0.0.1:30178](http://127.0.0.1:30178) で起動します。ランナーは `npm run fetch-omp` でダウンロードしたものを使います（固定が変わるたびに 1 回）。`npm run smoke` と `npm run build:binary` は自分でダウンロードします。
 
 `npm run dev` は Bun のホットリロード付きでサーバーを起動します。`npm run build` はブラウザアプリを `dist/` にバンドルし、`npm start` はそれをポート 30177 で配信します（`npm run smoke` で結果を確認できます）。`npm run dev:lan` は開発サーバーをすべてのインターフェースにバインドします。
 

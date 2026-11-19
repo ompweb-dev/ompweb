@@ -5,17 +5,17 @@
 // never the Bun server or the hub. self-update.ts prepares everything the worker uses and verifies the result.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
 import { promisify } from "node:util";
 import { requestHostControl, type HostControlStatus } from "./hosts/host-control";
-import { assertOwnedPath, HOST_VERSION_PATTERN, hostLaunch, moveHostRelease, sharedHostInstallReason, validateApprovedReleasePin } from "./hosts/update-worker";
+import { assertOwnedPath, HOST_VERSION_PATTERN, hostLaunch, moveHostRelease, replaceFileSync, sharedHostInstallReason, validateApprovedReleasePin } from "./hosts/update-worker";
 import { getAgentDir } from "./omp/paths";
 import { isProcessAlive } from "./process-identity";
 import { atomicWrite, attemptPath, isActiveLease, leasePath, markerPath, patchStatus, readStateJson, removeSecureFile, renewLease, secureRegularFile, statusPath, type SelfUpdateStage, type StoredStatus } from "./self-update-state";
-import { inspectUpgradeProcess, launchDetachedUpgrade, restartUpgradeProcess, stopUpgradeProcess, type UpgradeLaunch, type UpgradeProcess } from "./upgrade-process";
+import { cwdOutsideInstall, findInstallTrayPids, findTraySupervisor, inspectUpgradeProcess, installSpawnCwd, launchDetachedUpgrade, launchInteractiveTray, restartUpgradeProcess, serverRestartChoice, stopInstallLockingProcesses, stopUpgradeProcess, type TraySupervisor, type UpgradeLaunch, type UpgradeProcess } from "./upgrade-process";
 import { isRecord } from "./type-guards";
 import type { UpgradeParticipant, UpgradePlan } from "./upgrade-types";
 import type { ApprovedReleasePin } from "./hosts/update-types";
@@ -63,6 +63,14 @@ export interface ServerUpdateDeps {
   launch: typeof launchDetachedUpgrade;
   hostControl: typeof requestHostControl;
   sharedInstall: typeof sharedHostInstallReason;
+  /** Stops processes that lock the install directory. `tray` first, so a tray cannot restart the server; `all` after the descriptor stop. */
+  releaseLocks: typeof stopInstallLockingProcesses;
+  /** The tray that started the server, captured before it is stopped. Null when the server had no tray supervisor. */
+  findTray: typeof findTraySupervisor;
+  /** The trays the tray stop would end, and the cmd.exe wrapper between a tray and the server launcher: not foreign sharers, so the shared-install check can run before it stops. */
+  trayPids: typeof findInstallTrayPids;
+  /** Starts the tray in the logged-on session. Not the detached helper: that one is non-interactive. */
+  relaunchInteractiveTray: typeof launchInteractiveTray;
   /** The new server has this long to report ready after it starts. */
   bootTimeoutMs: number;
   /** The host has this long to answer its control endpoint linked, at the expected version. */
@@ -78,6 +86,10 @@ export const defaultServerUpdateDeps: ServerUpdateDeps = {
   launch: launchDetachedUpgrade,
   hostControl: requestHostControl,
   sharedInstall: sharedHostInstallReason,
+  releaseLocks: stopInstallLockingProcesses,
+  findTray: findTraySupervisor,
+  trayPids: findInstallTrayPids,
+  relaunchInteractiveTray: launchInteractiveTray,
   bootTimeoutMs: 120_000,
   hostTimeoutMs: 90_000,
   pollMs: 250,
@@ -267,7 +279,7 @@ export function reportPlan(attemptId: string, participantId: string | null, stat
     }
     const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
     writeFileSync(temporary, JSON.stringify(plan), { mode: 0o600, flag: "wx" });
-    try { renameSync(temporary, file); } finally { rmSync(temporary, { force: true }); }
+    try { replaceFileSync(temporary, file); } finally { rmSync(temporary, { force: true }); }
   } catch (error) {
     console.error(`Could not record the server update plan's progress: ${message(error)}`);
   }
@@ -275,6 +287,8 @@ export function reportPlan(attemptId: string, participantId: string | null, stat
 
 /** Runs one update attempt; the exit code. The terminal result is always in status.json (and the plan), never only in the exit code. */
 export async function runServerUpdateWorker(descriptorPath: string, deps: ServerUpdateDeps = defaultServerUpdateDeps): Promise<number> {
+  // Windows refuses to rename a directory that is a live process's working directory.
+  if (process.argv[2] === "--server-update-descriptor" || process.argv[2] === "server-update-worker") process.chdir(installSpawnCwd());
   // The terminal that started the update may close before it ends.
   process.on("SIGHUP", () => undefined);
   let d: ServerUpdateDescriptor;
@@ -291,6 +305,9 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
   catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return 1; throw error; }
 
   const flags = { hostDrainPending: false, hostDrained: false, hostStopped: false, serverStopped: false, swapped: false, restarted: false };
+  let tray: TraySupervisor | null = null;
+  let relaunchTray = false;
+  let trayStopped = false;
   const serverProcess = d.server.process;
   const hostProcess = d.localHost.kind === "shared" ? d.localHost.process : null;
   const backup = serverArtifact(d.installDir, "backup", id);
@@ -307,7 +324,16 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
     const nonce = randomUUID();
     removeSecureFile(markerPath(id, "boot.json"));
     atomicWrite(markerPath(id, "expect.json"), JSON.stringify({ attemptId: id, version, nonce }));
-    const started = await deps.restart(serverProcess, { ...d.server.launch, env: readLaunchEnvironment(id) });
+    const choice = serverRestartChoice(tray, d.installDir, cwdOutsideInstall(d.installDir));
+    relaunchTray = choice.kind === "tray";
+    // The tray must run in the logged-on session. The detached helper is only for a server that had no tray.
+    let started: number | undefined;
+    if (choice.kind === "tray") await deps.relaunchInteractiveTray(choice, id);
+    else {
+      const env = readLaunchEnvironment(id);
+      env.OMP_WEB_PACKAGE_DIR = d.installDir;
+      started = await deps.restart(serverProcess, { ...d.server.launch, env });
+    }
     const deadline = Date.now() + deps.bootTimeoutMs;
     let exitedAt: number | undefined;
     for (;;) {
@@ -377,12 +403,28 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
     };
     if (flags.restarted) {
       await step("The failed new host could not be stopped, so the previous installation was left in place", stopHostFromInstall, true);
-      if (!blocked) await step("The failed new server could not be stopped, so the previous installation was left in place", () => deps.stop(serverProcess), true);
+      if (!blocked) await step("The failed new server could not be stopped, so the previous installation was left in place", async () => {
+        if (relaunchTray) await deps.releaseLocks(d.installDir, [process.pid], "all");
+        else await deps.stop(serverProcess);
+      }, true);
     }
     if (flags.swapped && !blocked) {
       await step("The previous installation could not be restored", () => restoreInstallDirectory(d.installDir, backup, failed).then(() => { flags.swapped = false; }), true);
     }
-    if (flags.serverStopped && !blocked) await step(`The previous server ${d.fromVersion} could not be restarted`, () => startServer(d.fromVersion));
+    // Stopping the launcher on Windows can leave its bun child holding the port. Reconcile only the server's own tree: never the host daemon or other processes.
+    const restartPreviousServer = async (): Promise<void> => {
+      await deps.releaseLocks(d.installDir, [process.pid], "all", d.server.pids);
+      await startServer(d.fromVersion);
+    };
+    if (flags.serverStopped && !blocked) await step(`The previous server ${d.fromVersion} could not be restarted`, restartPreviousServer);
+    // The tray was stopped during preparation while the server kept running. A relaunched tray always starts its own server and would hit the occupied
+    // port, so stop our server (identity-checked) and let the tray start the one server; recovery is reported only after it is ready.
+    else if (trayStopped && !blocked) await step(`The previous tray and server ${d.fromVersion} could not be restarted`, async () => {
+      await deps.releaseLocks(d.installDir, [process.pid], "tray"); // a partial stop may have left it running: never two supervisors
+      await deps.stop(serverProcess);
+      flags.serverStopped = true;
+      await restartPreviousServer();
+    }, true);
     if (flags.hostStopped && !blocked) await step("The previous local host could not be restarted", async () => {
       await deps.restart(hostProcess!, launchFor(d));
       await awaitHost(d.fromVersion, hostProcess!.pid, true);
@@ -393,7 +435,7 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
       if (status.drained) await deps.hostControl("resume");
       flags.hostDrainPending = false;
     });
-    const touched = flags.serverStopped || flags.hostStopped || flags.swapped || flags.restarted || flags.hostDrained;
+    const touched = flags.serverStopped || flags.hostStopped || flags.swapped || flags.restarted || flags.hostDrained || trayStopped;
     const detail = notes.length ? `; ${notes.join("; ")}` : touched ? "; the previous release was restored" : "";
     return { message: `${message(primary)}${detail}`.slice(0, 1500), recovered: notes.length === 0 };
   };
@@ -405,8 +447,14 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
     await verifyStagedRelease(d);
     // Nothing stops while an unknown process still runs from the installation: the server's tree and the shared host (and its sessions) are expected.
     const owned = [...d.server.pids, ...(hostProcess ? [hostProcess.pid] : [])];
-    const sharing = await deps.sharedInstall(d.installDir, [process.pid, ...owned], owned);
+    tray = await deps.findTray(d.installDir, d.server.pids);
+    // Check before the tray stops: no refusal may leave a stopped tray beside a running server. The trays are ours to stop, not sharers.
+    const trays = await deps.trayPids(d.installDir, [process.pid, ...owned], d.server.pids);
+    const sharing = await deps.sharedInstall(d.installDir, [process.pid, ...owned, ...trays], owned);
     if (sharing) throw new Error(sharing);
+    trayStopped = tray !== null; // set before the stop: a release that fails midway may already have stopped it
+    // The tray exe lives in the package and is not a descriptor pid. Stop it before it can restart the server.
+    await deps.releaseLocks(d.installDir, [process.pid, ...owned], "tray");
 
     stage("stopping");
     if (hostProcess) {
@@ -440,7 +488,10 @@ export async function runServerUpdateWorker(descriptorPath: string, deps: Server
       } else if (!isProcessAlive(serverProcess.pid)) flags.serverStopped = true;
       throw error;
     }
-    const leftover = await deps.sharedInstall(d.installDir, [process.pid]);
+    // shortcut: a scheduled task can restart the host during the rename; hold that task across the swap if that race shows up.
+    // TerminateProcess stops only the descriptor pid, so a bun child whose command line references the install is still running.
+    await deps.releaseLocks(d.installDir, [process.pid], "all");
+    const leftover = await deps.sharedInstall(d.installDir, [process.pid, ...trays]); // the tray's cmd.exe wrapper may still be exiting
     if (leftover) throw new Error(leftover);
 
     stage("installing");

@@ -7,7 +7,7 @@ import { LINK_LIMITS } from "../hosts/link-protocol";
 
 /**
  * Process + protocol layer for ompweb's omp (`ompweb-omp --headless`), which speaks the channel of
- * runner/src/channel.ts as NDJSON over stdio. Frames pass through as `{type: t, ...rest}`, except:
+ * packages/ompweb-runner/src/channel.ts of the oh-my-pi fork as NDJSON over stdio. Frames pass through as `{type: t, ...rest}`, except:
  *
  *   hello                          → readiness (`waitReady` resolves `{type:"ready", ...hello}`)
  *   event {event}                  → the event object itself

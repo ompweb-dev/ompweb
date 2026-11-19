@@ -103,6 +103,41 @@ export async function listSessionsAllHosts(): Promise<SessionInfo[]> {
   return merged;
 }
 
+/** Search each host in sidebar order. One host settles before the next starts,
+ * so cancelling the consumer starts no later host work. */
+export async function* searchSessionsAllHosts(query: string): AsyncGenerator<Record<string, number>> {
+  const seen = new Set<string>();
+  for (const hostId of hostIds()) {
+    const lists = hostLists(hostId);
+    const ownershipKnown = lists.loaded || lists.sessions.length > 0;
+    const owned = new Set<string>();
+    for (const session of lists.sessions) {
+      if (seen.has(session.id)) continue;
+      seen.add(session.id);
+      owned.add(session.id);
+    }
+
+    const scores: Record<string, number> = {};
+    const host = getHost(hostId);
+    if (host && isLinkUp(host.status())) {
+      try {
+        const result = await host.sessionOps.searchSessions(query);
+        if (result.ok) {
+          for (const [id, score] of Object.entries(result.value)) {
+            if (owned.has(id) || (!ownershipKnown && !seen.has(id))) {
+              seen.add(id);
+              scores[id] = score;
+            }
+          }
+        }
+      } catch {
+        // An offline, old or failing host contributes no transcript scores.
+      }
+    }
+    yield scores;
+  }
+}
+
 async function hostWithSession(id: string, refresh: boolean): Promise<Host | null> {
   const ids = hostIds();
   const lists = await Promise.all(ids.map((hostId) => hostSessions(hostId, refresh)));

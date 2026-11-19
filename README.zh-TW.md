@@ -34,7 +34,7 @@
 
 ## 系統需求
 
-- 無需另行安裝 omp：ompweb 使用自己的 [omp](https://github.com/can1357/oh-my-pi) 建置版本 `ompweb-omp`，直接使用 `~/.omp` 中的設定、認證與對話。每種安裝方式（npm、npx 或單一二進位檔）都會在首次啟動時從該版本的 [GitHub 發行版本](https://github.com/ompweb-dev/ompweb/releases)下載同一版本的 `ompweb-omp`，驗證 SHA-256 後保存（單一二進位檔放在同一資料夾，其他方式放在 `~/.omp/agent/omp-web/omp/<version>/`）；也可用 `ompweb fetch-omp` 手動取得。支援的平台為 linux-x64、linux-arm64、darwin-x64、darwin-arm64 與 windows-x64；在其他平台（musl 的 Linux、Arm 版 Windows、FreeBSD）上無法啟動對話。無法連線至 GitHub 的機器請將 `OMP_WEB_OMP_BIN` 指向該發行版本 `ompweb-omp-<os>-<arch>` 的副本
+- 無需另行安裝 omp：ompweb 使用自己的 [omp](https://github.com/can1357/oh-my-pi) 建置版本 `ompweb-omp`，直接使用 `~/.omp` 中的設定、認證與對話。該建置版本由 [oh-my-pi 分支](https://github.com/ompweb-dev/oh-my-pi/releases)建置並發行，而非 ompweb。每種安裝方式（npm、npx 或單一二進位檔）都會在首次啟動時從其 ompweb 版本固定的分支發行版本（`omp-runner.json`）下載 `ompweb-omp`，驗證 SHA-256 後保存（單一二進位檔放在同一資料夾，其他方式放在 `~/.omp/agent/omp-web/omp/<version>/<發行標籤>/`）；也可用 `ompweb fetch-omp` 手動取得。支援的平台為 linux-x64、linux-arm64、darwin-x64、darwin-arm64 與 windows-x64；在其他平台（musl 的 Linux、Arm 版 Windows、FreeBSD）上無法啟動對話。無法連線至 GitHub 的機器請將 `OMP_WEB_OMP_BIN` 指向該發行版本 `ompweb-omp-<os>-<arch>` 的副本
 - Node.js `>= 24`。伺服器運作於 [Bun](https://bun.sh) 上，Bun 會作為 npm 套件的相依套件自動安裝（找不到隨套件安裝的 Bun 時會使用 `PATH` 中的 Bun）
 
 佇列中訊息的**引導（Steer）**、**刪除（Delete）**與**編輯（Edit）**操作皆為 `ompweb-omp` 通道的指令（`promote_queued_message`、`remove_queued_message`）。刪除操作會先經 omp 確認後，標籤才會自畫面消失；編輯操作則在成功取消佇列後，才會將文字取回輸入框。若該訊息已不再處於等待狀態，佇列將維持原狀並顯示提示；ompweb 不會重複傳送引導訊息。
@@ -90,7 +90,7 @@ ompweb
 ompweb --port 8080                         # 自訂連接埠
 ompweb --hostname 0.0.0.0                  # 監聽網路介面
 ompweb hash-password                       # 輸出供 OMP_WEB_PASSWORD_HASH 使用的雜湊值
-ompweb fetch-omp                           # 從 GitHub 發行版本下載此版本的 ompweb-omp（驗證 SHA-256，僅在缺少時）
+ompweb fetch-omp                           # 從固定的分支發行版本下載 ompweb-omp（驗證 SHA-256，僅在缺少時）
 ompweb preflight                           # 如同新對話般啟動一次 omp 並等待其 hello；失敗時說明原因並以 1 結束
 ompweb --no-open                           # 不自動開啟瀏覽器
 ompweb --install-tray                      # 安裝 Windows 系統匣服務與桌面捷徑
@@ -478,7 +478,7 @@ Start-ScheduledTask ompweb-host
 | `OMP_WEB_NO_OPEN` | 設為 `1` 可防止自動開啟瀏覽器 | `0` |
 | `OMP_WEB_DISABLE_AUTOUPDATE` | 設為 `1` 可停用更新檢查與應用程式內更新；變更後需重新啟動 | `0` |
 | `OMP_WEB_NAME` | 顯示於瀏覽器分頁與已安裝應用程式的名稱。若設為 `url`、`host` 或 `domain`（不分大小寫），則採用瀏覽器連線的主機名稱（不含連接埠）；localhost 與 IP 位址仍會保持 `omp web`。其他任何值將原樣採用。變更後需重新啟動 | `omp web` |
-| `OMP_WEB_OMP_BIN` | 用於取代下載版本的 `ompweb-omp` 建置版本路徑（無法連線至 GitHub 的機器上為發行版本中 `ompweb-omp-<os>-<arch>` 的副本，原始碼檢出中為 `runner/release/ompweb-omp-<os>-<arch>`）。一般的 `omp` 不支援 ompweb 的通道，無法使用。服務安裝程式僅在你設定它時才會寫入服務環境 | _下載的 `ompweb-omp`_ |
+| `OMP_WEB_OMP_BIN` | 用於取代下載版本的 `ompweb-omp` 建置版本路徑（無法連線至 GitHub 的機器上為分支發行版本中 `ompweb-omp-<os>-<arch>` 的副本，或從分支自行建置的 runner）。一般的 `omp` 不支援 ompweb 的通道，無法使用。服務安裝程式僅在你設定它時才會寫入服務環境 | _下載的 `ompweb-omp`_ |
 | `PI_CODING_AGENT_DIR` | 自訂 omp 代理目錄 | `~/.omp/agent` |
 | `OMP_WEB_STT_ENDPOINT` | 相容於 OpenAI 的語音轉文字（STT）端點網址。若保留未設定，則會透過 omp 自身的憑證搭配 `OMP_WEB_STT_MODEL` 進行轉錄 | _無_ |
 | `OMP_WEB_STT_KEY` | STT 端點的選用 API 金鑰 | _無_ |
@@ -562,12 +562,11 @@ proxy_set_header X-Omp-Web-Auth $ompweb_auth;
 git clone https://github.com/ompweb-dev/ompweb.git
 cd ompweb
 npm install
-npx bun runner/scripts/use-omp-build.ts && (cd runner && npx bun install --frozen-lockfile)
-npx bun runner/scripts/build-binary.ts   # 為本機建置 ompweb 的 omp：runner/release/ompweb-omp-<os>-<arch>
+npm run fetch-omp   # ompweb 的 omp runner（omp-runner.json 固定的分支發行版本）
 npm run dev
 ```
 
-開發伺服器將執行於 [http://127.0.0.1:30178](http://127.0.0.1:30178)。它會自動找到 `runner/release/` 中的 runner；`npm test` 與 `npm run build:binary` 也需要先準備好 runner。
+開發伺服器將執行於 [http://127.0.0.1:30178](http://127.0.0.1:30178)。它使用 `npm run fetch-omp` 下載的 runner（每個固定版本一次）；`npm run smoke` 與 `npm run build:binary` 會自行下載。
 開發伺服器不會接管本機守護行程：只有正式環境的網頁伺服器會寫入守護行程的 `host.json`，因此「本機」在開發環境中會顯示為離線，而守護行程會保持與您已安裝的 ompweb 連結。
 
 `npm run dev` 以 Bun 熱重載（hot reload）方式執行伺服器。`npm run build` 將瀏覽器端應用打包至 `dist/`，`npm start` 則在 30177 連接埠提供該產物（可用 `npm run smoke` 檢查結果）。`npm run dev:lan` 會將開發伺服器繫結至所有網路介面。`npm run build:binary` 會將適用於本機的[單一二進位檔](#單一二進位檔)建置到 `release/`（可使用 `-- --target bun-linux-arm64` 等參數為其他平台建置；`npm run smoke -- --binary release/ompweb-linux-x64/ompweb` 進行檢查）。

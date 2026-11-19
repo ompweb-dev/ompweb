@@ -30,6 +30,16 @@ $IcoPath = Join-Path $RepoRoot "public\omp-web.ico"
 $PngPath = Join-Path $RepoRoot "public\icon.png"
 $LaunchVbs = Join-Path $RepoRoot "scripts\windows\launch-tray.vbs"
 
+# The updater replaces this installation in place, and Windows refuses to rename a
+# directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
+# The shortcuts launch absolute targets, so they start outside the installation.
+$ShortcutWorkingDirectory = $env:USERPROFILE
+# A shortcut with an empty working directory starts in its target's directory, which is the
+# installation; refuse instead of silently reintroducing the lock.
+if ([string]::IsNullOrWhiteSpace($ShortcutWorkingDirectory)) {
+    throw "USERPROFILE is empty: refusing to create omp-web shortcuts that start inside the installation."
+}
+
 function Log-Message([string]$msg) {
     if (!$Quiet) {
         Write-Host $msg
@@ -172,7 +182,7 @@ try {
         $sc.TargetPath = $wscriptExe
         $sc.Arguments = "`"$LaunchVbs`" -OpenBrowser"
     }
-    $sc.WorkingDirectory = $RepoRoot
+    $sc.WorkingDirectory = $ShortcutWorkingDirectory
     if (Test-Path $IcoPath) { $sc.IconLocation = "$IcoPath,0" }
     $sc.Description = "Open omp-web AI Coding Agent Web Interface"
     $sc.Save()
@@ -193,7 +203,7 @@ try {
         $sc.TargetPath = $wscriptExe
         $sc.Arguments = "`"$LaunchVbs`" -OpenBrowser"
     }
-    $sc.WorkingDirectory = $RepoRoot
+    $sc.WorkingDirectory = $ShortcutWorkingDirectory
     if (Test-Path $IcoPath) { $sc.IconLocation = "$IcoPath,0" }
     $sc.Description = "omp-web System Tray & Web Interface"
     $sc.Save()
@@ -215,7 +225,7 @@ if (!$NoAutostart) {
             $sc.TargetPath = $wscriptExe
             $sc.Arguments = "`"$LaunchVbs`" -Startup"
         }
-        $sc.WorkingDirectory = $RepoRoot
+        $sc.WorkingDirectory = $ShortcutWorkingDirectory
         if (Test-Path $IcoPath) { $sc.IconLocation = "$IcoPath,0" }
         $sc.Description = "omp-web Background Tray Service"
         $sc.Save()
@@ -293,5 +303,7 @@ if (Test-Path $HostPs1) {
 # -----------------------------------------------------------------------------
 if ($StartImmediately) {
     Log-Message "Starting background service and opening browser..."
-    $wsh.Run("`"$wscriptExe`" `"$LaunchVbs`" -OpenBrowser", 0, $false)
+    # Start it from outside the installation too, or the tray inherits this directory as
+    # its working directory and blocks the next replacement.
+    Start-Process -FilePath $wscriptExe -ArgumentList "`"$LaunchVbs`" -OpenBrowser" -WorkingDirectory $ShortcutWorkingDirectory -WindowStyle Hidden
 }

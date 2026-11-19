@@ -95,7 +95,7 @@ const path = require("node:path");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const fs = require("node:fs");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { checkLaunchSecurity, parseLaunchOptions } = require("./omp-web-options");
+const { checkLaunchSecurity, parseLaunchOptions, serverWorkingDirectory } = require("./omp-web-options");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { isPortAvailable } = require("./port-availability");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -205,7 +205,10 @@ function trackServer(child) {
 
 function spawnServer(command) {
   return trackServer(spawn(command[0], command.slice(1), {
-    cwd: pkgDir,
+    // Never the installation: on Windows a working directory there blocks the rename an
+    // in-place update performs, and the server needs no relative path (the entry point and
+    // OMP_WEB_PACKAGE_DIR below are absolute).
+    cwd: serverWorkingDirectory(),
     stdio: ["inherit", "pipe", "inherit"],
     env: serverEnvironment(),
   }));

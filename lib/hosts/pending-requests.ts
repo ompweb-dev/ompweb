@@ -4,7 +4,7 @@
 import { isValidSessionId } from "../session-file-references-core";
 import { isRecord } from "../type-guards";
 
-/** One line of the runner channel (runner/src/channel.ts), keyed by `t`. */
+/** One line of the runner channel (packages/ompweb-runner/src/channel.ts of the oh-my-pi fork), keyed by `t`. */
 export type WireFrame = { t: string; [key: string]: unknown };
 /** An AgentSession event inside an `event` frame. */
 export type WireEvent = { type: string; [key: string]: unknown };

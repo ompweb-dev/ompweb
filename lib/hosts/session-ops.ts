@@ -11,6 +11,7 @@ import { homedir, tmpdir } from "os";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { promisify } from "util";
 import { comparableProjectPath } from "../comparable-path";
+import { MAX_SESSION_SEARCH_QUERY_LENGTH, searchSessions as searchSessionContent } from "../session-content-search";
 import { mediaFilePath } from "../media-cache";
 import { OMP_NOT_FOUND, resolveOmpBin, wrapWindowsScript } from "../omp/omp-cli";
 import { listArchivedSessionInfos, restoreArchivedSession, restoreFailureStatus } from "../omp/archive";
@@ -97,6 +98,7 @@ export interface ProjectUpdate {
 
 export interface SessionOps {
   listSessions(): Promise<SessionInfo[]>;
+  searchSessions(query: string): Promise<OpResult<Record<string, number>>>;
   /** Strict, uncached active-ID inventory for restore conflict checks; errors mean absence cannot be established. */
   listSessionIdsForRestore(): Promise<string[]>;
   readSession(id: string, options: SessionReadOptions): Promise<OpResult<SessionReadValue>>;
@@ -317,6 +319,14 @@ async function runOmpExport(filePath: string, outputPath: string): Promise<void>
 /** This machine's session and project files. */
 export const sessionOps: SessionOps = {
   listSessions: () => listAllSessions(),
+  async searchSessions(query) {
+    if (typeof query !== "string" || query.length > MAX_SESSION_SEARCH_QUERY_LENGTH) {
+      return fail(400, "query_too_long", "Query too long");
+    }
+    const scores: Record<string, number> = {};
+    for await (const batch of searchSessionContent(query)) Object.assign(scores, batch);
+    return ok(scores);
+  },
   listSessionIdsForRestore: async () => listSessionIdsForRestore(),
 
   async readSession(id, { deferThinking, deferMedia: deferToolResultImages }) {

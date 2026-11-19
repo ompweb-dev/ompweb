@@ -54,7 +54,7 @@ test("a SIGHUP to the dev parent also stops the server it re-ran", { skip: proce
 test("hot reload of a shared worker dependency keeps the dev server listening", { skip: process.platform === "win32", timeout: 60_000 }, async (t) => {
   const home = mkdtempSync(path.join(os.tmpdir(), "omp-web-hot-"));
   const source = path.join(home, "source");
-  for (const name of ["server", "app", "lib", "components", "hooks", "public", "scripts", "bin", "tsconfig.json", "bunfig.toml", "package.json", "instrumentation.node.ts", "proxy.ts"]) {
+  for (const name of ["server", "app", "lib", "components", "hooks", "public", "scripts", "bin", "tsconfig.json", "bunfig.toml", "package.json", "omp-runner.json", "instrumentation.node.ts", "proxy.ts"]) {
     cpSync(path.join(repo, name), path.join(source, name), { recursive: true });
   }
   symlinkSync(path.join(repo, "node_modules"), path.join(source, "node_modules"), "dir");

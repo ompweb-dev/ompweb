@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Download, RefreshCw } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/field";
 import type { HostRow } from "@/lib/hosts/hub";
@@ -88,7 +88,7 @@ export function HostUpdates({ host }: { host: HostRow }) {
         setInfo(next);
         setError(null);
         setNeedsStatus(false);
-        if (next.operation?.state === "running" && !next.operation.recoveryRequired) {
+        if ([next.operation, next.omp.operation].some((item) => item?.state === "running" && !item.recoveryRequired)) {
           watching.current = true;
           deadline.current ||= Date.now() + RECONNECT_MS;
           setMonitoring(true);
@@ -145,7 +145,8 @@ export function HostUpdates({ host }: { host: HostRow }) {
       }
       if (!data.accepted || !data.operation) throw new Error(t("hostUpdates.invalidResponse"));
       const operation = data.operation as HostUpdateOperation;
-      setInfo((previous) => previous && { ...previous, operation: operation.state === "running" ? operation : null });
+      // An omp update has its own record, beside ompweb's: neither replaces the other.
+      setInfo((previous) => previous && (target === "omp" ? { ...previous, omp: { ...previous.omp, operation: operation.state === "running" ? operation : null } } : { ...previous, operation: operation.state === "running" ? operation : null }));
       watching.current = true;
       deadline.current = Date.now() + RECONNECT_MS;
       setMonitoring(true);
@@ -171,6 +172,8 @@ export function HostUpdates({ host }: { host: HostRow }) {
   const disabled = busy || unavailable || unsupported;
   const unavailableReason = (host.status === "needs-upgrade" && unavailable) || unsupported ? t("hostUpdates.unsupported") : host.status === "offline" && unavailable ? t("hostUpdates.offline") : null;
   const operation = info?.operation;
+  const operations = [info?.operation, info?.omp.operation].filter((item): item is HostUpdateOperation => !!item);
+  const running = operations.find((item) => item.state === "running");
   return (
     <div style={{ flexBasis: "100%", minWidth: 0, borderTop: "1px solid var(--border)", paddingTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
@@ -179,45 +182,46 @@ export function HostUpdates({ host }: { host: HostRow }) {
           <RefreshCw size={13} aria-hidden="true" />{t(loading ? "hostUpdates.checking" : error || needsStatus ? "hostUpdates.retry" : "hostUpdates.check")}
         </button>
       </div>
-      {(["ompweb"] as const).map((target) => {
+      {(["ompweb", "omp"] as const).map((target) => {
         const software = info?.[target];
         const label = t(`hostUpdates.${target}`);
+        // A daemon without the runner channel updates omp only with ompweb.
+        const withOmpweb = target === "omp" && info !== null && info.omp.runnerChannel !== true;
         const updateDisabled = disabled || needsStatus || operation?.recoveryRequired === true || !software?.canUpdate;
         const forceable = operation?.recoveryRequired !== true && software?.updateAvailable === true && !software.canUpdate && software.canForceUpdate === true;
         return (
           <div key={target} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
             <div style={{ minWidth: 0, flex: "1 1 200px", fontSize: 12, color: "var(--text-muted)", overflowWrap: "anywhere" }}>
               <strong style={{ color: "var(--text)", fontWeight: 600 }}>{label}</strong>
-              <div style={{ marginTop: 3, fontFamily: "var(--font-mono)" }}>{t("hostUpdates.current", { version: software?.currentVersion ?? host.ompwebVersion ?? t("hostUpdates.unknown") })}</div>
+              <div style={{ marginTop: 3, fontFamily: "var(--font-mono)" }}>{t("hostUpdates.current", { version: software?.currentVersion ?? (target === "ompweb" ? host.ompwebVersion : host.ompVersion?.replace(/^omp\//, "")) ?? t("hostUpdates.unknown") })}</div>
               {software?.updateAvailable && software.availableVersion && <div style={{ color: "var(--accent)" }}>{t("hostUpdates.available", { version: software.availableVersion })}</div>}
-              {software?.currentVersion && !software.updateAvailable && !software.blockedReason && !error && !busy && !unavailableReason && <div>{t("hostUpdates.upToDate")}</div>}
+              {withOmpweb && <div>{t("hostUpdates.ompWithOmpweb")}</div>}
+              {!withOmpweb && software?.currentVersion && !software.updateAvailable && !software.blockedReason && !error && !busy && !unavailableReason && <div>{t("hostUpdates.upToDate")}</div>}
               {software?.blockedReason && <div style={{ marginTop: 3, color: "var(--status-warning)" }}>{t("hostUpdates.blocked", { reason: software.blockedReason })}</div>}
               {software?.updateAvailable && !software.canUpdate && !software.blockedReason && !forceable && <div>{t("hostUpdates.manualOnly")}</div>}
               {forceable && <div>{t("hostUpdates.forceAvailable")}</div>}
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {software?.updateAvailable && software.availableVersion && <button type="button" className="ui-focus-ring" aria-label={t("hostUpdates.updateAria", { software: label })} disabled={updateDisabled} style={{ ...buttonStyle, opacity: updateDisabled ? 0.6 : 1, cursor: updateDisabled ? "not-allowed" : "pointer" }} onClick={() => setConfirm({ target, force: false })}><Download size={13} aria-hidden="true" />{t("hostUpdates.update")}</button>}
+              {software?.updateAvailable && software.availableVersion && <button type="button" className="ui-focus-ring" aria-label={t("hostUpdates.updateAria", { software: label })} disabled={updateDisabled} style={{ ...buttonStyle, opacity: updateDisabled ? 0.6 : 1, cursor: updateDisabled ? "not-allowed" : "pointer" }} onClick={() => setConfirm({ target, force: false })}><Download size={13} aria-hidden="true" />{target === "omp" ? t("hostUpdates.updateOmp", { version: software.availableVersion }) : t("hostUpdates.update")}</button>}
               {forceable && software.availableVersion && <button type="button" className="ui-focus-ring" aria-label={t("hostUpdates.forceUpdateAria", { software: label })} disabled={disabled || needsStatus} style={{ ...dangerButtonStyle, opacity: disabled || needsStatus ? 0.6 : 1, cursor: disabled || needsStatus ? "not-allowed" : "pointer" }} onClick={() => setConfirm({ target, force: true })}><AlertTriangle size={13} aria-hidden="true" />{t("hostUpdates.forceUpdate")}</button>}
             </div>
           </div>
         );
       })}
-      {/* omp updates with ompweb: each ompweb release ships its omp runner. */}
-      <div style={{ minWidth: 0, fontSize: 12, color: "var(--text-muted)", overflowWrap: "anywhere" }}>
-        <strong style={{ color: "var(--text)", fontWeight: 600 }}>{t("hostUpdates.omp")}</strong>
-        <div style={{ marginTop: 3, fontFamily: "var(--font-mono)" }}>{t("hostUpdates.current", { version: info?.omp.currentVersion ?? host.ompVersion?.replace(/^omp\//, "") ?? t("hostUpdates.unknown") })}</div>
-        <div>{t("hostUpdates.ompWithOmpweb")}</div>
-      </div>
       <div aria-live="polite" style={{ fontSize: 12, color: "var(--text-muted)", overflowWrap: "anywhere" }}>
         {unavailableReason && <div>{unavailableReason}</div>}
-        {monitoring && <div role="status">{operation?.state === "running" ? t("hostUpdates.updating", { software: t(`hostUpdates.${operation.target}`), version: operation.version }) : t("hostUpdates.reconnecting")}</div>}
-        {!monitoring && !posting && !error && operation?.state === "succeeded" && <div role="status">{t(operation.awaitingServerCutover ? "hostUpdates.awaitingServerCutover" : "hostUpdates.succeeded")}</div>}
-        {!monitoring && operation?.force === true && operation.interruptedSessions !== undefined && operation.state !== "running" && <div>{t("hostUpdates.interruptedSessions", { count: operation.interruptedSessions })}</div>}
-        {!monitoring && (operation?.state === "failed" || operation?.recoveryRequired) && <div role="alert" style={{ color: "var(--status-error)" }}>{t("hostUpdates.updateFailed", { error: operation.error || t("hostUpdates.unknownError") })}</div>}
+        {monitoring && <div role="status">{running ? t("hostUpdates.updating", { software: t(`hostUpdates.${running.target}`), version: running.version }) : t("hostUpdates.reconnecting")}</div>}
+        {operations.map((item) => (
+          <Fragment key={`${item.target}:${item.id}`}>
+            {!monitoring && !posting && !error && item.state === "succeeded" && <div role="status">{t(item.awaitingServerCutover ? "hostUpdates.awaitingServerCutover" : item.target === "omp" ? "hostUpdates.ompSucceeded" : "hostUpdates.succeeded")}</div>}
+            {!monitoring && item.force === true && item.interruptedSessions !== undefined && item.state !== "running" && <div>{t("hostUpdates.interruptedSessions", { count: item.interruptedSessions })}</div>}
+            {!monitoring && (item.state === "failed" || item.recoveryRequired) && <div role="alert" style={{ color: "var(--status-error)" }}>{t("hostUpdates.updateFailed", { error: item.error || t("hostUpdates.unknownError") })}</div>}
+          </Fragment>
+        ))}
         {error && <div role="alert" style={{ color: "var(--status-error)" }}>{error}</div>}
         {needsStatus && <div>{t("hostUpdates.statusRequired")}</div>}
       </div>
-      <ConfirmDialog open={confirm !== null} onOpenChange={(open) => { if (!open) setConfirm(null); }} title={t(confirm?.force ? "hostUpdates.forceConfirmTitle" : "hostUpdates.confirmTitle", { software: confirm ? t(`hostUpdates.${confirm.target}`) : "", host: hostName(t, host) })} description={t(confirm?.force ? "hostUpdates.forceHostWarning" : "hostUpdates.hostWarning", { host: hostName(t, host) })} confirmLabel={t(confirm?.force ? "hostUpdates.forceConfirm" : "hostUpdates.update")} cancelLabel={t("hostsConfig.cancel")} danger={confirm?.force === true} busy={posting} onConfirm={() => void update()} />
+      <ConfirmDialog open={confirm !== null} onOpenChange={(open) => { if (!open) setConfirm(null); }} title={t(confirm?.force ? "hostUpdates.forceConfirmTitle" : "hostUpdates.confirmTitle", { software: confirm ? t(`hostUpdates.${confirm.target}`) : "", host: hostName(t, host) })} description={t(confirm?.force ? "hostUpdates.forceHostWarning" : confirm?.target === "omp" ? "hostUpdates.ompHostWarning" : "hostUpdates.hostWarning", { host: hostName(t, host) })} confirmLabel={t(confirm?.force ? "hostUpdates.forceConfirm" : "hostUpdates.update")} cancelLabel={t("hostsConfig.cancel")} danger={confirm?.force === true} busy={posting} onConfirm={() => void update()} />
     </div>
   );
 }

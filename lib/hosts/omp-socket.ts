@@ -1,4 +1,4 @@
-// The host socket an omp started from a TUI dials (runner/src/channel.ts): each connection becomes a daemon channel,
+// The host socket an omp started from a TUI dials (the runner's channel.ts, packages/ompweb-runner/src/ of the oh-my-pi fork): each connection becomes a daemon channel,
 // its lines the child's stdout, the server's lines written back, its close the child's exit. Unix only, never TCP.
 import { chmodSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
@@ -12,10 +12,10 @@ import type { SpawnRequest, SpawnResult } from "./host";
 const HELLO_TIMEOUT_MS = 10_000;
 const errno = (error: unknown) => (error as NodeJS.ErrnoException)?.code;
 
-/** Must match `CHANNEL_PROTO` in runner/src/channel.ts (omp-socket.test.mjs checks). */
+/** Must match `CHANNEL_PROTO` in the runner's channel.ts (see above); a change there that an older ompweb cannot speak bumps RUNNER_PROTOCOL (omp-cli.ts) too. */
 export const CHANNEL_PROTO = 1;
 
-/** Must match `hostSocketPath()` in runner/src/channel.ts (omp-socket.test.mjs checks). */
+/** Must match `hostSocketPath()` in the runner's channel.ts (see above); omp-socket.test.mjs pins this side. */
 export function hostSocketPath(): string {
   return process.env.OMPWEB_HOST_SOCKET || join(process.env.XDG_RUNTIME_DIR || tmpdir(), "ompweb", "host.sock");
 }
@@ -87,7 +87,7 @@ function helloLaunch(line: string): { pid: number; launch: SpawnRequest; session
     ...(typeof hello.sessionId === "string" ? { sessionId: hello.sessionId } : {}) };
 }
 
-/** Tells the runner not to redial (runner/src/channel.ts), then closes. */
+/** Tells the runner not to redial (its channel.ts), then closes. */
 function refuse(socket: Socket, reason: string): void {
   socket.end(JSON.stringify({ t: "refused", reason }) + "\n");
 }

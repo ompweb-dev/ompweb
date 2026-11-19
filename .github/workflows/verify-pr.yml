@@ -46,12 +46,17 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
-      # The runner's own deps too: lib/hosts/omp-socket.test.mjs checks the host against runner/src/channel.ts.
       - name: Install dependencies
-        run: |
-          npm ci
-          npx bun runner/scripts/use-omp-build.ts
-          npx bun install --cwd runner --frozen-lockfile
+        run: npm ci
+
+      # What publish.yml runs before npm publish: the tray must build from these sources and carry this commit.
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        if: runner.os == 'Linux'
+        with:
+          dotnet-version: 8.0.x
+      - name: Build the Windows tray (Linux only)
+        if: runner.os == 'Linux'
+        run: sh scripts/build-tray.sh
 
       - name: TypeScript typecheck
         run: npm run typecheck
@@ -86,8 +91,10 @@ jobs:
       - name: Verify production build
         run: npm run build
 
-      - name: Build the omp runner
-        run: npx bun runner/scripts/build-binary.ts
+      # The omp runner is built and released by the oh-my-pi fork: this downloads the release omp-runner.json pins
+      # (SHA-256-checked) into release/runners/, where the smoke tests, the binary build and the upgrade test find it.
+      - name: Fetch the pinned omp runner
+        run: npx bun scripts/fetch-runner.ts
 
       - name: Smoke test
         run: npm run smoke
@@ -124,25 +131,64 @@ jobs:
       # Required on every supported runner, including macOS foreground. A skip fails the job.
       - name: Native compiled coordinated upgrade and rollback
         shell: bash
+        # The suite bounds each test at 15 min; a stall past that (seen twice on windows-latest, killed at the 60 min job
+        # limit with no log) must fail here with its output kept.
+        timeout-minutes: 25
         env:
           OMPWEB_COMPILED_UPGRADE_E2E: "1"
         run: |
-          export OMPWEB_UPGRADE_E2E_RUNNER="$(node -p "require('node:path').resolve('runner', 'release', 'ompweb-omp-' + (process.platform === 'win32' ? 'windows' : process.platform) + '-' + process.arch + (process.platform === 'win32' ? '.exe' : ''))")"
-          npx bun test --parallel --timeout 900000 lib/compiled-upgrade.integration.test.mjs
+          OMPWEB_UPGRADE_E2E_RUNNER="$(npx bun scripts/fetch-runner.ts)"
+          export OMPWEB_UPGRADE_E2E_RUNNER
+          # Output goes to a file, not the step's pipe: a detached process that inherits the pipe keeps a Windows step open.
+          log="$RUNNER_TEMP/compiled-upgrade.log"
+          status=0
+          npx bun test --parallel --timeout 900000 lib/compiled-upgrade.integration.test.mjs > "$log" 2>&1 < /dev/null || status=$?
+          cat "$log"
+          exit "$status"
+
+      - name: Upload the coordinated upgrade log
+        if: ${{ !cancelled() && failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compiled-upgrade-${{ matrix.os }}
+          path: ${{ runner.temp }}/compiled-upgrade.log
+          if-no-files-found: ignore
+
+      # Published 0.6.0, 0.7.0 and 0.7.1 servers updated through their own GUI update path (real npm installs from the registry).
+      - name: Old published servers update to this checkout through their own GUI
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 20
+        env:
+          OMPWEB_OLD_SERVER_E2E: "1"
+        run: |
+          log="$RUNNER_TEMP/old-server-upgrade.log"
+          status=0
+          npx bun test --parallel --timeout 900000 lib/old-server-upgrade.integration.test.mjs > "$log" 2>&1 < /dev/null || status=$?
+          cat "$log"
+          exit "$status"
+
+      - name: Upload the old-server upgrade log
+        if: ${{ !cancelled() && failure() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: old-server-upgrade-${{ matrix.os }}
+          path: ${{ runner.temp }}/old-server-upgrade.log
+          if-no-files-found: ignore
 
       - name: Packed install smoke test
         shell: bash
         run: |
           npm pack --ignore-scripts
           npm install -g --prefix "$RUNNER_TEMP/ompweb-prefix" ./kahme247-ompweb-*.tgz
-          npm run smoke -- --omp "$(ls runner/release/ompweb-omp-*)" --package "$(npm root -g --prefix "$RUNNER_TEMP/ompweb-prefix")/@kahme247/ompweb"
+          npm run smoke -- --package "$(npm root -g --prefix "$RUNNER_TEMP/ompweb-prefix")/@kahme247/ompweb"
 
       # Bun's postinstall does not run here: the launcher must fall back to @oven/bun-<os>-<arch> (spec R1).
       - name: Packed install smoke test (install scripts disabled)
         shell: bash
         run: |
           npm install -g --ignore-scripts --prefix "$RUNNER_TEMP/ompweb-prefix-no-scripts" ./kahme247-ompweb-*.tgz
-          npm run smoke -- --omp "$(ls runner/release/ompweb-omp-*)" --package "$(npm root -g --prefix "$RUNNER_TEMP/ompweb-prefix-no-scripts")/@kahme247/ompweb"
+          npm run smoke -- --package "$(npm root -g --prefix "$RUNNER_TEMP/ompweb-prefix-no-scripts")/@kahme247/ompweb"
 
       - name: Parse Windows PowerShell scripts (Windows only)
         if: runner.os == 'Windows'

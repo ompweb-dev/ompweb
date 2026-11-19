@@ -69,15 +69,19 @@ async function main(argv: string[]): Promise<number> {
     return 1;
   }
   // Login/logout need none of the daemon, which jiti would otherwise transpile on every run.
-  const [{ runHostDaemon }, { hostSocketPath }, { ensureOmpRunner }] = await Promise.all([import("./daemon"), import("./omp-socket"), import("../omp/runner-fetch")]);
-  // Sessions need the runner; until it is here they fail with OMP_NOT_FOUND and the next start retries.
-  void ensureOmpRunner().catch((error: unknown) => console.error(`ompweb host: ${error instanceof Error ? error.message : String(error)}`));
+  const [{ runHostDaemon }, { hostSocketPath }, { ensureOmpRunner, sweepOmpRunners }] = await Promise.all([import("./daemon"), import("./omp-socket"), import("../omp/runner-fetch")]);
   let daemon: HostDaemon | undefined;
+  // The endpoint is the proof that no other daemon runs on this machine: a second `ompweb host` stops here, before it
+  // touches anything the first one's sessions run from.
   const endpoint = await createHostControlServer((command) => {
     if (!daemon) throw new Error("The host daemon is starting");
     return daemon.control(command);
   });
   try {
+    // The runners of earlier "Update omp" installs: no session of this daemon is running from them any more.
+    sweepOmpRunners();
+    // Sessions need the runner; until it is here they fail with OMP_NOT_FOUND and the next start retries.
+    void ensureOmpRunner().catch((error: unknown) => console.error(`ompweb host: ${error instanceof Error ? error.message : String(error)}`));
     // Windows has no host socket yet (a current-user named pipe is open in the runner spec).
     daemon = runHostDaemon({ allowHttp: argv.includes("--allow-http"), hostSocket: process.platform === "win32" ? undefined : hostSocketPath() });
     // Worker cutover starts fail-closed; ordinary hosts have no maintenance environment.

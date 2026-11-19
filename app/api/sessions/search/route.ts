@@ -1,16 +1,15 @@
-import { searchSessions } from "@/lib/session-content-search";
-
-const MAX_QUERY_LENGTH = 500;
+import { MAX_SESSION_SEARCH_QUERY_LENGTH } from "@/lib/session-content-search";
+import { searchSessionsAllHosts } from "@/lib/hosts/session-index";
 
 // GET /api/sessions/search?q= — NDJSON, one `{ scores }` line per batch of
 // scanned sessions (empty batches too, so the scan keeps reaching the reader).
 // Closing the request stops the scan after the batch being read (no resume).
 export async function GET(req: Request, { disableIdleTimeout }: { disableIdleTimeout: () => void }) {
   const q = new URL(req.url).searchParams.get("q") ?? "";
-  if (q.length > MAX_QUERY_LENGTH) {
+  if (q.length > MAX_SESSION_SEARCH_QUERY_LENGTH) {
     return Response.json({ error: "Query too long", code: "query_too_long" }, { status: 400 });
   }
-  const batches = searchSessions(q);
+  const batches = searchSessionsAllHosts(q);
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     // Pull-driven: the scan only advances while the client keeps reading.

@@ -1,7 +1,7 @@
 import type { NpmUpdateStatus } from "../npm-update";
 
-/** omp is not a target: it updates with ompweb, whose release ships its runner. */
-export type HostUpdateTarget = "ompweb";
+/** What a host updates: its ompweb install, and its omp runner (a newer fork release's, between ompweb releases: lib/omp/runner-fetch.ts). */
+export type HostUpdateTarget = "ompweb" | "omp";
 
 /** The running web server's supported daemon protocol range. Supplied by the hub, never by the browser. */
 export interface HostUpdateCompatibility {
@@ -26,7 +26,7 @@ export interface ApprovedReleasePin {
  * maintenance drain) is never forceable.
  */
 export interface HostUpdateBlocker {
-  code: "updates_disabled" | "check_failed" | "protocol_unverified" | "protocol_incompatible" | "update_in_progress" | "unsupported_install" | "shared_install" | "supervisor_unsupported" | "host_drained" | "host_busy";
+  code: "updates_disabled" | "check_failed" | "protocol_unverified" | "protocol_incompatible" | "update_in_progress" | "ompweb_update_active" | "omp_install_active" | "unsupported_install" | "shared_install" | "supervisor_unsupported" | "host_drained" | "host_busy";
   message: string;
   forceable: boolean;
   coordination?: "server";
@@ -54,8 +54,8 @@ export interface HostSoftwareUpdate {
 export interface HostUpdateOperation {
   /** The operation id the caller supplied (HostUpdateRequest.operationId), else a generated one; the same id names the attempt, its worker and every acknowledgement. */
   id: string;
-  /** "omp": an `omp update` a host recorded before omp updated with ompweb. */
-  target: HostUpdateTarget | "omp";
+  /** "ompweb" restarts the daemon; "omp" only changes the runner new sessions start. */
+  target: HostUpdateTarget;
   version: string;
   state: "running" | "succeeded" | "failed";
   /** All candidate artifacts passed preflight; the worker is waiting for an explicit coordinated commit. */
@@ -87,8 +87,17 @@ export interface HostUpdateRequest {
   phase?: "prepare" | "commit" | "cancel";
 }
 
+/**
+ * The runner (`omp`) on a host. `runnerChannel` is set by a daemon that checks fork releases for runners; a daemon without it
+ * reports only `currentVersion`, and its other fields are never read. No force: an omp update interrupts nothing, so a
+ * blocked one waits for its blocker (`ompweb_update_active` while an ompweb update holds or has unsettled the host's update
+ * claim, `omp_install_active` while an omp install runs; an ompweb update is blocked by `omp_install_active` likewise).
+ * `operation` is the omp update's own record, never `HostUpdateInfo.operation`, which stays ompweb's.
+ */
+export type HostOmpUpdate = Partial<HostSoftwareUpdate> & { currentVersion: string | null; runnerChannel?: true; operation?: HostUpdateOperation | null };
+
 export interface HostUpdateInfo {
   ompweb: HostSoftwareUpdate & Pick<NpmUpdateStatus, "installMethod"> & { protocolVersion: number | null; activeSessions?: number };
-  omp: { currentVersion: string | null };
+  omp: HostOmpUpdate;
   operation: HostUpdateOperation | null;
 }
