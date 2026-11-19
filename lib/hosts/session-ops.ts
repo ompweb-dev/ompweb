@@ -30,6 +30,7 @@ import {
 } from "../omp/session-files";
 import { preparePoolProject, type PreparedPoolProject } from "../pooled-projects";
 import { projectIdentityKey, sessionPathKey } from "../paths";
+import { discardSessionPack, packSessionFile, readSessionPack, retireMovedSession, unpackSessionPack, writeSessionPack, type SessionMoveOrigin } from "./session-transfer";
 import {
   hideProject,
   loadProjectRegistry,
@@ -111,6 +112,17 @@ export interface SessionOps {
   /** `liveSessionIds`: sessions main has a live omp process for; their files are never rewritten. */
   deleteSession(id: string, liveSessionIds: string[]): Promise<OpResult<{ skippedChildren?: Array<{ id: string; reason: string }> }>>;
   archiveSession(id: string): Promise<OpResult<{ archivedPath: string }>>;
+  /** Packs a session for a move (`omp session pack`); `transfer` names the archive on this host until it is unpacked or discarded. */
+  packSession(id: string): Promise<OpResult<{ transfer: string; bytes: number; home: string; platform: string }>>;
+  /** Up to SESSION_PACK_CHUNK_BYTES of a packed archive from `offset`. */
+  readSessionPack(transfer: string, offset: number): Promise<OpResult<Uint8Array>>;
+  /** Appends a base64 chunk to an archive arriving from another host; `offset` must be its current size. */
+  writeSessionPack(transfer: string, offset: number, data: string): Promise<OpResult<{ bytes: number }>>;
+  /** Lands archive `transfer` in workspace `cwd` (`omp session unpack`) and tells the session where it came from. */
+  unpackSession(transfer: string, cwd: string, move: SessionMoveOrigin): Promise<OpResult<{ sessionId: string }>>;
+  /** After the session arrived on host `to`: marks this copy moved (resuming it forks) and archives it. */
+  finishSessionMove(id: string, transfer: string, to: string): Promise<OpResult<null>>;
+  discardSessionPack(transfer: string): Promise<OpResult<null>>;
   /** This host's archive, newest first (browser entries; no hostId). */
   listArchives(): Promise<ArchivedSessionInfo[]>;
   /** Admit one restore: `restoreArchive` starts only under a claim token reserved here and not fenced since. `instance`
@@ -582,6 +594,35 @@ export const sessionOps: SessionOps = {
     invalidateSessionListCache();
     return ok({ archivedPath });
   },
+
+  async packSession(id) {
+    const filePath = await resolveSessionPath(id);
+    if (!filePath) return sessionNotFound();
+    return packSessionFile(filePath);
+  },
+
+  readSessionPack,
+  writeSessionPack,
+
+  async unpackSession(transfer, cwd, move) {
+    const result = await unpackSessionPack(transfer, cwd, move);
+    if (result.ok) {
+      invalidateSessionPathCache(result.value.sessionId);
+      invalidateSessionListCache();
+    }
+    return result;
+  },
+
+  async finishSessionMove(id, transfer, to) {
+    const filePath = await resolveSessionPath(id);
+    if (!filePath) return sessionNotFound();
+    const result = await retireMovedSession(filePath, transfer, to);
+    invalidateSessionPathCache(id);
+    invalidateSessionListCache();
+    return result;
+  },
+
+  discardSessionPack: async (transfer) => discardSessionPack(transfer),
 
   async listArchives() {
     return listArchivedSessionInfos();

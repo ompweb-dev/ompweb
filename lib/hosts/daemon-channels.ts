@@ -70,6 +70,8 @@ export class ChannelTable {
   private readonly goneLinks = new Set<string>();
   /** Exited channels whose open result is still queued for a paused member. */
   private readonly exitedHandoffs = new Map<string, Channel>();
+  /** Session ids reserved by an in-flight move on this host, until unpack/retirement/discard or link drop. */
+  private readonly moving = new Map<string, { transfer: string; linkId: string; timer: NodeJS.Timeout }>();
   private spawningCount = 0;
   private commandId = 0;
   private stopped = false;
@@ -104,6 +106,9 @@ export class ChannelTable {
     if (!isRecord(args) || !(args.sessionId === null || typeof args.sessionId === "string" && isValidSessionId(args.sessionId)) || !isRecord(args.launch)
       || (args.replaceAdvisor !== undefined && typeof args.replaceAdvisor !== "boolean") || (args.preparing !== undefined && typeof args.preparing !== "boolean")
       || (args.expectedChannel !== undefined && (typeof args.expectedChannel !== "string" || !args.expectedChannel || args.replaceAdvisor === true))) throw invalid();
+    if (args.sessionId !== null && this.moving.has(args.sessionId)) {
+      throw new HostOpError(409, "session_busy", "This session is currently being moved");
+    }
     let channel: Channel;
     if (args.expectedChannel !== undefined) {
       const advertised = this.channels.get(args.expectedChannel);
@@ -208,6 +213,9 @@ export class ChannelTable {
     const identity = id ?? this.identity(launch);
     const mutation = (identity === null ? undefined : this.mutating.get(identity)) ?? this.mutating.get(file);
     if (mutation) { await mutation; return this.ensure(id, requested, preparingLinkId); }
+    if (identity !== null && this.moving.has(identity)) {
+      throw new HostOpError(409, "session_busy", "This session is currently being moved");
+    }
     const existing = this.find(identity, file);
     if (existing) {
       await existing.startup;
@@ -249,6 +257,7 @@ export class ChannelTable {
     const prepared = this.deps.prepareLaunch(launch);
     const identity = (prepared.sessionFile ? this.identity(prepared) : null) ?? (sessionId && isValidSessionId(sessionId) ? sessionId : null);
     const key = identity ?? (prepared.sessionFile || null);
+    if (identity !== null && this.moving.has(identity)) throw new HostOpError(409, "session_busy", "This session is currently being moved");
     if (this.find(identity, prepared.sessionFile) || (key !== null && this.spawning.has(key))) throw collision();
     const channel = await this.create(prepared, identity, undefined, spawned);
     channel.opened = true;
@@ -503,6 +512,7 @@ export class ChannelTable {
     for (const owner of channel.commands.values()) if (owner.link?.id === link.id) owner.link = null;
   }
   linkDown(link: DaemonLink): void {
+    this.releaseMovesForLink(link.id);
     for (const channel of this.channels.values()) {
       channel.lifecycle?.linkDown(link.id); channel.shared?.linkChanged();
       // A restarted server forgets its edit; a dropped holder's edit fails as host_offline anyway.
@@ -512,6 +522,7 @@ export class ChannelTable {
   linkUp(link: DaemonLink): void { for (const channel of this.channels.values()) { channel.lifecycle?.linkUp(link.id); channel.shared?.linkChanged(); } }
   linkGone(link: DaemonLink): void {
     this.goneLinks.add(link.id);
+    this.releaseMovesForLink(link.id);
     for (const [ch, channel] of this.exitedHandoffs) {
       channel.members.delete(link.id);
       if (![...channel.members.values()].some(member => member.paused)) this.exitedHandoffs.delete(ch);
@@ -552,9 +563,45 @@ export class ChannelTable {
       return [entries[index]];
     });
   }
-  async mutateSession<T>(id: string, action: (canonicalId: string, liveIds: string[]) => Promise<T>): Promise<T> {
+  reserveMove(link: DaemonLink, sessionId: string, transfer: string, ttlMs = 10 * 60_000): void {
+    const existing = this.moving.get(sessionId);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      if (this.moving.get(sessionId)?.transfer === transfer) this.moving.delete(sessionId);
+    }, ttlMs);
+    timer.unref?.();
+    this.moving.set(sessionId, { transfer, linkId: link.id, timer });
+  }
+  releaseMove(transfer: string): void {
+    for (const [sessionId, entry] of this.moving) {
+      if (entry.transfer === transfer) {
+        clearTimeout(entry.timer);
+        this.moving.delete(sessionId);
+      }
+    }
+  }
+  isMoving(sessionId: string): boolean {
+    return this.moving.has(sessionId);
+  }
+  private releaseMovesForLink(linkId: string): void {
+    for (const [sessionId, entry] of this.moving) {
+      if (entry.linkId === linkId) {
+        clearTimeout(entry.timer);
+        this.moving.delete(sessionId);
+      }
+    }
+  }
+  async mutateSession<T>(
+    id: string,
+    action: (canonicalId: string, liveIds: string[]) => Promise<T>,
+    options?: { refuseRunning?: boolean; moveTransfer?: string },
+  ): Promise<T> {
     if (!isValidSessionId(id)) throw invalid("Invalid session id");
     while (this.mutating.has(id)) await this.mutating.get(id);
+    const moving = this.moving.get(id);
+    if (moving && moving.transfer !== options?.moveTransfer) {
+      throw new HostOpError(409, "session_busy", "This session is currently being moved");
+    }
     const { promise, resolve } = Promise.withResolvers<void>();
     const keys = new Set([id]);
     const protect = (channel?: Channel) => {
@@ -573,6 +620,9 @@ export class ChannelTable {
       channel = findTarget();
       protect(channel);
       if (channel && !channel.exited) {
+        if (options?.refuseRunning && (channel.resuming === true || channel.editor !== undefined || (channel.lifecycle ? !channel.lifecycle.isIdle : channel.pending.activeTurn))) {
+          throw new HostOpError(409, "session_busy", "Wait for the response to finish before moving this session");
+        }
         const exit = Promise.withResolvers<void>();
         channel.transport.onExit(() => exit.resolve()); this.stopChannel(channel); await exit.promise;
       }
@@ -591,6 +641,8 @@ export class ChannelTable {
   }
   async stop(): Promise<void> {
     this.stopped = true;
+    for (const entry of this.moving.values()) clearTimeout(entry.timer);
+    this.moving.clear();
     const exits = [...this.channels.values()].map(channel => {
       if (channel.exited) return Promise.resolve();
       const { promise, resolve } = Promise.withResolvers<void>();

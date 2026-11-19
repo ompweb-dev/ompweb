@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Added
+
+- **Move sessions by drag and drop.** Drag a session onto another workspace in the sidebar, on the same host or another one. The session is told where it came from: host, working directory, home directory and operating system. A copy left on another host is archived there.
+
 ### Fixed
 
 - **In-app updates work again on a Windows install without administrator rights.** The update looked for the service supervising the host daemon among its parent processes and skipped Task Scheduler's `svchost.exe` by its executable path, which Windows does not show to a non-administrator. It then took the daemon started by the `omp-web-host` scheduled task for the `Schedule` service, could not control that service and refused the update with `not_controllable` (#537). Service hosts are now recognized by process name, so the scheduled task is found.

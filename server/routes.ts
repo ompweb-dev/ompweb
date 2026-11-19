@@ -58,6 +58,7 @@ import * as sessionsIdEntriesEntryIdThinking from "@/app/api/sessions/[id]/entri
 import * as sessionsIdExport from "@/app/api/sessions/[id]/export/route";
 import * as sessionsIdLocalFile from "@/app/api/sessions/[id]/local-file/route";
 import * as sessionsIdMatches from "@/app/api/sessions/[id]/matches/route";
+import * as sessionsIdMove from "@/app/api/sessions/[id]/move/route";
 import * as sessionsId from "@/app/api/sessions/[id]/route";
 import * as sessionsIdState from "@/app/api/sessions/[id]/state/route";
 import * as sessionsIdSubagentsSubagentId from "@/app/api/sessions/[id]/subagents/[subagentId]/route";
@@ -161,6 +162,7 @@ export const ROUTE_MODULES: Record<string, RouteModule> = {
   "sessions/[id]/export": sessionsIdExport,
   "sessions/[id]/local-file": sessionsIdLocalFile,
   "sessions/[id]/matches": sessionsIdMatches,
+  "sessions/[id]/move": sessionsIdMove,
   "sessions/[id]": sessionsId,
   "sessions/[id]/state": sessionsIdState,
   "sessions/[id]/subagents/[subagentId]": sessionsIdSubagentsSubagentId,

@@ -52,7 +52,7 @@ import {
   hostsCameOnline,
 } from "./SessionSidebar-helpers";
 import { OmpWebTitle, SIDEBAR_BUTTON_TRANSITION, SidebarIconButton, SidebarPortalMenu } from "./SessionSidebar-chrome";
-import { HostGroup, ProjectRow } from "./SessionSidebar-rows";
+import { HostGroup, ProjectRow, type DraggedSession } from "./SessionSidebar-rows";
 
 /** Deadline for one /api/sessions fetch. A wedged-but-listening server never
  * answers; without this the initial spinner would pend forever. */
@@ -161,6 +161,10 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   }, [hosts, pools]);
   const selectedWorkspaceRef = useRef("");
   selectedWorkspaceRef.current = hostProjectKey(selectedHostId, selectedCwd ?? "");
+  const selectedSessionIdRef = useRef(selectedSessionId);
+  selectedSessionIdRef.current = selectedSessionId;
+  const allSessionsRef = useRef(allSessions);
+  allSessionsRef.current = allSessions;
   // Host group headers only exist once a remote host is linked.
   const showHostGroups = hostList.some((host) => host.id !== LOCAL_HOST_ID);
   // The server renders no groups; collapse state is read after mount.
@@ -1457,6 +1461,31 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     loadSessions();
   }, [allSessions, onSessionDeleted, loadSessions]);
 
+  const handleSessionDrop = useCallback(async (dragged: DraggedSession, project: ManagedProject) => {
+    if (hostOf(dragged) === hostOf(project) && comparableProjectPath(dragged.projectRoot ?? dragged.cwd) === comparableProjectPath(project.path)) return;
+    const name = project.alias ?? project.name ?? projectLabel(project.path);
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(dragged.id)}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hostId: hostOf(project), cwd: project.path }),
+      });
+      const data = await res.json().catch(() => ({})) as { sessionId?: string; hostId?: string; cwd?: string; projectRoot?: string; staleCopy?: string; error?: string; code?: string };
+      if (!res.ok || !data.sessionId) {
+        toast.error(t("sessionSidebar.moveFailed"), formatApiError({ ...data, error: data.error ?? `HTTP ${res.status}` }));
+        return;
+      }
+      toast.success(t("sessionSidebar.moved", { name }), data.staleCopy ? t("sessionSidebar.moveStaleCopy", { error: data.staleCopy }) : undefined);
+      const moved = allSessionsRef.current.find((session) => session.id === dragged.id);
+      if (moved && selectedSessionIdRef.current === dragged.id) {
+        handleSelectSessionFromList({ ...moved, id: data.sessionId, hostId: data.hostId, cwd: data.cwd ?? project.path, projectRoot: data.projectRoot, poolId: undefined, projectId: undefined, projectKey: undefined, worktreeBranch: undefined });
+      }
+      loadSessions();
+    } catch (error) {
+      toast.error(t("sessionSidebar.moveFailed"), error instanceof Error ? error.message : String(error));
+    }
+  }, [handleSelectSessionFromList, loadSessions, t]);
+
   useEffect(() => {
     const selected = allSessions.find((session) => session.id === selectedSessionId);
     if (selected) setLastOpenSession(hostProjectKey(selected.hostId, workspaceKeyOf(selected)), selected.id);
@@ -1843,6 +1872,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                   pinnable={pinsActive}
                   onTogglePin={handleTogglePin}
                   isDragTarget={draggedProject !== null && projectTargetId(draggedProject, pools) === projectTargetId(project, pools) && projectIdentity(draggedProject) !== projectKey && (!pinsActive || project.pinOrder !== undefined)}
+                  onDropSession={project.poolId || hostUnavailableReason(hostOf(project)) ? undefined : handleSessionDrop}
                   removeBusy={removeProjectKey === projectKey}
                   onSelectSession={handleSelectSessionFromList}
                   searchQuery={trimmedSearchQuery || undefined}
