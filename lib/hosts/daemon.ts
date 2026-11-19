@@ -99,7 +99,7 @@ export interface HostDaemon {
   refreshOmpVersion(): Promise<void>;
 }
 /** `hostSocket`: where omps started from a TUI attach (`hostSocketPath()`); unset, none can. */
-type DaemonOptions = { allowHttp: boolean; url?: string; token?: string; links?: HostLink[]; hostSocket?: string };
+type DaemonOptions = { allowHttp: boolean; url?: string; token?: string; links?: HostLink[]; hostSocket?: string; /** Tests. */ ompVersionRetryMs?: number };
 /** A daemon whose omp version read found nothing reads it again after this, doubling up to OMP_VERSION_RETRY_MAX_MS. */
 const OMP_VERSION_RETRY_MS = 30_000;
 const OMP_VERSION_RETRY_MAX_MS = 5 * 60_000;
@@ -120,7 +120,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   let stopping: Promise<void> | undefined;
   let updateStateWarningLogged = false;
   let reloadTimer: NodeJS.Timeout | undefined;
-  let versionRetry: NodeJS.Timeout | undefined, versionRetryMs = OMP_VERSION_RETRY_MS;
+  let versionRetry: NodeJS.Timeout | undefined, versionRetryMs = options.ompVersionRetryMs ?? OMP_VERSION_RETRY_MS;
   let drained = process.env.OMP_WEB_HOST_DRAINED === "1";
   let preparationsInFlight = 0, operationsInFlight = 0, nativeUpdatesInFlight = 0;
   const executable = realpathSync(process.execPath);
@@ -562,7 +562,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   let refreshing: Promise<void> | undefined, refreshAgain = false;
   function scheduleVersionRetry(): void {
     clearTimeout(versionRetry);
-    versionRetry = setTimeout(() => void refreshOmpVersion(), versionRetryMs);
+    versionRetry = setTimeout(() => void refreshOmpVersion().catch(error => log("could not read omp version: " + reason(error))), versionRetryMs);
     versionRetry.unref?.();
   }
   async function readVersionAgain(): Promise<void> {
