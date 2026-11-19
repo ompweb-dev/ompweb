@@ -564,6 +564,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     clearTimeout(versionRetry);
     versionRetry = setTimeout(() => void refreshOmpVersion().catch(error => log("could not read omp version: " + reason(error))), versionRetryMs);
     versionRetry.unref?.();
+    versionRetryMs = Math.min(versionRetryMs * 2, OMP_VERSION_RETRY_MAX_MS);
   }
   async function readVersionAgain(): Promise<void> {
     await versionRead;
@@ -572,7 +573,6 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     if (stopped || ompVersion !== null) return;
     if (version === null) {
       scheduleVersionRetry();
-      versionRetryMs = Math.min(versionRetryMs * 2, OMP_VERSION_RETRY_MAX_MS);
       return;
     }
     clearTimeout(versionRetry);
@@ -583,7 +583,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     if (refreshing) { refreshAgain = true; return refreshing; }
     refreshing = readVersionAgain().finally(() => {
       refreshing = undefined;
-      if (refreshAgain) { refreshAgain = false; void refreshOmpVersion(); }
+      if (refreshAgain) { refreshAgain = false; void refreshOmpVersion().catch(error => log("could not read omp version: " + reason(error))); }
     });
     return refreshing;
   }
