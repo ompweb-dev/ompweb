@@ -528,6 +528,7 @@ export function decodeUp(line: string): UpMessage | UnknownMessage {
     case "sessions_changed":
       return { type: "sessions_changed", seq: seqNum(o, "seq") };
     case "omp_version":
+      if (!str(o, "ompVersion")) fail("ompVersion must not be empty");
       return { type: "omp_version", seq: seqNum(o, "seq"), ompVersion: str(o, "ompVersion") };
     case "channels_changed":
       return { type: "channels_changed", seq: seqNum(o, "seq"), channels: channels(o) };
