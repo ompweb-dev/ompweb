@@ -80,11 +80,11 @@ async function main(argv: string[]): Promise<number> {
   try {
     // The runners of earlier "Update omp" installs: no session of this daemon is running from them any more.
     sweepOmpRunners();
-    // Sessions need the runner; until it is here they fail with OMP_NOT_FOUND. Once fetched, the daemon tells its servers.
-    const runner = ensureOmpRunner().catch((error: unknown) => { console.error(`ompweb host: ${error instanceof Error ? error.message : String(error)}`); return null; });
+    // Sessions need the runner; until it is here they fail with OMP_NOT_FOUND. The daemon joins this fetch, tries it
+    // again while omp is missing and tells its servers once omp answers.
+    void ensureOmpRunner().catch((error: unknown) => console.error(`ompweb host: ${error instanceof Error ? error.message : String(error)}`));
     // Windows has no host socket yet (a current-user named pipe is open in the runner spec).
-    daemon = runHostDaemon({ allowHttp: argv.includes("--allow-http"), hostSocket: process.platform === "win32" ? undefined : hostSocketPath() });
-    void runner.then(bin => { if (bin) return daemon!.refreshOmpVersion(); }).catch((error: unknown) => console.error(`ompweb host: ${error instanceof Error ? error.message : String(error)}`));
+    daemon = runHostDaemon({ allowHttp: argv.includes("--allow-http"), hostSocket: process.platform === "win32" ? undefined : hostSocketPath(), ensureRunner: ensureOmpRunner });
     // Worker cutover starts fail-closed; ordinary hosts have no maintenance environment.
     if (process.env.OMP_WEB_HOST_DRAINED === "1") daemon.control("drain");
     const stop = () => void daemon!.stop();

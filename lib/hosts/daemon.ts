@@ -99,7 +99,10 @@ export interface HostDaemon {
   refreshOmpVersion(): Promise<void>;
 }
 /** `hostSocket`: where omps started from a TUI attach (`hostSocketPath()`); unset, none can. */
-type DaemonOptions = { allowHttp: boolean; url?: string; token?: string; links?: HostLink[]; hostSocket?: string; /** Tests. */ ompVersionRetryMs?: number };
+type DaemonOptions = { allowHttp: boolean; url?: string; token?: string; links?: HostLink[]; hostSocket?: string;
+  /** Fetches the omp runner when this install has none (`ensureOmpRunner`); each omp version retry runs it first. */
+  ensureRunner?: () => Promise<unknown>;
+  /** Tests. */ ompVersionRetryMs?: number };
 /** A daemon whose omp version read found nothing reads it again after this, doubling up to OMP_VERSION_RETRY_MAX_MS. */
 const OMP_VERSION_RETRY_MS = 30_000;
 const OMP_VERSION_RETRY_MAX_MS = 5 * 60_000;
@@ -554,7 +557,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     .finally(() => {
       operationsInFlight--;
       if (!stopped) for (const link of links.values()) link.start();
-      if (!stopped && ompVersion === null) scheduleVersionRetry();
+      if (!stopped && ompVersion === null) void refreshOmpVersion();
     });
   // A null version in the hello marks this host "omp not installed" and its sessions refused. The runner's first fetch,
   // or a first start Windows' antivirus holds past the probe, can outlast the startup read: read again until omp answers,
@@ -570,6 +573,9 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     await versionRead;
     if (stopped || ompVersion !== null) return;
     clearTimeout(versionRetry); // this read is the retry; a miss arms the next one
+    // A fetch that failed at start (offline) is tried again; one still running is joined.
+    await options.ensureRunner?.().catch(error => log("could not fetch the omp runner: " + reason(error)));
+    if (stopped || ompVersion !== null) return;
     const version = await getOmpVersion(true).catch(error => { log("could not read omp version: " + reason(error)); return null; });
     if (stopped || ompVersion !== null) return;
     if (version === null) {
