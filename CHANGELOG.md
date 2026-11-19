@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Fixed
+
+- **In-app updates work again on a Windows install without administrator rights.** The update looked for the service supervising the host daemon among its parent processes and skipped Task Scheduler's `svchost.exe` by its executable path, which Windows does not show to a non-administrator. It then took the daemon started by the `omp-web-host` scheduled task for the `Schedule` service, could not control that service and refused the update with `not_controllable` (#537). Service hosts are now recognized by process name, so the scheduled task is found.
+
 ## [v0.7.3] - 2026-11-18
 
 ### Fixed

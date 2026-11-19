@@ -93,7 +93,7 @@ function assertTrustedFile(path: string, what: string): void {
 
 // ---------------------------------------------------------------- processes
 
-interface ProcessInfo { pid: number; ppid: number; state: string; exe: string; args: string[]; cwd: string | null; created: string | null }
+interface ProcessInfo { pid: number; ppid: number; state: string; exe: string; args: string[]; cwd: string | null; created: string | null; name?: string }
 
 /** CommandLineToArgvW's rules: whitespace separates arguments, quotes group, backslashes escape only before a quote. */
 function splitWindowsCommandLine(line: string): string[] {
@@ -192,8 +192,8 @@ async function listProcesses(): Promise<ProcessInfo[]> {
     return rows;
   }
   if (process.platform === "win32") {
-    const out = await powershell(`$rows = @(Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; ppid = [int]$_.ParentProcessId; exe = [string]$_.ExecutablePath; cmd = [string]$_.CommandLine; created = $(if ($_.CreationDate) { [string]$_.CreationDate.ToUniversalTime().Ticks } else { '' }) } })\nConvertTo-Json -Compress -InputObject $rows`, 120000);
-    return parseJson<{ pid: number; ppid: number; exe: string; cmd: string; created: string }[]>(out, "process list").map((row) => ({ pid: row.pid, ppid: row.ppid, state: "R", exe: row.exe, args: splitWindowsCommandLine(row.cmd), cwd: null, created: row.created || null }));
+    const out = await powershell(`$rows = @(Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; ppid = [int]$_.ParentProcessId; name = [string]$_.Name; exe = [string]$_.ExecutablePath; cmd = [string]$_.CommandLine; created = $(if ($_.CreationDate) { [string]$_.CreationDate.ToUniversalTime().Ticks } else { '' }) } })\nConvertTo-Json -Compress -InputObject $rows`, 120000);
+    return parseJson<{ pid: number; ppid: number; name: string; exe: string; cmd: string; created: string }[]>(out, "process list").map((row) => ({ pid: row.pid, ppid: row.ppid, state: "R", name: row.name, exe: row.exe, args: splitWindowsCommandLine(row.cmd), cwd: null, created: row.created || null }));
   }
   const env = { ...process.env, LC_ALL: "C" };
   const [commands, names] = await Promise.all([
@@ -511,14 +511,21 @@ async function windowsService(name: string): Promise<WindowsService> {
   const out = await powershell(`$s = @(Get-CimInstance Win32_Service | Where-Object { $_.Name -eq ${psString(name)} } | ForEach-Object { ${SERVICE_FIELDS} })\nif ($s.Count -ne 1) { throw 'Service not found' }\nConvertTo-Json -Compress -InputObject $s[0]`);
   return parseJson<WindowsService>(out, "service");
 }
+/**
+ * The ancestors whose services may supervise this process. A scheduled task's tree hangs under the Schedule service's
+ * svchost (shared by many services), which is never one. Matched by name too: a non-administrator reads no
+ * ExecutablePath for a SYSTEM process.
+ */
+export function supervisorCandidatePids(chain: Pick<ProcessInfo, "pid" | "exe" | "name">[]): number[] {
+  return chain.filter((row) => !/^svchost\.exe$/i.test(row.name ?? "") && !/(^|[\\/])svchost\.exe$/i.test(row.exe)).map((row) => row.pid);
+}
 async function inspectWindowsSupervisor(me: ProcessInfo, rows: ProcessInfo[], installDir: string): Promise<UpgradeSupervisor> {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   const chain = ancestry(byPid, me);
   const normal = (value: string) => value.toLowerCase().replaceAll("\\", "/");
   const scripts = [...new Set(chain.slice(1).flatMap((row) => row.args.slice(1).filter((arg) => /\.(?:ps1|cmd|bat|vbs)$/i.test(arg))))];
   const found = parseJson<{ services: WindowsService[]; tasks: WindowsTask[] }>(await powershell(
-    // A scheduled task's tree hangs under the Schedule service's svchost (shared by many services): never a candidate supervisor.
-    `$ids = @(${chain.filter((row) => !/(^|[\\/])svchost\.exe$/i.test(row.exe)).map((row) => row.pid).join(",")})\n$scripts = ${psStrings(scripts.map(normal))}\n` +
+    `$ids = @(${supervisorCandidatePids(chain).join(",")})\n$scripts = ${psStrings(scripts.map(normal))}\n` +
     `$services = @(Get-CimInstance Win32_Service | Where-Object { $_.ProcessId -and ($ids -contains [int]$_.ProcessId) } | ForEach-Object { ${SERVICE_FIELDS} })\n` +
     `$tasks = @()\nif ($scripts.Count -gt 0) { $tasks = @(Get-ScheduledTask | ForEach-Object { $t = $_; $text = ((@($t.Actions | ForEach-Object { $_.Execute + ' ' + $_.Arguments })) -join ' ').ToLowerInvariant().Replace('\\', '/'); $hit = $false; foreach ($s in $scripts) { if ($text.Contains($s)) { $hit = $true } }; if ($hit) { ${TASK_FIELDS} } }) }\n` +
     `ConvertTo-Json -Compress -Depth 6 -InputObject ([pscustomobject]@{ services = $services; tasks = $tasks })`), "supervisor query");
