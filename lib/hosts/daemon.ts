@@ -569,6 +569,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   async function readVersionAgain(): Promise<void> {
     await versionRead;
     if (stopped || ompVersion !== null) return;
+    clearTimeout(versionRetry); // this read is the retry; a miss arms the next one
     const version = await getOmpVersion(true);
     if (stopped || ompVersion !== null) return;
     if (version === null) {
