@@ -1003,6 +1003,10 @@ function applyUp(link: Link, message: UpMessage | UnknownMessage, whole?: UpMess
       return link.channels.get(message.ch)?.deliverLine(message.line);
     case "stderr":
       return link.channels.get(message.ch)?.deliverStderr(message.chunk);
+    case "omp_version":
+      link.ompVersion = message.ompVersion;
+      if (link.status === "omp-missing") setStatus(link, "online");
+      return;
     case "resync":
       return link.channels.get(message.ch)?.deliverResync();
     case "exit": {

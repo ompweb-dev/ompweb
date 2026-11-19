@@ -177,7 +177,9 @@ export function resolveOmpBin(fresh = false): string | null {
 /** Return the installed CLI version, using file metadata to invalidate cached
  * results without launching omp on every visit. An expiry covers opaque
  * launchers; concurrent callers share a probe. */
-export function getOmpVersion(): Promise<string | null> {
+export function getOmpVersion(fresh = false): Promise<string | null> {
+  // fresh: ignore the miss caches (the binary or its version not found within MISS_TTL_MS); a probe in flight is shared.
+  if (fresh) { binMissAt = 0; versionMiss = null; }
   versionProbe ??= probeOmpVersion().finally(() => {
     versionProbe = null;
   });
