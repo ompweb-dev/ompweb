@@ -75,8 +75,6 @@ export class DaemonLink {
   start(): void { this.runtime.start(); }
   stop(): Promise<void> { return this.runtime.stop(); }
   rekey(token: string): void { this.runtime.rekey(token); }
-  /** Ends the current socket; the redial sends a fresh hello and resumes the link. */
-  redial(why: string): void { this.runtime.redial(why); }
   isUp(): boolean { return this.runtime.isUp(); }
   busy(): boolean { return this.runtime.busy(); }
   /** An unsequenced report (`capacity`, `config_state`): sent now on an up link with room, never replayed. A
@@ -497,6 +495,5 @@ function linkRuntime(owner: DaemonLink, deps: LinkDeps) {
   }
   return { queue, output, discard, result, report, busy: () => !mismatched && reliablePending > 0, ackedDown: () => down.acked, isUp: () => linked !== null && !stopped,
     rekey: (token: string) => { owner.login.token = token; authorization = "Bearer " + token; socket?.close(1001, "credentials changed"); },
-    redial: (why: string) => { socket?.close(1001, why); },
     start: () => { if (!started && !stopped) { started = true; loop = keepLinked(); } }, stop };
 }

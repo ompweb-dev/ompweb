@@ -1005,8 +1005,10 @@ function applyUp(link: Link, message: UpMessage | UnknownMessage, whole?: UpMess
       return link.channels.get(message.ch)?.deliverStderr(message.chunk);
     case "omp_version":
       link.ompVersion = message.ompVersion;
-      if (link.status === "omp-missing") setStatus(link, "online");
-      return;
+      if (link.status !== "omp-missing") return notify(hub().changeListeners);
+      setStatus(link, "online");
+      // What waited for a hello with omp (the outbox, resumes) runs now.
+      return notify(hub().helloListeners, link.id, link.recoveryInventory ?? []);
     case "resync":
       return link.channels.get(message.ch)?.deliverResync();
     case "exit": {

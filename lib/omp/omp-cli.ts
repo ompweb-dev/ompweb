@@ -178,8 +178,8 @@ export function resolveOmpBin(fresh = false): string | null {
  * results without launching omp on every visit. An expiry covers opaque
  * launchers; concurrent callers share a probe. */
 export function getOmpVersion(fresh = false): Promise<string | null> {
-  // fresh: ignore the miss caches (the binary or its version not found within MISS_TTL_MS); a probe in flight is shared.
-  if (fresh) { binMissAt = 0; versionMiss = null; }
+  // fresh: a probe of its own, past the miss caches; one in flight may have looked before the binary arrived.
+  if (fresh) { binMissAt = 0; versionMiss = null; return probeOmpVersion(); }
   versionProbe ??= probeOmpVersion().finally(() => {
     versionProbe = null;
   });

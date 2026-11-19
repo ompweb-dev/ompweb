@@ -101,7 +101,7 @@ export interface HostDaemon {
 /** `hostSocket`: where omps started from a TUI attach (`hostSocketPath()`); unset, none can. */
 type DaemonOptions = { allowHttp: boolean; url?: string; token?: string; links?: HostLink[]; hostSocket?: string };
 /** A daemon whose omp version read found nothing reads it again after this, doubling up to OMP_VERSION_RETRY_MAX_MS. */
-export const OMP_VERSION_RETRY_MS = 30_000;
+const OMP_VERSION_RETRY_MS = 30_000;
 const OMP_VERSION_RETRY_MAX_MS = 5 * 60_000;
 export function runHostDaemon(options: DaemonOptions): HostDaemon {
   const explicit = options.url !== undefined && options.token !== undefined ? [{ url: options.url, token: options.token }] : options.links;
@@ -554,31 +554,39 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     .finally(() => {
       operationsInFlight--;
       if (!stopped) for (const link of links.values()) link.start();
+      if (!stopped && ompVersion === null) scheduleVersionRetry();
     });
   // A null version in the hello marks this host "omp not installed" and its sessions refused. The runner's first fetch,
   // or a first start Windows' antivirus holds past the probe, can outlast the startup read: read again until omp answers,
-  // then tell every server (a link made later says it in its hello).
-  async function refreshOmpVersion(): Promise<void> {
+  // then tell every server (a link made later says it in its hello). One read at a time; a call during one reads again.
+  let refreshing: Promise<void> | undefined, refreshAgain = false;
+  function scheduleVersionRetry(): void {
+    clearTimeout(versionRetry);
+    versionRetry = setTimeout(() => void refreshOmpVersion(), versionRetryMs);
+    versionRetry.unref?.();
+  }
+  async function readVersionAgain(): Promise<void> {
     await versionRead;
     if (stopped || ompVersion !== null) return;
-    clearTimeout(versionRetry); versionRetry = undefined;
     const version = await getOmpVersion(true);
     if (stopped || ompVersion !== null) return;
     if (version === null) {
-      clearTimeout(versionRetry);
-      versionRetry = setTimeout(() => void refreshOmpVersion(), versionRetryMs);
-      versionRetry.unref?.();
+      scheduleVersionRetry();
       versionRetryMs = Math.min(versionRetryMs * 2, OMP_VERSION_RETRY_MAX_MS);
       return;
     }
+    clearTimeout(versionRetry);
     ompVersion = version;
     for (const link of links.values()) link.queue({ type: "omp_version", ompVersion: version }, "omp_version");
   }
-  void versionRead.then(() => {
-    if (stopped || ompVersion !== null) return;
-    versionRetry = setTimeout(() => void refreshOmpVersion(), versionRetryMs);
-    versionRetry.unref?.();
-  });
+  function refreshOmpVersion(): Promise<void> {
+    if (refreshing) { refreshAgain = true; return refreshing; }
+    refreshing = readVersionAgain().finally(() => {
+      refreshing = undefined;
+      if (refreshAgain) { refreshAgain = false; void refreshOmpVersion(); }
+    });
+    return refreshing;
+  }
   const started = Promise.all([startupSweep, startupRecovery, versionRead, hostSocket]).then(() => {});
   return { stop: () => shutdown(0), done, control, started, refreshOmpVersion };
 }
