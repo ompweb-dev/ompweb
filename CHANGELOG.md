@@ -6,10 +6,11 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+## [v0.7.4] - 2026-11-20
+
 ### Fixed
 
 - **In-app updates work again on a Windows install without administrator rights.** The update looked for the service supervising the host daemon among its parent processes and skipped Task Scheduler's `svchost.exe` by its executable path, which Windows does not show to a non-administrator. It then took the daemon started by the `omp-web-host` scheduled task for the `Schedule` service, could not control that service and refused the update with `not_controllable` (#537). Service hosts are now recognized by process name, so the scheduled task is found.
-
 - **A host no longer stays "omp not installed" once its runner is there.** The host daemon read the omp version once, at start, while the runner download it had just started in the background (or a fresh runner's first start, which Windows' antivirus can hold past the 30 s probe) was still running. Its server then showed **omp not installed** and refused every message until the daemon restarted, although Settings → Hosts listed the runner's version. The daemon now reads the version again as soon as the download finishes, and otherwise after 30 seconds, doubling up to 5 minutes; each try also downloads the runner again if the first download failed (a host started offline). It tells its servers as soon as omp answers, without reconnecting. A server that predates this learns the version the next time the daemon reconnects to it.
 
 ## [v0.7.3] - 2026-11-18
