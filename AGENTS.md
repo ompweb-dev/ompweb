@@ -1580,9 +1580,13 @@ during the wait.
   frames also feed a bounded per-subagent activity buffer shown in the
   transcript dialog.
 - **Roster hydration**: `get_subagents` snapshots (which carry progress)
-  rehydrate the roster after SSE reconnect (`refreshSubagentRoster`, wired
-  into mount, send, and the reconcile poll). Terminal subagents vanish from
-  the live registry — history fills that gap.
+  rehydrate the roster after every event-stream reconnect (`refreshSubagentRoster`,
+  wired into mount, send, and the reconcile poll), even when the same stream has
+  carried later prompt runs. Running/pending progress for an unknown child also
+  requests the registry; never fabricate a roster entry from a possibly late
+  progress frame. Concurrent reads share one in-flight request per session/run/
+  roster generation, and both merging and pruning reject a stale generation.
+  Terminal subagents vanish from the live registry — history fills that gap.
 - **On-disk history** (`lib/subagent-history.ts`, `/api/sessions/[id]/subagents*`):
   omp persists each subagent's transcript to the parent session's sibling
   artifacts dir (`<session-dir>/<subagent-id>.jsonl`) and the parent file's
@@ -1623,6 +1627,15 @@ during the wait.
   count (`inflightTaskDetails`/`extractedToolData.task` progress), and the
   `⤴` async marker (live `detached` flag or history `details.async`
   presence). Shared formatters live in `lib/subagent-format.ts`.
+- **Wire diet** (`lib/subagent-stream.ts`, `SubagentStreamLimiter` in `AgentSessionWrapper.handleFrame`):
+  omp mirrors every child event and snapshots progress every ~150 ms per child, ~430 KiB/s per open
+  session with ten children. Before `emit`, `subagent_event` is cut to what `parseSubagentActivityEvent`
+  reads (child id, tool name/intent/arg keys, a 140-char label); streaming child events
+  (`message_update`, `tool_stream_update`, `tool_execution_update`) pass at most once a second per child;
+  `subagent_progress` is newest-wins once a second per child (terminal at once). `subagent_lifecycle`
+  and `agent_end` flush the held progress first, so a snapshot never lands after the change that
+  supersedes it; `dispose` drops it. A new consumer of a child event's fields must extend
+  `slimInnerEvent`, or it reads nothing. Transcripts come from disk, never from these frames.
 
 ### Worktrees and project grouping
 - `lib/worktree.ts` resolves linked worktree top-levels back to the main repo `projectRoot`; `listAllSessions()` attaches that to each `SessionInfo` so all worktrees for one repo are grouped together in the sidebar.
