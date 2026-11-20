@@ -219,6 +219,8 @@ Hosts that [use the server's provider logins](#use-the-servers-provider-logins-o
 
 Cluster members also fetch this machine's omp configuration from `/api/hosts/cluster-config/manifest` and `/api/hosts/cluster-config/file/<hash>` (exactly these two paths, `<hash>` being 64 hexadecimal digits), authenticated by their host token and answering members only. Unlike the broker's prefix, they must be reachable at exactly these paths, without the proxy's own authentication and without redirects.
 
+A server-sent-events client keeps its stream alive with a comment frame every 30 s by default; `GET /api/events?heartbeat=<seconds>` (15 to 110) chooses another interval for that connection. A value outside that range falls back to the 30 s default. The proxy's read timeout must stay above the interval the client asks for: nginx's default `proxy_read_timeout` is 60 s, so a client selecting 110 s needs a timeout above 110 s (for example `proxy_read_timeout 120s;`), or the proxy drops the idle stream before its first keep-alive. `GET /api/app-info` tells a native client whether the server supports the query.
+
 ### Two services: the web server and the local daemon
 
 ompweb runs this machine's `omp` sessions through a small daemon, `ompweb host`,
