@@ -669,6 +669,7 @@
   "subagentTranscript.completionTruncated": "Output truncated",
   "codeBlock.copied": "copied",
   "codeBlock.copy": "copy",
+  "directoryPicker.browse": "Browse…",
   "directoryPicker.cancel": "Cancel",
   "directoryPicker.checking": "Checking…",
   "directoryPicker.close": "Close",

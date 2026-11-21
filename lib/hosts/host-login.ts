@@ -15,7 +15,8 @@ export type HostLink = { url: string; token: string };
 type SavedLink = HostLink & Record<string, unknown>;
 type HostConfig = Record<string, unknown> & { url?: string; token?: string; links?: SavedLink[] };
 
-export const isLoopbackHost = (hostname: string) => hostname === "localhost" || hostname === "[::1]" || /^127(\.\d{1,3}){3}$/.test(hostname);
+/** A loopback name or address, including the IPv4-mapped form a dual-stack socket reports. */
+export const isLoopbackHost = (hostname: string) => hostname === "localhost" || hostname === "::1" || hostname === "[::1]" || /^(::ffff:)?127(\.\d{1,3}){3}$/i.test(hostname);
 
 /** Existing configuration must never be confused with a first login. */
 export class HostLoginUnreadableError extends Error {

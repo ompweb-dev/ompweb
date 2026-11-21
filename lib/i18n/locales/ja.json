@@ -653,6 +653,7 @@
   "subagentTranscript.completionTruncated": "出力は切り捨てられました",
   "codeBlock.copied": "コピーしました",
   "codeBlock.copy": "コピー",
+  "directoryPicker.browse": "参照…",
   "directoryPicker.cancel": "キャンセル",
   "directoryPicker.checking": "確認中…",
   "directoryPicker.close": "閉じる",

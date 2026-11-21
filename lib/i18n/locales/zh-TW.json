@@ -669,6 +669,7 @@
   "subagentTranscript.completionTruncated": "輸出已截斷",
   "codeBlock.copied": "已複製",
   "codeBlock.copy": "複製",
+  "directoryPicker.browse": "瀏覽…",
   "directoryPicker.cancel": "取消",
   "directoryPicker.checking": "檢查中…",
   "directoryPicker.close": "關閉",

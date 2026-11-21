@@ -8,6 +8,7 @@ import { useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
 import { appendProgress, cloneDirectoryName } from "@/lib/git-clone";
 import { randomUUID as newCloneId } from "@/lib/random-uuid";
+import { LOCAL_HOST_ID } from "@/lib/project-ordering";
 
 interface DirectoryEntry {
   name: string;
@@ -74,6 +75,8 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, host,
   const [directories, setDirectories] = useState<DirectoryEntry[]>([]);
   const [drives, setDrives] = useState<DirectoryEntry[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [nativePickerAvailable, setNativePickerAvailable] = useState(false);
+  const [nativePickerBusy, setNativePickerBusy] = useState(false);
   const [profile, setProfile] = useState("");
   const [advisor, setAdvisor] = useState(false);
   const [extraArgs, setExtraArgs] = useState("");
@@ -87,7 +90,7 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, host,
   const cloneLogRef = useRef<HTMLPreElement>(null);
   const browseAbortRef = useRef<AbortController | null>(null);
   const cloning = cloneId !== null;
-  const locked = busy || cloning;
+  const locked = busy || cloning || nativePickerBusy;
   const dialogRef = useModalDialog<HTMLDivElement>({
     onClose: () => { if (!locked) onCancel(); },
     active: portalTarget !== null,
@@ -121,6 +124,35 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, host,
     void navigateTo();
     return () => browseAbortRef.current?.abort();
   }, [navigateTo]);
+
+  // The OS folder dialog runs on the server's desktop, so it is offered only for this machine.
+  useEffect(() => {
+    if (pool || host.id !== LOCAL_HOST_ID) return;
+    let active = true;
+    void fetch("/api/cwd/picker")
+      .then(async (response) => (await response.json()) as { available?: boolean })
+      .then((data) => { if (active) setNativePickerAvailable(Boolean(data.available)); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [host.id, pool]);
+
+  const pickNativeDirectory = async () => {
+    if (locked) return;
+    setNativePickerBusy(true);
+    setLoadError(null);
+    try {
+      const response = await fetch("/api/cwd/pick", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ hostId: host.id }),
+      });
+      const data = await response.json() as { path?: string; error?: string; code?: string };
+      if (!response.ok || data.error) throw new Error(formatApiError({ ...data, error: data.error ?? `HTTP ${response.status}` }));
+      if (data.path) await navigateTo(data.path);
+    } catch (cause) {
+      setLoadError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setNativePickerBusy(false);
+    }
+  };
 
   useEffect(() => () => { cloneAbortRef.current?.abort(); cloneAbortRef.current = null; }, []);
 
@@ -302,6 +334,20 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, host,
           >
             {t("directoryPicker.go")}
           </button>
+          {nativePickerAvailable && !pool && (
+            <button
+              className="directory-picker-action"
+              type="button"
+              onClick={() => void pickNativeDirectory()}
+              disabled={locked}
+              title={t("directoryPicker.browse")}
+              style={{ minWidth: 66, height: 36, padding: "0 12px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-hover)", color: "var(--text-muted)", cursor: locked ? "default" : "pointer", opacity: nativePickerBusy ? 0.6 : 1, transition: "background-color var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm), opacity var(--dur-fast) var(--ease-out-warm)" }}
+              onMouseEnter={(e) => { if (!locked) { e.currentTarget.style.background = "var(--bg-selected)"; e.currentTarget.style.color = "var(--text)"; } }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text-muted)"; }}
+            >
+              {t("directoryPicker.browse")}
+            </button>
+          )}
         </form>
 
         <div className="directory-picker-list" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px 10px" }}>
