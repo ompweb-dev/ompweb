@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Added
+
+- **Native clients can search the messages of every session on this machine.** `GET /api/sessions/messages/search?q=&limit=&cursor=` scans the session transcripts of the omp-web server's own machine newest-first and answers `{ results, partial, cursor, scannedFiles, scannedBytes, skippedFiles }` plus `scope: "local"`, so a client never presents an empty answer as a global result. Sessions of linked hosts are not searched. Each request is bounded — result count, per-file and total bytes, and a 5-second budget that now also covers the session listing — and answers `partial: true` with an opaque cursor for the next slice. A cursor belongs to the listing snapshot its first page installed, so a pagination run neither skips nor repeats a session when the corpus changes underneath it or another client searches at the same time; a run whose snapshot expired (idle for five minutes, evicted by newer runs, or issued before a server restart) answers `409 cursor_expired` and the client starts over. Files above 64 MiB and lines above 1 MiB are skipped, and at most two scans run per process (`429` + `Retry-After` beyond that). The capability flag `messageSearch` is advertised by `GET /api/app-info` together with the route.
+
 ## [v0.7.4] - 2026-11-20
 
 ### Fixed

@@ -17,6 +17,8 @@ export function GET(): Response {
     capabilities: {
       /** `GET /api/events?heartbeat=<15..110>` chooses this connection's keep-alive. */
       heartbeatParam: true,
+      /** `GET /api/sessions/messages/search?q=&limit=&cursor=` searches this machine's transcripts. */
+      messageSearch: true,
     },
   }, { headers: { "Cache-Control": "no-store" } });
 }
