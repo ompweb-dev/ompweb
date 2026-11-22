@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Added
+
+- **Settings → Mobile app shows how to reach this server from a phone.** The new card reports the bind (loopback, network or unknown), the port, whether a password is configured, and the addresses to type into the app: the Tailscale address first for a phone that is away from home, then LAN. MagicDNS appears only when the bind actually covers the tailnet — a wildcard bind, or a specific bind on the Tailscale IP — because a socket bound to a LAN address does not listen on the Tailscale one. A specific bind keeps its address kind (a CGNAT `100.64.0.0/10` or Tailscale IPv6 `fd7a:115c:a1e0::/48` address is labelled Tailscale, not LAN), and IPv6 addresses are bracketed so the URL parses. Each installer's command sequence is shown as a hidden-input flow that keeps the password and its hash out of the shell history and `ps`. The card is backed by `GET /api/mobile-access`, which is read-only, rides the normal auth gate and returns only whether a password is configured — never the hash.
+
 ## [v0.7.4] - 2026-11-20
 
 ### Fixed

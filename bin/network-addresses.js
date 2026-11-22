@@ -48,8 +48,24 @@ function isTailscaleAddress(ifaceName, address) {
     if (parts.length === 4 && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) {
       return true;
     }
+    // Tailscale IPv6 uses the ULA range fd7a:115c:a1e0::/48. A bind on that
+    // address is the tailnet address just like a CGNAT IPv4 one; without this
+    // an IPv6 tailnet bind was reported as plain LAN.
+    if (isTailscaleIpv6(address)) return true;
   }
   return false;
+}
+
+/** First 48 bits of `fd7a:115c:a1e0::/48`; brackets and a zone id are tolerated. */
+function isTailscaleIpv6(address) {
+  const bare = address.trim().replace(/^\[|\]$/g, "").split("%")[0].toLowerCase();
+  if (!bare.includes(":")) return false;
+  // Only the leading groups matter for a /48. With `::` compression the groups
+  // after it are zeros, so a prefix that ends before the third group cannot be
+  // this range.
+  const groups = bare.split("::")[0].split(":");
+  if (groups.length < 3) return false;
+  return parseInt(groups[0], 16) === 0xfd7a && parseInt(groups[1], 16) === 0x115c && parseInt(groups[2], 16) === 0xa1e0;
 }
 
 function isIgnoredAddress(ifaceName, address) {
@@ -106,8 +122,14 @@ function getAccessibleAddresses({ hostname, port, interfaces = os.networkInterfa
   }
 
   if (!isWildcardHost(hostname)) {
+    // A specific-IP bind listens on that address only, so it is one entry — but
+    // it is still the Tailscale address when the bind is on the tailnet, and a
+    // bare IPv6 host needs brackets in a URL (`getBrowserUrl` adds them).
     return {
-      entries: [{ label: "Network", url: `http://${hostname}:${port}` }],
+      entries: [{
+        label: isTailscaleAddress(undefined, hostname.trim()) ? "Tailscale" : "Network",
+        url: getBrowserUrl(hostname.trim(), port),
+      }],
     };
   }
 

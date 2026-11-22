@@ -147,6 +147,7 @@ app/api/
   models/route.ts                 GET { models, modelList, defaultModel }
   models-config/route.ts          GET/PUT — read/write ~/.omp/agent/models.yml
   models-config/test/route.ts     POST test a configured model/provider
+  mobile-access/route.ts          GET read-only Settings → Mobile app facts: bound hostname/port, exposure, password-configured boolean, phone-reachable addresses (MagicDNS/Tailscale/LAN) and the installer commands; never a credential and never changes the binding
   omp-settings/route.ts           GET/PUT native config.yml settings (allow-listed)
   web-settings/route.ts           GET/PUT omp-web's own server settings (auto-resume, agent tools, agent env, browser transport; a transport change is pushed to every open browser)
   mcp/route.ts                    GET/POST/PUT/DELETE project MCP servers; `GET ?sessionId=&attach=1` reads a running session's live MCP status and never starts one (a cluster session on another member)
@@ -237,6 +238,7 @@ lib/
   session-match-listing.ts   server: lists a session's search hits counted per rendered text node (remark parse)
   session-resume.ts    running-session list for auto-resume after a restart
   web-auth.ts          password-hash check + session cookie signing
+  mobile-access.ts     Settings → Mobile app facts: bind classification, phone-reachable addresses (a specific bind keeps its kind — a CGNAT `100.64.0.0/10` or Tailscale IPv6 `fd7a:115c:a1e0::/48` address is `tailscale`; IPv6 is bracketed), MagicDNS only when the bind covers the tailnet, and the installer command sequences
   web-auth-secret.ts   per-installation session-signing key (~/.omp/agent/omp-web/web-auth-secret.json)
   web-password-hash.ts typed view of bin/omp-web-password-hash.js (the scrypt hash format)
   web-settings.ts      omp-web server settings (~/.omp/agent/omp-web-settings.json)
