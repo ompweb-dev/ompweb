@@ -248,6 +248,22 @@ try {
       assert(state.running === true, `GET /api/agent: ${JSON.stringify(state)}`);
     });
 
+    // The usage report runs in a worker (lib/usage-report-worker.ts). A release ships that worker as its own file
+    // beside the binary, because a compiled binary's modules sit in Bun's embedded filesystem, where `new Worker`
+    // cannot start anything; a missing or unresolvable worker answers 500 instead of a report.
+    await step("GET /api/usage computes the report in the shipped worker", async () => {
+      const response = await fetch(`${base}/api/usage?range=30d&granularity=daily&refresh=true`);
+      const body = await response.text();
+      assert(response.status === 200, `status ${response.status}: ${body.slice(0, 400)}`);
+      const report = JSON.parse(body) as { summary?: { inputTokens?: number }; scanInfo?: { transcriptsScanned?: number }; stale?: boolean };
+      assert(report.summary && typeof report.summary.inputTokens === "number", `no summary in ${body.slice(0, 400)}`);
+      assert(report.scanInfo && typeof report.scanInfo.transcriptsScanned === "number", `no scanInfo in ${body.slice(0, 400)}`);
+      // The fixture session above has no assistant usage, so the scan reports the transcript it read and no tokens.
+      assert(report.scanInfo.transcriptsScanned >= 1, `scanned ${report.scanInfo.transcriptsScanned} transcripts`);
+      assert.equal(report.summary.inputTokens, 0);
+      assert.equal(report.stale, false, "a forced refresh is computed, never served stale");
+    });
+
     if (binary) {
       await step("the owned binary release supports GUI-coordinated updates", async () => {
         const update = await (await fetch(`${base}/api/app-update`)).json() as { installMethod?: string; selfUpdateSupported?: boolean; updateCommand?: string };

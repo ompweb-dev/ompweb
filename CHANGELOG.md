@@ -6,6 +6,12 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Fixes & Improvements
+
+- **The Usage page stays responsive while it rescans, and Refresh always rescans.** The usage report is now computed in a worker thread, so a cold scan of every transcript no longer stops the server from answering other requests. An explicit **Refresh** always rescans instead of reusing a recent report, a refresh that arrives during a running scan joins it rather than starting a second one, and a report older than five minutes is never served from the cache while a rescan runs. The page also asks again when the server answers with a cached report, so it stops showing the previous visit's numbers as soon as the new scan lands; a failed re-ask keeps the cached numbers on screen, shows the error and retries with the same bounded backoff instead of stopping for good. A refresh that fails leaves the last successful report in place as a fallback. The single-file releases now ship the worker as `lib/usage-worker.mjs` beside the binary, where a compiled binary can start it, and its own build's dependencies are covered by the shipped third-party licenses.
+- **`GET /api/usage` rejects incomplete and over-wide windows.** A window must now name both ends or neither: a lone `from` or `to` used to be accepted, ignored by the report (which applies a window only when both are present) and keyed separately, so it answered the plain 30-day report under its own cache key and paid for a full transcript scan every time. An explicit `from`/`to` pair that spans more than 400 days, is backwards, or is not a whole non-negative number now answers 400 `invalid_usage_window` instead of running a full transcript scan per distinct window. Every distinct `from`/`to` pair is its own cache key and its own scan, so an unbounded window let one client explore the transcript tree without limit; 400 days covers the page's widest range. Callers that passed `from=0` to mean "everything" must switch to `range=all` or send a window inside the limit.
+- **A failed or killed refresh no longer empties the usage database.** An explicit refresh used to delete every stored row before the re-sync transaction opened, so a scan that hit the worker's deadline or failed midway left an empty database behind — and the next request then cached a zero-usage report as current. The delete now happens inside the same transaction as the re-sync: a refresh that does not commit rolls back and the previous numbers stay.
+
 ## [v0.7.4] - 2026-11-20
 
 ### Fixed

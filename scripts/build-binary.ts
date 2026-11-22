@@ -46,6 +46,24 @@ const result = await Bun.build({
 for (const log of result.logs) console.log(log);
 if (!result.success) process.exit(1);
 
+// The usage report worker as its own file beside the binary: a compiled binary's modules live in Bun's embedded
+// filesystem, which `new Worker` cannot start from, so lib/usage-report-worker.ts resolves this bundle on disk
+// instead. Bundled here (not shipped as .ts) so the release carries no TypeScript the server would have to compile.
+const usageWorker = await Bun.build({
+  entrypoints: [path.join(root, "lib", "usage-worker.ts")],
+  target: "bun",
+  format: "esm",
+  minify: true,
+  // Its dependencies ship beside the binary as this bundle, so their licenses
+  // must come from this metafile too: the main bundle may not name them.
+  metafile: true,
+  throw: false,
+});
+for (const log of usageWorker.logs) console.log(log);
+if (!usageWorker.success) process.exit(1);
+const usageWorkerFile = path.join(out, "lib", "usage-worker.mjs");
+await Bun.write(usageWorkerFile, await usageWorker.outputs[0].text());
+
 // The static root (server/binary.ts): the client, the public files, the KaTeX CSS and fonts (where the server
 // resolves the katex package), and the licenses of what ships. Beside the binary, unless --no-runner: the omp runner
 // it spawns (`ompweb-omp`, lib/omp/omp-cli.ts), downloaded from the pinned fork release.
@@ -61,7 +79,14 @@ for (const file of new Bun.Glob("app/fonts/*-{OFL.txt,LICENSE.*}").scanSync(root
 const katex = path.dirname(Bun.resolveSync("katex/package.json", root));
 for (const file of ["package.json", "LICENSE", "dist/katex.min.css", "dist/fonts"]) copy(path.join(katex, file), `node_modules/katex/${file}`);
 const clientPackages = (JSON.parse(readFileSync(clientPackagesFile, "utf8")) as string[]).map((dir) => path.resolve(root, dir));
-writeLicenses(out, [...new Set([...bundledPackageDirs(result.metafile!, process.cwd()), ...clientPackages])].sort(), bunLicense);
+// The server bundle, the client bundle and the usage worker's own bundle: the
+// worker is a separate build shipped as a file, so a dependency only it uses
+// would otherwise ship without its license.
+writeLicenses(out, [...new Set([
+  ...bundledPackageDirs(result.metafile!, process.cwd()),
+  ...bundledPackageDirs(usageWorker.metafile!, process.cwd()),
+  ...clientPackages,
+])].sort(), bunLicense);
 
 // Bun.Archive writes every entry as 0644 (the binary would lose its execute bit) and makes no zip: the system tools do.
 // On Windows that is its own bsdtar, which makes zips: a GNU tar from Git Bash on PATH makes none.
