@@ -5,7 +5,7 @@ import { readSessionHeaderSync } from "../omp/session-files";
 import { isValidSessionId } from "../session-file-references-core";
 import { isRecord } from "../type-guards";
 import type { DaemonLink } from "./daemon-link";
-import { CONFIG_VERSION_RE, CREATION_ID_RE, HISTORY_MUTATING_COMMANDS, HostOpError, LINK_LIMITS, MESSAGE_COMMANDS, PEER_MESSAGE_FRAME, PEER_PROMPT_OUTCOME_FRAME, type HelloChannel, type HostUriScheme, type OpenChannelRequest, type OpenChannelResult, type Unsequenced, type UpMessage } from "./link-protocol";
+import { CONFIG_VERSION_RE, CREATION_ID_RE, HostOpError, LINK_LIMITS, MESSAGE_COMMANDS, PEER_MESSAGE_FRAME, PEER_PROMPT_OUTCOME_FRAME, isHistoryMutatingCommand, type HelloChannel, type HostUriScheme, type OpenChannelRequest, type OpenChannelResult, type Unsequenced, type UpMessage } from "./link-protocol";
 import { CHANNEL_PROTO } from "./omp-socket";
 import { idOf, parseWire, PendingRequests, wireEvent, type WireFrame } from "./pending-requests";
 import { StreamSnapshot } from "./stream-snapshot";
@@ -457,7 +457,7 @@ export class ChannelTable {
       if (op !== null) this.deliver(channel, member, { type: "stdout", ch, line: JSON.stringify({ t: "res", id: frame.id, ok: false, code, error }) }, true);
     };
     if (channel.replacing) return refuse("session_restarting", "This session is restarting to apply advisor mode; retry once it is ready");
-    if (op !== null && channel.editor !== undefined && channel.editor !== link.id && HISTORY_MUTATING_COMMANDS.has(op)) {
+    if (op !== null && channel.editor !== undefined && channel.editor !== link.id && isHistoryMutatingCommand(op, frame.args)) {
       return refuse("session_busy", "Another web app is editing this session's history; retry once it finishes");
     }
     if (op === "branch" || op === "new_session" || op === "switch_session") channel.sessionMovePending = false;

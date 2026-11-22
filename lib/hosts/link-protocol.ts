@@ -73,6 +73,19 @@ export const HISTORY_MUTATING_COMMANDS = new Set([
   "set_model", "cycle_model", "set_thinking_level", "cycle_thinking_level",
   "set_fast_mode", "set_slow_mode", "set_auto_compaction", "set_auto_retry", "abort_retry",
 ]);
+/** `goal` sub-ops that append to or replace the active history; `get` only reads
+ * the state a live child holds. omp rejects any other op (`Unknown goal op`), so
+ * a typo never writes and never needs the fence. */
+export const GOAL_HISTORY_MUTATING_OPS: Record<string, true> = { create: true, pause: true, resume: true, drop: true };
+/** Whether one command frame mutates session history: by type for every
+ * `HISTORY_MUTATING_COMMANDS` entry, and by its `op` for `goal` (the frame's
+ * args, or the wrapper's flat command). A non-string op is never a goal write. */
+export function isHistoryMutatingCommand(type: string, args?: unknown): boolean {
+  if (HISTORY_MUTATING_COMMANDS.has(type)) return true;
+  if (type !== "goal" || !args || typeof args !== "object" || !("op" in args)) return false;
+  const op = args.op;
+  return typeof op === "string" && Object.hasOwn(GOAL_HISTORY_MUTATING_OPS, op);
+}
 /** Commands whose user message a peer's identical echo could be mistaken for. */
 export const MESSAGE_COMMANDS = new Set(["prompt", "steer", "follow_up", "followUp", "abort_and_prompt"]);
 /** Shared-channel marker a daemon puts in the other members' output when one link writes a message command. */

@@ -8,6 +8,7 @@ import { runOutboxCommand } from "@/lib/message-outbox";
 import { readClientMessageIds } from "@/lib/client-message-ids";
 import { reconcileOutboxHandoffs } from "@/lib/outbox-handoff";
 import type { MessageOrigin } from "@/lib/message-origin";
+import { GOAL_HISTORY_MUTATING_OPS } from "@/lib/hosts/link-protocol";
 
 // Commands that ride whatever child is alive and never spawn or replace one:
 // keystroke predictions, and the side-question reads/cancel omp-web sends in
@@ -20,6 +21,24 @@ export const NO_SPAWN_REPLIES: Record<string, unknown> = {
   get_btw_history: { records: [] },
   btw_cancel: { cancelled: false },
 };
+
+/** The refusal for a command that may only ride a live child, or undefined when
+ * the command may start one. `goal` reads the state a running child holds: a
+ * native client inspecting goal mode must not resume a full omp child (MCP,
+ * LSP) for it, and a saved session's goal is not read off disk here. Only the
+ * history-mutating ops (`create`, `pause`, `resume`, `drop`) keep their start
+ * semantics — they are what a client uses to set a goal on an idle session;
+ * `get`, a missing op, a typo and a non-string op only read state a live child
+ * holds, and omp rejects an unknown op (`Unknown goal op: undefined`), so
+ * spawning a full child just to relay that rejection is not what the caller
+ * asked for. The `typeof` check is load-bearing: the table lookup coerces its
+ * key, so `op: ["create"]` would otherwise read as the start op `create`. */
+function liveOnlyRefusal(type: string, command: Record<string, unknown>): { error: string; code: string } | undefined {
+  if (type !== "goal") return undefined;
+  const op = command.op;
+  if (typeof op === "string" && Object.hasOwn(GOAL_HISTORY_MUTATING_OPS, op)) return undefined;
+  return { error: "Goal state requires a running session", code: "goal_state_unavailable" };
+}
 
 /** omp-web's own failures carry a stable code the client can localize; omp's
  * errors stay opaque English text. */
@@ -112,8 +131,9 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
     let resumeId = id;
     let resumeHost: AgentSessionWrapper["host"] | undefined;
     const noSpawn = Object.hasOwn(NO_SPAWN_REPLIES, type);
+    const liveOnly = liveOnlyRefusal(type, command);
     if (existing?.isAlive()) {
-      if (noSpawn || (existing.adopted && !existing.hostOwnedLifecycle)
+      if (noSpawn || liveOnly || (existing.adopted && !existing.hostOwnedLifecycle)
         || existing.advisorSpawned === (advisor === true || existing.launchAdvisor === true) || existing.isRunning() || existing.isEditingHistory()) {
         const result = await send(existing);
         return Response.json({ success: true, data: result });
@@ -126,6 +146,9 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
       if (!existing.hostOwnedLifecycle) await existing.destroyAndWait("advisor", true);
     }
     if (noSpawn) return Response.json({ success: true, data: NO_SPAWN_REPLIES[type] });
+    if (liveOnly) {
+      return Response.json({ error: liveOnly.error, code: liveOnly.code }, { status: 409 });
+    }
 
     const resolved = resumeHost ? { host: resumeHost } : await resolveSessionHostOr404(resumeId);
     if ("response" in resolved) return resolved.response;

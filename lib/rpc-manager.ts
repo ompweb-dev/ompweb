@@ -33,6 +33,7 @@ import { publishNotification } from "./notification-hub";
 import { eventWithToolResultImageUrls } from "./media-cache";
 import type {
   BashResultInfo,
+  GoalCommandReply,
   OmpModel,
   RpcAvailableSlashCommand,
   RpcSessionState,
@@ -42,7 +43,7 @@ import type {
 import type { AgentConfirmPayload, AgentMessage, CrossSessionHostToolCall, CrossSessionHostToolEvent, ExitedRpcSession, ExtensionWidgetItem } from "./types";
 import { isLinkUp, type Host, type HostStatus, type SpawnRequest, type SpawnResult } from "./hosts/host";
 import { freezeHostLinks, getHost, hostOwnsLifecycle, isNotifier, lastUplinkAt, listHosts, orphanExit } from "./hosts/hub";
-import { CREATION_ID_RE, HISTORY_MUTATING_COMMANDS, HostOpError, PEER_MESSAGE_FRAME, PEER_PROMPT_OUTCOME_FRAME } from "./hosts/link-protocol";
+import { CREATION_ID_RE, HostOpError, PEER_MESSAGE_FRAME, PEER_PROMPT_OUTCOME_FRAME, isHistoryMutatingCommand } from "./hosts/link-protocol";
 import { LOCAL_HOST_ID } from "./hosts/registry";
 import type { OpResult } from "./hosts/session-ops";
 import { hostForSessionId, invalidateHostSessionList, listSessionsAllHosts, sessionSpawnTarget } from "./hosts/session-index";
@@ -182,6 +183,9 @@ const PASSTHROUGH_COMMANDS = new Set([
   "btw_cancel",
   "get_btw_history",
   "get_client_message_status",
+  // Goal mode (`{type:"goal", op}`) has the same shape as omp's RPC frame and
+  // is the only way native clients reach it; every op answers `{goal, state}`.
+  "goal",
 ]);
 
 // Outlasts omp's cold prediction-daemon start (up to 3 × 30s start rounds plus a
@@ -2215,6 +2219,8 @@ export class AgentSessionWrapper {
       slowModeScope: state.slowModeScope,
       usageLimit: state.usageLimit,
       todoPhases: state.todoPhases ?? [],
+      // Never invent a goal shape for a child that does not report one.
+      ...(state.goal !== undefined ? { goal: state.goal } : {}),
       extensionStatuses: Array.from(this.extensionStatuses, ([key, text]) => ({ key, text })),
       extensionWidgets: Array.from(this.extensionWidgets.values()),
     };
@@ -2593,7 +2599,7 @@ export class AgentSessionWrapper {
     if (typeof command.type === "string" && command.type.startsWith("abort")) {
       console.info("[omp-web] cancellation-command", JSON.stringify({ sessionId: this._sessionId, type: command.type, at: new Date().toISOString() }));
     }
-    const mutatesHistory = HISTORY_MUTATING_COMMANDS.has(command.type as string);
+    const mutatesHistory = isHistoryMutatingCommand(command.type as string, command);
     if (mutatesHistory && this.historyEditInFlight) {
       throw new WebRpcError("Wait for the history edit to finish", "session_busy");
     }
@@ -3009,6 +3015,16 @@ export class AgentSessionWrapper {
         if (typeof command.id === "string") this.pendingHostUris.delete(command.id);
         this.proc.sendFrame(command as { type: string; [key: string]: unknown });
         return null;
+      }
+
+      // Goal mode: `{type:"goal", op}` is omp's own RPC frame, forwarded
+      // verbatim. Every op answers `{goal, state}` — `goal` the record the op
+      // acted on, `state` the mode snapshot around it, both `null` once no goal
+      // is set (omp answers that after `drop`). Typed here because this is the
+      // only place omp-web sees the reply shape.
+      case "goal": {
+        const reply: GoalCommandReply = await this.sendNativeMessageCommand<GoalCommandReply>(command as { type: string }, undefined, command);
+        return reply;
       }
 
       default: {
