@@ -97,7 +97,13 @@ export interface HostDaemon {
   control(command: HostControlCommand): HostControlStatus;
 }
 /** `hostSocket`: where omps started from a TUI attach (`hostSocketPath()`); unset, none can. */
-type DaemonOptions = { allowHttp: boolean; url?: string; token?: string; links?: HostLink[]; hostSocket?: string };
+type DaemonOptions = { allowHttp: boolean; url?: string; token?: string; links?: HostLink[]; hostSocket?: string;
+  /** Fetches the omp runner when this install has none (`ensureOmpRunner`); each omp version retry runs it first. */
+  ensureRunner?: () => Promise<unknown>;
+  /** Tests. */ ompVersionRetryMs?: number };
+/** A daemon whose omp version read found nothing reads it again after this, doubling up to OMP_VERSION_RETRY_MAX_MS. */
+const OMP_VERSION_RETRY_MS = 30_000;
+const OMP_VERSION_RETRY_MAX_MS = 5 * 60_000;
 export function runHostDaemon(options: DaemonOptions): HostDaemon {
   const explicit = options.url !== undefined && options.token !== undefined ? [{ url: options.url, token: options.token }] : options.links;
   const initial = explicit ?? readHostLinks();
@@ -115,6 +121,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   let stopping: Promise<void> | undefined;
   let updateStateWarningLogged = false;
   let reloadTimer: NodeJS.Timeout | undefined;
+  let versionRetry: NodeJS.Timeout | undefined, versionRetryMs = options.ompVersionRetryMs ?? OMP_VERSION_RETRY_MS;
   let drained = process.env.OMP_WEB_HOST_DRAINED === "1";
   let preparationsInFlight = 0, operationsInFlight = 0, nativeUpdatesInFlight = 0;
   const executable = realpathSync(process.execPath);
@@ -510,7 +517,7 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
   }
   function shutdown(code: number): Promise<void> {
     if (stopping) return stopping;
-    stopped = true; watcher.close(); clearTimeout(reloadTimer); clearInterval(sweepTimer); clearInterval(capacityTimer); uploadRetention.stop();
+    stopped = true; watcher.close(); clearTimeout(reloadTimer); clearInterval(sweepTimer); clearInterval(capacityTimer); clearTimeout(versionRetry); uploadRetention.stop();
     clearTimeout(recoveryTimer);
     // Freeze before exit handlers observe children stopping.
     resume.freeze();
@@ -548,7 +555,37 @@ export function runHostDaemon(options: DaemonOptions): HostDaemon {
     .finally(() => {
       operationsInFlight--;
       if (!stopped) for (const link of links.values()) link.start();
+      if (!stopped && ompVersion === null) void refreshOmpVersion();
     });
+  // A null version in the hello marks this host "omp not installed" and its sessions refused. The runner's first fetch,
+  // or a first start Windows' antivirus holds past the probe, can outlast the startup read: read again until omp answers,
+  // then tell every server (a link made later says it in its hello). One read at a time.
+  let refreshing: Promise<void> | undefined;
+  function scheduleVersionRetry(): void {
+    clearTimeout(versionRetry);
+    versionRetry = setTimeout(() => void refreshOmpVersion(), versionRetryMs);
+    versionRetry.unref?.();
+    versionRetryMs = Math.min(versionRetryMs * 2, OMP_VERSION_RETRY_MAX_MS);
+  }
+  async function readVersionAgain(): Promise<void> {
+    await versionRead;
+    if (stopped || ompVersion !== null) return;
+    clearTimeout(versionRetry); // this read is the retry; a miss arms the next one
+    // A fetch that failed at start (offline) is tried again; one still running is joined.
+    await options.ensureRunner?.().catch(error => log("could not fetch the omp runner: " + reason(error)));
+    if (stopped || ompVersion !== null) return;
+    const version = await getOmpVersion(true).catch(error => { log("could not read omp version: " + reason(error)); return null; });
+    if (stopped || ompVersion !== null) return;
+    if (version === null) {
+      scheduleVersionRetry();
+      return;
+    }
+    ompVersion = version;
+    for (const link of links.values()) link.queue({ type: "omp_version", ompVersion: version }, "omp_version");
+  }
+  function refreshOmpVersion(): Promise<void> {
+    return refreshing ??= readVersionAgain().finally(() => { refreshing = undefined; });
+  }
   const started = Promise.all([startupSweep, startupRecovery, versionRead, hostSocket]).then(() => {});
   return { stop: () => shutdown(0), done, control, started };
 }
