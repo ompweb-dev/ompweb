@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Added
+
+- **Move sessions by drag and drop.** Drag a session onto another workspace in the sidebar, on the same host or another one. The session is told where it came from: host, working directory, home directory and operating system. A copy left on another host is archived there.
+
 ### Fixed
 
 - **Horizontal scrollbars no longer clip file-panel tabs.** The tab row keeps its full height in narrow panels, including on mobile.

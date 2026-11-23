@@ -26,6 +26,10 @@ import {
   SidebarPortalMenu,
 } from "./SessionSidebar-chrome";
 
+/** Drag data of a session row; readable only on drop, so a drop target checks the type alone while dragging. */
+const SESSION_DRAG_TYPE = "application/x-ompweb-session";
+type DraggedSession = Pick<SessionInfo, "id" | "hostId" | "cwd" | "projectRoot">;
+
 /**
  * Shared indicator sizing; session rows keep theirs in the right-edge column.
  *
@@ -111,6 +115,8 @@ interface ProjectRowProps {
   onUpdatePresentation: (project: ManagedProject, updates: { alias?: string | null; sortOrder?: number | null; launchConfig?: ProjectLaunchConfig | null }) => Promise<void>;
   onDragProjectChange: (project: ManagedProject | null) => void;
   onDropProject: (project: ManagedProject) => void;
+  /** Set when a session dragged here can move into this workspace. */
+  onDropSession?: (session: DraggedSession, project: ManagedProject) => void;
   onMoveProject: (project: ManagedProject, delta: -1 | 1) => void;
   /** A sort is active: show the pin toggle; only pinned rows reorder by hand. */
   pinnable: boolean;
@@ -150,6 +156,7 @@ function ProjectRow({
   onUpdatePresentation,
   onDragProjectChange,
   onDropProject,
+  onDropSession,
   onMoveProject,
   pinnable,
   onTogglePin,
@@ -170,6 +177,7 @@ function ProjectRow({
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const actionButtonRef = useRef<HTMLButtonElement>(null);
+  const [sessionDropActive, setSessionDropActive] = useState(false);
   const [aliasEditing, setAliasEditing] = useState(false);
   const [aliasValue, setAliasValue] = useState("");
   const aliasInputRef = useRef<HTMLInputElement>(null);
@@ -202,7 +210,30 @@ function ProjectRow({
     : tree;
 
   return (
-    <section className="sidebar-project" data-active={isActive ? "true" : "false"} style={{ marginBottom: 12, opacity: node?.unavailableReason ? 0.55 : 1 }}>
+    <section
+      className="sidebar-project"
+      data-active={isActive ? "true" : "false"}
+      onDragOver={onDropSession ? (event) => {
+        if (!event.dataTransfer.types.includes(SESSION_DRAG_TYPE)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        setSessionDropActive(true);
+      } : undefined}
+      onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setSessionDropActive(false); }}
+      onDrop={onDropSession ? (event) => {
+        const data = event.dataTransfer.getData(SESSION_DRAG_TYPE);
+        setSessionDropActive(false);
+        if (!data) return;
+        event.preventDefault();
+        onDropSession(JSON.parse(data) as DraggedSession, project);
+      } : undefined}
+      style={{
+        marginBottom: 12,
+        opacity: node?.unavailableReason ? 0.55 : 1,
+        borderRadius: "var(--radius-control)",
+        ...(sessionDropActive ? { outline: "1px solid var(--accent)", outlineOffset: -1 } : {}),
+      }}
+    >
       {node?.unavailableReason && <span id={reasonId} className="sr-only">{node.unavailableReason}</span>}
       <ConfirmDialog
         open={confirmRemove}
@@ -822,6 +853,12 @@ const SessionItem = memo(function SessionItem({
   return (
     <>
     <div
+      draggable={!renaming && !confirmDelete && !deleting}
+      onDragStart={(event) => {
+        const dragged: DraggedSession = { id: session.id, hostId: session.hostId, cwd: session.cwd, projectRoot: session.projectRoot };
+        event.dataTransfer.setData(SESSION_DRAG_TYPE, JSON.stringify(dragged));
+        event.dataTransfer.effectAllowed = "move";
+      }}
       className="session-item-row"
       onContextMenu={(event) => {
         if (renaming || confirmDelete || deleting) return;
@@ -961,5 +998,6 @@ export {
   ProjectRow,
   SessionItem,
   SessionTreeItem,
+  type DraggedSession,
   type ProjectRowProps,
 };

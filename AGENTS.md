@@ -121,6 +121,7 @@ app/api/
   sessions/[id]/context/route.ts  GET ?leafId= — context for a specific leaf; answers a strong ETag for the exact bytes and 304 on a matching If-None-Match
   sessions/[id]/matches/route.ts  GET ?q=&limit= — best `limit` search hits in the active conversation (best match, then newest); Load more asks for a longer prefix
   sessions/[id]/export/route.ts   GET exported HTML for a session
+  sessions/[id]/move/route.ts     POST { hostId?, cwd } move a stopped session into a workspace of any host: `omp session pack` on its host, chunked over the links (`readSessionPack`/`writeSessionPack`), `omp session unpack` on the target, whose arrival marker is reworded to name hosts, workspaces, home and OS; a copy left on another host is marked moved and archived (`finishSessionMove`). 409 `session_busy` while running, `session_has_children` for a parent
   sessions/[id]/local-file/route.ts GET ?uri=local://<file> → `{ path, sessionId }`: the absolute path of a file in the session's own local:// directory, resolved on the owning host's daemon, and the canonical session that owns it (a live alias resolves to its current id; the tab must store that, since the alias goes with its wrapper). The open_file host tool then reads it through /api/files with that `sessionId`; 400 `invalid_local_uri` / `not_a_file`, 404 `session_not_found` / `file_not_found`, 403 on a symlink out, 501 `workspace_unsupported` for a host daemon that predates `resolveLocalFile`
   agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
   agent/[id]/route.ts             GET state (?systemPrompt=0 drops the ~13 KB prompt from the poll) | POST any channel command
@@ -175,6 +176,7 @@ lib/
     local-bootstrap.ts web server side of the local link: `localLinkUrl`, `ensureLocalHostLink` (the `local` record + `host.json`)
     host-login.ts      `host.json` (`loginHost`, `readHostLogin`) and `isLoopbackHost`, shared by the daemon and local-bootstrap
     session-ops.ts     file-reading half of the session/project routes, run on the owning host's daemon (this machine's too)
+    session-transfer.ts daemon side of a session move: the `omp session pack|unpack|moved` calls, transfer archives in `<agent dir>/omp-web/transfers/` (swept after 24 h), the reworded arrival marker
     uploads.ts         daemon side of composer uploads: `StagedUploads` (staging dir `<agent dir>/omp-web/uploads/`, offset writes, 24 h sweep, attach into the session's `local/uploads/`), `sanitizeUploadName`
     upload-retention.ts  daemon side of sent-upload retention: `UploadRetention` (op `setUploadRetention`, `<agent dir>/omp-web/upload-retention.json`, sweep at start and every 24 h), `sweepSentUploads`; `upload-retention-sync.ts` is main's side (`startUploadRetentionSync` on every hello, `pushUploadRetention` when the setting changes)
     link-protocol.ts   link messages, codec, binary blob frames, close codes, size limits, `HOST_OP_NAMES`, `SeqWindow`/`Outbox`, `LinkSender`/`PartJoiner` (pieces, fair sending)
