@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { ProviderUsageReport, ProviderUsageSnapshot } from "@/lib/provider-usage-types";
+import { isRecord } from "@/lib/type-guards";
+
+export const PROVIDER_ACCOUNTS_CHANGED = "omp-provider-accounts-change";
 
 export function formatUsageReset(value: number, unit: "minutes" | "hours"): string {
   if (unit === "minutes") {
@@ -12,23 +15,6 @@ export function formatUsageReset(value: number, unit: "minutes" | "hours"): stri
   const days = Math.floor(value / 24);
   const hours = value % 24;
   return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-}
-
-/**
- * Label that distinguishes one usage row from another row for the same
- * provider and account, or undefined when the row needs none.
- * Antigravity rows carry their bucket ("Gemini", "Claude & GPT (shared)");
- * Anthropic rows carry their tier, capitalised ("Fable", "Opus", "Sonnet")
- * — the shared account-wide row has no tier and stays plain "Anthropic".
- * Other providers' tiers are quota tiers, not bucket names, so they are
- * not promoted to a label here.
- */
-export function usageBucketLabel(report: ProviderUsageReport): string | undefined {
-  if (report.bucket) return report.bucket;
-  if (report.provider === "anthropic" && report.tier) {
-    return report.tier.charAt(0).toUpperCase() + report.tier.slice(1);
-  }
-  return undefined;
 }
 
 export function usageTone(percent: number): string {
@@ -62,16 +48,24 @@ export function formatProviderUsageReport(report: ProviderUsageReport, noLimitsL
   return parts.join(" · ");
 }
 
-export type ProviderUsageState = {
-  snapshot: ProviderUsageSnapshot | null;
+export type ProviderUsageState<T = ProviderUsageSnapshot> = {
+  snapshot: T | null;
   loading: boolean;
   error: boolean;
 };
 
-export function useProviderUsage(query: string | null, refreshMs?: number): ProviderUsageState & { refresh: () => Promise<boolean> } {
-  const [state, setState] = useState<ProviderUsageState>({ snapshot: null, loading: false, error: false });
-  const refreshRef = useRef<() => Promise<boolean>>(async () => false);
-  const refresh = useCallback(() => refreshRef.current(), []);
+type UsageLoad = "poll" | "reload" | "force" | "invalidate";
+
+/** Polls `path` (`refresh()` asks omp for fresh limits, `reload()` only re-reads omp-web's view). */
+export function useProviderUsage<T = ProviderUsageSnapshot>(
+  query: string | null,
+  refreshMs?: number,
+  path = "/api/provider-usage",
+): ProviderUsageState<T> & { refresh: () => Promise<boolean>; reload: (options?: { invalidate?: boolean }) => Promise<boolean> } {
+  const [state, setState] = useState<ProviderUsageState<T>>({ snapshot: null, loading: false, error: false });
+  const refreshRef = useRef<(mode: UsageLoad) => Promise<boolean>>(async () => false);
+  const refresh = useCallback(() => refreshRef.current("force"), []);
+  const reload = useCallback((options?: { invalidate?: boolean }) => refreshRef.current(options?.invalidate ? "invalidate" : "reload"), []);
   useEffect(() => {
     if (query === null) {
       setState({ snapshot: null, loading: false, error: false });
@@ -81,26 +75,37 @@ export function useProviderUsage(query: string | null, refreshMs?: number): Prov
     setState({ snapshot: null, loading: true, error: false });
     let inFlight: Promise<boolean> | undefined;
     let inFlightForced = false;
-    const load = (force = false): Promise<boolean> => {
+    let generation = 0;
+    const load = (mode: UsageLoad = "poll"): Promise<boolean> => {
       if (controller.signal.aborted) return Promise.resolve(false);
-      if (inFlight) {
-        return force && !inFlightForced ? inFlight.then(() => load(true)) : inFlight;
+      if (mode === "invalidate") {
+        generation += 1;
+        setState({ snapshot: null, loading: true, error: false });
       }
+      if (inFlight) {
+        if (mode === "force" && !inFlightForced) return inFlight.then(() => load("force"));
+        if (mode === "reload" || mode === "invalidate") return inFlight.then(() => load("poll"));
+        return inFlight;
+      }
+      const force = mode === "force";
       if (force) setState((previous) => ({ ...previous, loading: true, error: false }));
       const params = new URLSearchParams(query);
       if (force) params.set("refresh", "true");
       const queryString = params.toString();
       inFlightForced = force;
+      const startedAt = generation;
       inFlight = (async () => {
         try {
-          const response = await fetch(`/api/provider-usage${queryString ? `?${queryString}` : ""}`, { signal: controller.signal });
+          const response = await fetch(`${path}${queryString ? `?${queryString}` : ""}`, { signal: controller.signal });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          const snapshot = await response.json() as ProviderUsageSnapshot;
-          if (controller.signal.aborted) return false;
+          const snapshot = await response.json() as T;
+          if (controller.signal.aborted || generation !== startedAt) return false;
           setState({ snapshot, loading: false, error: false });
-          return true;
+          return !isRecord(snapshot) || snapshot.usageUnavailable !== true;
         } catch {
-          if (!controller.signal.aborted) setState({ snapshot: null, loading: false, error: true });
+          if (!controller.signal.aborted && generation === startedAt) {
+            setState((previous) => ({ ...previous, loading: false, error: true }));
+          }
           return false;
         } finally {
           inFlight = undefined;
@@ -108,7 +113,7 @@ export function useProviderUsage(query: string | null, refreshMs?: number): Prov
       })();
       return inFlight;
     };
-    refreshRef.current = () => load(true);
+    refreshRef.current = load;
     void load();
     const interval = refreshMs ? window.setInterval(() => void load(), refreshMs) : undefined;
     return () => {
@@ -116,6 +121,6 @@ export function useProviderUsage(query: string | null, refreshMs?: number): Prov
       controller.abort();
       if (interval !== undefined) window.clearInterval(interval);
     };
-  }, [query, refreshMs]);
-  return { ...state, refresh };
+  }, [query, refreshMs, path]);
+  return { ...state, refresh, reload };
 }

@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import { createElement } from "react";
 
-const { cleanup, render, screen, waitFor } = await import("@testing-library/react/pure.js");
+const { act, cleanup, render, screen, waitFor } = await import("@testing-library/react/pure.js");
 const { default: userEvent } = await import("@testing-library/user-event");
-const { providerInitials } = await import("./ModelsConfig.tsx");
+const { ModelsConfig, providerInitials } = await import("./ModelsConfig.tsx");
 const { RetryFallbackDetail } = await import("./ModelsConfig-panels.tsx");
 
 afterEach(cleanup);
@@ -126,4 +126,32 @@ test("a failed fallback save restores the confirmed chain", async (t) => {
   await screen.findByRole("alert");
   assert.equal(screen.queryByText("openai-codex/gpt-5.6-sol:high"), null);
   assert.ok(screen.getByText("No explicit chain. OMP uses the default chain when available."));
+});
+
+test("focusProvider waits for OAuth list to settle before selecting apikey", async (t) => {
+  let resolveOauth;
+  t.mock.method(globalThis, "fetch", async (url) => {
+    if (url === "/api/auth/providers") {
+      return await new Promise((resolve) => {
+        resolveOauth = () => resolve(Response.json({ providers: [{ id: "anthropic", name: "Anthropic", loggedIn: false }] }));
+      });
+    }
+    if (url === "/api/auth/all-providers") {
+      return Response.json({ providers: [{ id: "anthropic", name: "Anthropic", configured: true }] });
+    }
+    if (url === "/api/models-config") return Response.json({ providers: {} });
+    if (url === "/api/models") return Response.json({ modelList: [], connectedProviders: [] });
+    return Response.json({});
+  });
+
+  await act(async () => {
+    render(createElement(ModelsConfig, { onClose: () => {}, embedded: true, focusProvider: { id: "anthropic" } }));
+    await new Promise((r) => setTimeout(r, 30));
+  });
+  assert.equal(screen.queryByText("API Key"), null, "must not select apikey before oauth list settles");
+
+  await act(async () => {
+    resolveOauth();
+  });
+  await screen.findByText("Subscription");
 });

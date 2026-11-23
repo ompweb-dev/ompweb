@@ -5,7 +5,7 @@ import { LogOut } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
 import { planForStoredAccount, summarizeProviderAccounts } from "@/lib/provider-accounts";
-import { useProviderUsage } from "./AppShell-provider-usage";
+import { PROVIDER_ACCOUNTS_CHANGED, useProviderUsage } from "./AppShell-provider-usage";
 import { ConfirmDialog } from "./ui/field";
 
 interface StoredAccount {
@@ -63,6 +63,7 @@ export function ProviderAccounts({ providerId, enabled, onChanged }: { providerI
       // Drop the row now; the refetch reconciles with omp's store.
       setStored((s) => s && { ...s, accounts: s.accounts.filter((a) => a.credentialId !== account.credentialId) });
       setVersion((v) => v + 1);
+      window.dispatchEvent(new Event(PROVIDER_ACCOUNTS_CHANGED));
       onChanged();
     } catch (e) {
       setConfirm(null);

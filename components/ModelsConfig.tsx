@@ -25,6 +25,7 @@ import { toast } from "@/components/ui/toast";
 import { SettingsTabs, type SettingsTab } from "./SettingsTabs";
 import { ModelCatalogPicker } from "./ModelCatalogPicker";
 import { ProviderAccounts } from "./ProviderAccounts";
+import { PROVIDER_ACCOUNTS_CHANGED } from "./AppShell-provider-usage";
 import {
   API_OPTIONS,
   COMPOSER_MODELS_STORAGE_KEY,
@@ -851,6 +852,7 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
         es.close();
         setLoginState({ phase: "success" });
         setAccountsVersion((v) => v + 1);
+        window.dispatchEvent(new Event(PROVIDER_ACCOUNTS_CHANGED));
         onRefresh();
       } else if (data.type === "error") {
         es.close();
@@ -1038,7 +1040,7 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }: { onClose: () => void; onSelectTab?: (tab: SettingsTab) => void; onSaved?: () => void; embedded?: boolean }) {
+export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false, focusProvider }: { onClose: () => void; onSelectTab?: (tab: SettingsTab) => void; onSaved?: () => void; embedded?: boolean; focusProvider?: { id: string } | null }) {
   const { t, tn } = useI18n();
   const isMobile = useIsMobile();
   const [config, setConfig] = useState<ModelsFileData>({ providers: {} });
@@ -1050,6 +1052,7 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
   const [systemTab, setSystemTab] = useState<"registry" | "picker" | "roles" | "fallbacks">("registry");
   const [selection, setSelection] = useState<Selection | null>(null);
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([]);
+  const [oauthLoaded, setOauthLoaded] = useState(false);
   const [apiKeyProviders, setApiKeyProviders] = useState<ApiKeyProvider[]>([]);
   const [runtimeModels, setRuntimeModels] = useState<RuntimeModelEntry[]>([]);
   const [connectedProviders, setConnectedProviders] = useState<ConnectedProvider[]>([]);
@@ -1066,12 +1069,14 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
   const [parseError, setParseError] = useState<{ message: string; path?: string } | null>(null);
 
   const loadOAuthProviders = useCallback(() => {
+    setOauthLoaded(false);
     fetch("/api/auth/providers")
       .then((r) => r.json())
       .then((d: { providers?: OAuthProvider[] }) => {
         if (Array.isArray(d.providers)) setOauthProviders(d.providers);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setOauthLoaded(true));
   }, []);
 
   const loadApiKeyProviders = useCallback(() => {
@@ -1125,6 +1130,19 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
     loadApiKeyProviders();
     loadRuntimeModels();
   }, [loadConfig, loadOAuthProviders, loadApiKeyProviders, loadRuntimeModels]);
+
+  // Opened from a provider usage row: show that provider once the lists are in, once per request.
+  const focusedRef = useRef<{ id: string } | null>(null);
+  useEffect(() => {
+    if (!focusProvider || focusedRef.current === focusProvider) return;
+    const type = oauthProviders.some((p) => p.id === focusProvider.id)
+      ? "oauth"
+      : oauthLoaded && apiKeyProviders.some((p) => p.id === focusProvider.id) ? "apikey" : null;
+    if (!type) return;
+    focusedRef.current = focusProvider;
+    setSubTab("connected");
+    setSelection({ type, providerId: focusProvider.id });
+  }, [focusProvider, oauthProviders, oauthLoaded, apiKeyProviders]);
 
   useEffect(() => {
     try {

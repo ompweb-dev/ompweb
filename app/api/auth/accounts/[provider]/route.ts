@@ -1,5 +1,6 @@
 import { invalidateModelsCache } from "@/lib/models-cache";
 import { runUtilityCommand } from "@/lib/omp/rpc-utility";
+import { invalidateUsageCache } from "@/lib/provider-usage";
 
 /** Entry of omp's `get_logout_accounts` response. Labels never carry a raw key. */
 interface OmpProviderAccount {
@@ -47,6 +48,7 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ provi
   try {
     await runUtilityCommand({ type: "logout", providerId: provider, credentialId }, 60_000);
     invalidateModelsCache();
+    invalidateUsageCache();
     return Response.json({ ok: true });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });

@@ -3,6 +3,7 @@ import { invalidateModelsCache } from "@/lib/models-cache";
 import { enableProvider } from "@/lib/omp/model-roles";
 import { RpcProcess, type RpcFrame } from "@/lib/omp/rpc-process";
 import { disposeUtilityRpc } from "@/lib/omp/rpc-utility";
+import { invalidateUsageCache } from "@/lib/provider-usage";
 
 /**
  * Interactive login over a dedicated headless runner. The runner drives the
@@ -164,6 +165,7 @@ export async function GET(
         await child.sendCommand({ type: "login", providerId: provider }, LOGIN_TIMEOUT_MS);
         enableProvider(provider);
         invalidateModelsCache();
+        invalidateUsageCache();
         disposeUtilityRpc();
         send({ type: "success" });
       } catch (error) {

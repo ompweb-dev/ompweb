@@ -6,8 +6,13 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Added
+
+- **Provider Usage shows one row per account with every limit window at once.** Splits such as Anthropic's Fable bucket or Antigravity's model quotas merge into their account; open a row for each split's reset time. The 5H/7D switch is gone. Each quota gets its own meter line; drag an account to reorder, double-click it to rename it. An open row sets the account's usage limit (omp's per-account reserve: above it omp uses the provider's other accounts first), marks it preferred (omp's account priority: used first while below its limit), pauses it without signing out, and opens it in API Keys & Providers.
+
 ### Fixed
 
+- **Provider Usage keeps accounts visible when their limits are unavailable.** Paused accounts can still be resumed, and a failed quota fetch no longer removes stored account names. Signing out drops the account instead of leaving its cached limits behind.
 - **Horizontal scrollbars no longer clip file-panel tabs.** The tab row keeps its full height in narrow panels, including on mobile.
 - **Show the generation-speed pill in the top bar again.** Since the header opener was split from the file-panel close control, the pill's box sized to zero width and its narrow-header rule hid it on every screen; it now keeps its width. Phone-width screens still hide it.
 
