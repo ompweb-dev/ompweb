@@ -1126,7 +1126,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, newSessio
     <AgentLinkContext.Provider value={openAgentLink}>
     <WorkspaceFileContext.Provider value={fileSource}>
     <div
-      className="relative flex h-full flex-col overflow-hidden"
+      className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}

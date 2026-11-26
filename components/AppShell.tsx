@@ -2699,8 +2699,9 @@ export function AppShell({ appName }: { appName: string }) {
 
         </div>
 
-        {/* Chat content */}
-        <div style={{ flex: 1, overflow: "hidden", position: "relative" }}>
+        {/* Chat content: flex column so the chat fills only the space left
+            below SessionTabs (h-full pushed the composer off-screen). */}
+        <div style={{ flex: 1, minHeight: 0, overflow: "hidden", position: "relative", display: "flex", flexDirection: "column" }}>
           {openSessionTabs.length > 0 && (
             <SessionTabs
               tabs={openSessionTabs}
