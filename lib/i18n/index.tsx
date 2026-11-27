@@ -121,8 +121,10 @@ export function formatExitedSessionNotice(exit: ExitedRpcSession): string {
   });
 }
 
-/** Czech also distinguishes integer counts 2–4 (few). The count is
- * always available to the template as {count}. */
+/** Plural-aware translate: resolves `<key>.one` for count===1, `<key>.few`
+ * for Czech integer counts 2–4, and `<key>.other` otherwise (zh/ja
+ * dictionaries may map both one and other to the same string). The count
+ * is always available to the template as {count}. */
 export function translatePlural(
   key: string,
   count: number,
