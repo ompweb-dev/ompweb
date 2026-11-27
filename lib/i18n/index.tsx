@@ -2,23 +2,26 @@
 
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 import type { ExitedRpcSession } from "@/lib/types";
+import cs from "./locales/cs.json";
 import en from "./locales/en.json";
 import ja from "./locales/ja.json";
 import zhCN from "./locales/zh-CN.json";
 import zhTW from "./locales/zh-TW.json";
 
-export type Locale = "en" | "zh-CN" | "zh-TW" | "ja";
+export type Locale = "en" | "zh-CN" | "zh-TW" | "ja" | "cs";
 
 export const LOCALES: Array<{ value: Locale; label: string }> = [
   { value: "en", label: "EN" },
   { value: "zh-CN", label: "简体中文" },
   { value: "zh-TW", label: "繁體中文" },
   { value: "ja", label: "日本語" },
+  { value: "cs", label: "Čeština" },
 ];
 
 const STORAGE_KEY = "omp-lang";
 
 const dictionaries: Record<Locale, Record<string, string>> = {
+  cs,
   en: en as Record<string, string>,
   "zh-CN": zhCN as Record<string, string>,
   "zh-TW": zhTW as Record<string, string>,
@@ -52,6 +55,7 @@ export function resolveNavigatorLocale(language: string | undefined | null): Loc
   if (lang.startsWith("zh")) {
     return TRADITIONAL_ZH_RE.test(lang) ? "zh-TW" : "zh-CN";
   }
+  if (/^cs(?:-|$)/.test(lang)) return "cs";
   if (lang.startsWith("ja")) return "ja";
   return "en";
 }
@@ -61,7 +65,7 @@ function detectLocale(): Locale {
   try {
     if (typeof window !== "undefined" && typeof localStorage !== "undefined") {
       const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored === "en" || stored === "zh-CN" || stored === "zh-TW" || stored === "ja") return stored;
+      if (stored === "en" || stored === "zh-CN" || stored === "zh-TW" || stored === "ja" || stored === "cs") return stored;
     }
   } catch {
     // storage unavailable (private mode etc.)
@@ -117,15 +121,17 @@ export function formatExitedSessionNotice(exit: ExitedRpcSession): string {
   });
 }
 
-/** Plural-aware translate: resolves `<key>.one` for count===1, `<key>.other`
- * otherwise (zh/ja dictionaries may map both to the same string). The count is
- * always available to the template as {count}. */
+/** Plural-aware translate: resolves `<key>.one` for count===1, `<key>.few`
+ * for Czech integer counts 2–4, and `<key>.other` otherwise (zh/ja
+ * dictionaries may map both one and other to the same string). The count
+ * is always available to the template as {count}. */
 export function translatePlural(
   key: string,
   count: number,
   vars?: Record<string, string | number>,
 ): string {
-  return translate(`${key}.${count === 1 ? "one" : "other"}`, { count, ...vars });
+  const form = count === 1 ? "one" : getLocale() === "cs" && Number.isInteger(count) && count >= 2 && count <= 4 ? "few" : "other";
+  return translate(`${key}.${form}`, { count, ...vars });
 }
 
 function subscribe(cb: () => void): () => void {
