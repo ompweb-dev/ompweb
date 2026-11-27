@@ -47,8 +47,8 @@ The jsdom dependency stays on 29.x for now; moving to a newer major is a separat
   shadow, motion) — no hardcoded colors. Shared primitives live in
   `components/ui/` (Dialog/Tooltip/Collapsible/field/toast, built on Base UI);
   icons come from `lucide-react`.
-- **i18n**: every user-facing string needs entries in all four dictionaries:
-  `lib/i18n/locales/{en,zh-CN,zh-TW,ja}.json`.
+- **i18n**: every user-facing string needs entries in all dictionaries:
+  `lib/i18n/locales/{en,zh-CN,zh-TW,ja,cs}.json`.
 - **Architecture**: the ompweb server and daemon never import `@oh-my-pi/*` or `@earendil-works/*`
   packages (Bun-only). Live agent features go through the `ompweb-omp` child process
   (built and released by the oh-my-pi fork) over ompweb's channel; see `DESIGN.md` and `AGENTS.md` for the full contract.

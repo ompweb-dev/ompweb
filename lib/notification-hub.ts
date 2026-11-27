@@ -3,6 +3,7 @@ import { releaseRepo } from "./release-repo";
 import en from "./i18n/locales/en.json";
 import ja from "./i18n/locales/ja.json";
 import zhCN from "./i18n/locales/zh-CN.json";
+import cs from "./i18n/locales/cs.json";
 import zhTW from "./i18n/locales/zh-TW.json";
 import {
   renderNotification,
@@ -157,7 +158,7 @@ export function routeNotification(event: NotificationEvent, presence: Notificati
   return deliveries;
 }
 
-const dictionaries: Record<string, Record<string, string>> = { en, ja, "zh-CN": zhCN, "zh-TW": zhTW };
+const dictionaries: Record<string, Record<string, string>> = { cs, en, ja, "zh-CN": zhCN, "zh-TW": zhTW };
 
 function renderFor(event: NotificationEvent, locale: string): RenderedNotification {
   const dictionary = Object.hasOwn(dictionaries, locale) ? dictionaries[locale] : dictionaries.en;
