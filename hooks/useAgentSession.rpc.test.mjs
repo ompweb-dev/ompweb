@@ -3340,6 +3340,84 @@ test("subagent roster is restored from the get_subagents snapshot after reconnec
   );
 });
 
+test("unknown running progress restores a missed subagent without activating the chat", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const { w, es } = await startStreamingRun("s1");
+  const child = { id: "missed-child", agent: "explore", status: "running", index: 0, task: "keep searching", progress: { id: "missed-child", status: "running", tokens: 42 } };
+  world.subagentSnapshots.set("s1", [child]);
+  let release;
+  world.holds.push({
+    match: (method, _url, body) => method === "POST" && body?.type === "get_subagents",
+    produce: () => new Promise((resolve) => { release = () => resolve({ value: { success: true, data: { subagents: [child] } } }); }),
+  });
+  const before = world.calls.filter((c) => c.body?.type === "get_subagents").length;
+  await act(async () => {
+    for (let i = 0; i < 5; i++) es.emit({ type: "subagent_progress", payload: { progress: child.progress } });
+  });
+  await until(() => !!release, "unknown progress must trigger registry recovery");
+  assert.equal(world.calls.filter((c) => c.body?.type === "get_subagents").length - before, 1, "concurrent recovery triggers share one read");
+  await act(async () => { release(); });
+  await until(() => w.latest.subagents.some((s) => s.id === child.id), "the missing chip appears without focus or another prompt");
+  assert.equal(w.latest.subagents.find((s) => s.id === child.id)?.progress.tokens, 42);
+  assert.equal(w.latest.agentRunning, true);
+});
+
+test("late unknown progress cannot fabricate a child absent from omp's registry", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const { w, es } = await startStreamingRun("s1");
+  await act(async () => {
+    es.emit({ type: "subagent_progress", payload: { progress: { id: "old-child", status: "running", tokens: 42 } } });
+  });
+  await settle();
+  assert.deepEqual(w.latest.subagents, [], "a late frame is only a recovery hint, never proof of a running child");
+});
+
+test("roster recovery started by progress cannot repopulate a finished run", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const { w, es } = await startStreamingRun("s1");
+  let release;
+  world.holds.push({
+    match: (method, _url, body) => method === "POST" && body?.type === "get_subagents",
+    produce: () => new Promise((resolve) => {
+      release = () => resolve({ value: { success: true, data: { subagents: [{ id: "old-child", agent: "explore", status: "running" }] } } });
+    }),
+  });
+  await act(async () => {
+    es.emit({ type: "subagent_progress", payload: { progress: { id: "old-child", status: "running" } } });
+  });
+  await until(() => !!release, "recovery read starts");
+  await act(async () => { es.emit({ type: "agent_end", isTerminal: true }); });
+  await until(() => !w.latest.agentRunning, "the main run finishes");
+  await act(async () => { release(); });
+  await settle();
+  assert.deepEqual(w.latest.subagents, [], "the old generation cannot restore a ghost chip");
+});
+
+test("every recoverable stream reconnect restores quiet subagents across prompt runs", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const { w, es } = await startStreamingRun("s1");
+  world.agents.set("s1", { running: true, state: { isStreaming: true } });
+  for (const id of ["first-reconnect", "next-run-reconnect"]) {
+    world.subagentSnapshots.set("s1", [{ id, agent: "explore", status: "running", index: 0, task: "quiet child" }]);
+    await act(async () => {
+      es.dropRecoverably();
+      es.open();
+    });
+    await until(() => w.latest.subagents.some((s) => s.id === id), "reopening the same stream must restore its roster");
+    if (id === "first-reconnect") {
+      await act(async () => { es.emit({ type: "agent_end", isTerminal: true }); });
+      await until(() => !w.latest.agentRunning, "the first prompt finishes");
+      await act(async () => { es.emit({ type: "agent_start" }); });
+      await settle();
+    }
+  }
+  assert.equal(w.latest.agentRunning, true);
+});
+
 /** Poll inside act until `check` holds (btw frames flush on a display-rate timer). */
 async function until(check, message, timeoutMs = 2000) {
   const deadline = Date.now() + timeoutMs;
