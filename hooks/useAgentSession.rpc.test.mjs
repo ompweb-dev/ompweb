@@ -396,7 +396,7 @@ const { toast: testToast, toastCalls: testToastCalls } = await import("./__fixtu
 mock.module("@/components/ui/toast", () => ({
   ...realToastExports, toast: testToast, default: testToast,
 }));
-const { useAgentSession } = await import("../hooks/useAgentSession.ts");
+const { useAgentSession, thinkingConfirmDeadline } = await import("../hooks/useAgentSession.ts");
 const { selectSessionHistory } = await import("@/lib/session-sync");
 const { publishSessionsChanged } = await import("@/lib/session-change-bus");
 const { AgentSessionWrapper } = await import("@/lib/rpc-manager");
@@ -6500,6 +6500,49 @@ test("a thinking confirmation arriving after a branch switch cannot overwrite it
   await act(async () => { finish({ value: { info: { configuredThinkingLevel: "auto", thinkingLevel: "low" } } }); await command; });
   assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["high", "high"]);
   assert.equal(w.latest.thinkingLevelPending, false);
+});
+test("both thinking confirmation reads carry the deadline the picker waits under", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  Object.assign(world.sessions.get("s1"), { configuredThinkingLevel: "medium", thinkingLevel: "medium" });
+  world.agents.set("s1", { running: true, state: { configuredThinkingLevel: "medium", thinkingLevel: "low" } });
+  const w = await mountSession("s1");
+  const signals = [];
+  world.respond = (method, url, _body, init) => {
+    if (method === "GET" && (url === "/api/sessions/s1/state" || url === "/api/sessions/s1?meta=1")) signals.push(init?.signal);
+    return undefined;
+  };
+  await act(async () => { await w.latest.handleThinkingLevelChange("auto"); });
+  assert.equal(signals.length, 2, "the state and metadata reads both confirm the mode");
+  assert.ok(signals.every((signal) => signal instanceof AbortSignal), "a stalled read is aborted at the deadline, not awaited forever");
+  assert.equal(w.latest.thinkingLevelPending, false);
+});
+
+test("the thinking confirmation deadline aborts at its limit and can be cancelled", async () => {
+  const expiring = thinkingConfirmDeadline(5);
+  await sleep(40);
+  assert.equal(expiring.signal.aborted, true);
+  const kept = thinkingConfirmDeadline(5);
+  kept.cancel();
+  await sleep(40);
+  assert.equal(kept.signal.aborted, false, "a read that settled leaves no timer to abort it");
+});
+
+test("sending from a historical branch confirms the live thinking level first", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const base = world.sessions.get("s1");
+  Object.assign(base, { configuredThinkingLevel: "auto", thinkingLevel: "auto" });
+  world.views.set("s1:other:false", { ...base, configuredThinkingLevel: "high", thinkingLevel: "high" });
+  world.agents.set("s1", { running: true, state: { configuredThinkingLevel: "auto", thinkingLevel: "low" } });
+  const w = await mountSession("s1");
+  await act(async () => { await w.changeLeaf("other"); });
+  assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["high", "high"]);
+  await act(async () => { await w.latest.handleSend("next prompt"); await sleep(30); });
+  assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["auto", "low"]);
+  await act(async () => { await w.latest.handleThinkingLevelChange("high"); });
+  assert.deepEqual(callsTo("POST", "/api/agent/s1").filter(({ body }) => body?.type === "set_thinking_level").map(({ body }) => body.level), ["high"],
+    "picking the branch's level is not mistaken for the live session's");
 });
 
 test("cycling thinking reads the mode instead of inferring it from effective low", async () => {

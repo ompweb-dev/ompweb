@@ -311,9 +311,21 @@ function observedLevel(source?: Pick<AgentStateResponse, "thinkingLevel" | "obse
   return source?.observedThinkingLevel ?? (source?.thinkingLevel !== "off" ? source?.thinkingLevel : undefined);
 }
 
-async function readSessionMetadata(sid: string): Promise<Pick<SessionReadValue, "info" | "leafId"> | undefined> {
+/** How long the confirmation reads after a thinking command may take. The native acknowledgement is already bounded
+ * at 30 s, so a stalled state or metadata read must not keep the picker disabled past it. */
+export const THINKING_CONFIRM_TIMEOUT_MS = 30_000;
+
+/** Aborts after `ms` unless cancelled: an AbortController and a timer, not AbortSignal.timeout, because older
+ * browsers lack it. */
+export function thinkingConfirmDeadline(ms = THINKING_CONFIRM_TIMEOUT_MS): { signal: AbortSignal; cancel: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cancel: () => clearTimeout(timer) };
+}
+
+async function readSessionMetadata(sid: string, signal?: AbortSignal): Promise<Pick<SessionReadValue, "info" | "leafId"> | undefined> {
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?meta=1`);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?meta=1`, signal ? { signal } : undefined);
     return res.ok ? await res.json() : undefined;
   } catch {
     return undefined;
@@ -1165,10 +1177,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const branch = branchRevisionRef.current;
     const observationToken = thinkingObservationSeqRef.current;
     const modeToken = confirmThinking ? ++thinkingModeSeqRef.current : undefined;
+    const deadline = thinkingConfirmDeadline();
     try {
       const [agentState, metadata] = await Promise.all([
-        fetch(`/api/sessions/${encodeURIComponent(sid)}/state`).then((res) => res.ok ? res.json() as Promise<{ running: boolean; state?: AgentStateResponse }> : null).catch(() => null),
-        confirmThinking ? readSessionMetadata(sid) : undefined,
+        fetch(`/api/sessions/${encodeURIComponent(sid)}/state`, { signal: deadline.signal }).then((res) => res.ok ? res.json() as Promise<{ running: boolean; state?: AgentStateResponse }> : null).catch(() => null),
+        confirmThinking ? readSessionMetadata(sid, deadline.signal) : undefined,
       ]);
       if (!hookAliveRef.current || sessionIdRef.current !== sid || branchRevisionRef.current !== branch) return;
       const modelCurrent = token === authoritativeModelSeqRef.current;
@@ -1203,6 +1216,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (agentState.state?.followUpMode !== undefined) setFollowUpMode(agentState.state.followUpMode);
     } catch {
       // Best effort; the next loadSession/reconcile re-syncs.
+    } finally {
+      deadline.cancel();
     }
   }, [applyAuthoritativeModel, applyLiveThinking, beginAuthoritativeModelSync, catchUp]);
 
@@ -3525,7 +3540,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // from omp's own frames when the web server dispatches it (agent_start), not from this click.
       if (catchUp.view().leafId) {
         catchUp.select({ leafId: null, includePreCompaction: catchUp.view().includePreCompaction });
-        void catchUp.request();
+        // The branch's recorded level is not the live session's: confirm the live one before the branch read-back lands.
+        void (async () => {
+          await catchUp.request();
+          await refreshLiveModelState(sessionIdRef.current ?? session.id, true);
+        })();
       }
       return await holdMessage(sessionIdRef.current ?? session.id, "prompt", message, images, uploads, uploadProofs)
         ? { status: "accepted" }
@@ -3678,7 +3697,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       dispatch({ type: "end" });
       return mayHaveRun ? { status: "accepted" } : { status: "rejected", recoveryKey: sessionIdRef.current ?? recoveryKey };
     }
-  }, [catchUp, eventCoalescer, isNew, pooled, newSessionPoolId, newSessionProjectId, newSessionCwd, newSessionHostId, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, onSessionCreated, waitForPromptSettlement, addNotice, refreshSubagentRoster, clearLiveToolResults, clearTerminalReconcileTimer, snapshotRunEntries, holdMessage]);
+  }, [catchUp, eventCoalescer, isNew, pooled, newSessionPoolId, newSessionProjectId, newSessionCwd, newSessionHostId, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, onSessionCreated, waitForPromptSettlement, addNotice, refreshSubagentRoster, clearLiveToolResults, clearTerminalReconcileTimer, snapshotRunEntries, holdMessage, refreshLiveModelState]);
 
   /** Abort the running agent and send the message as a fresh prompt
    * (abort_and_prompt). Only valid mid-run; the old turn's agent_end is

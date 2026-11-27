@@ -987,6 +987,8 @@ function selectSessionContext(
       else if (entry.configured === null) configuredThinkingLevel = undefined;
       hasThinkingEntry = true;
       thinkingFromFallbackHop = previousWasFallbackHop;
+      // A user pick outside a fallback hop replaces the baseline, so the next hop snapshots this pick.
+      if (!previousWasFallbackHop) preFallbackThinking = undefined;
     } else if (entry.type === "model_change") {
       // On resume omp discards the effort applied by a retry hop, not a later user pick.
       // Across chained hops keep the first snapshot until a non-hop model change.
