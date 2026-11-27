@@ -2,7 +2,7 @@
 
 import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, memo, KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Maximize2, Mic, Paperclip, Plus, RotateCw, Shrink, Snail, Sparkles, Terminal, Wrench, X, Zap } from "lucide-react";
+import { Brain, ChevronDown, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Maximize2, Mic, Paperclip, Plus, RotateCw, Shrink, Snail, Sparkles, Terminal, Wrench, X, Zap } from "lucide-react";
 import { getSubmitDuringRunBehavior, isWordCompletionEnabled } from "@/lib/composer-prefs";
 import type { BuiltinSlashCommandResult, CompactResultInfo, PromptSendOptions, PromptSubmissionResult, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { ActiveGoal, ActivePlan } from "@/lib/web-mode-state";
@@ -215,7 +215,10 @@ interface Props {
   onAbortCompaction?: () => void;
   isCompacting?: boolean;
   compactResult?: CompactResultInfo | null;
-  thinkingLevel?: string;
+  configuredThinkingLevel?: string;
+  observedThinkingLevel?: string;
+  thinkingLevelDisabled?: boolean;
+  useDraftThinkingDefault?: boolean;
   onThinkingLevelChange?: (level: string) => void;
   availableThinkingLevels?: string[] | null;
   thinkingLevelMap?: Record<string, string | null> | null;
@@ -373,7 +376,7 @@ function menuDropStyle(placement: MenuPlacement, maxHeight: number | null): Reac
 export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatInput({
   onSend, onPredictWord, onPredictWordFeedback, onAbort, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, modelsLoading, onModelChange, fastModeEnabled, fastModeActive, usageLimit, fastModeSupported, onFastModeChange, slowModeSupported, slowModeEnabled, slowModeScope, onSlowModeChange,
   onAbortCompaction, isCompacting, compactResult,
-  thinkingLevel, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap, modelNameOverride,
+  configuredThinkingLevel, observedThinkingLevel, thinkingLevelDisabled, useDraftThinkingDefault, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap, modelNameOverride,
   toolPreset, onToolPresetChange, sessionToolPreset, isNewSession,
   retryInfo, queuedMessages, inputHistory = [], onAbortRetry,
   slashCommands, slashCommandsLoading, onLoadSlashCommands,
@@ -2301,21 +2304,26 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const activeToolCount = getToolPresetToolCount(activeToolPreset);
   const toolsetBadgeLabel = `tools: ${activeToolPreset}${activeToolCount === null ? "" : ` (${activeToolCount})`}`;
   const restrictedToolPreset = toolPresetKnown && activeToolPreset !== "full" ? activeToolPreset : null;
+  const thinkingDisabled = isStreaming || !!thinkingLevelDisabled;
+  const autoOptionLabel = useDraftThinkingDefault ? t("chatInput.thinkingAuto") : t("chatInput.reasoningAuto");
   const thinkingDisplayLabel = (() => {
-    const lvl = thinkingLevel ?? "auto";
-    if (lvl === "auto" || !thinkingLevelMap) return lvl;
-    return thinkingLevelMap[lvl] ?? lvl;
+    if (configuredThinkingLevel === "auto") {
+      return observedThinkingLevel && observedThinkingLevel !== "auto"
+        ? t("chatInput.reasoningAutoTurn", { level: observedThinkingLevel })
+        : autoOptionLabel;
+    }
+    if (configuredThinkingLevel) return t("chatInput.reasoningFixed", { level: configuredThinkingLevel });
+    if (observedThinkingLevel) return t("chatInput.reasoningLevel", { level: observedThinkingLevel });
+    return t("chatInput.reasoningUnknown");
   })();
   const thinkingLevelOptions = React.useMemo(
     () => selectableThinkingLevels(availableThinkingLevels),
     [availableThinkingLevels],
   );
-  // A run starting mid-interaction must not leave the reasoning menu
-  // open: the level only applies to the next prompt, and the trigger is
-  // disabled while streaming.
+  // A run or a pending change can lock an already open picker.
   useEffect(() => {
-    if (isStreaming) setThinkingDropdownOpen(false);
-  }, [isStreaming]);
+    if (thinkingDisabled) setThinkingDropdownOpen(false);
+  }, [thinkingDisabled]);
 
   useEffect(() => {
     if (!modelDropdownOpen) {
@@ -3681,7 +3689,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               <div ref={thinkingDropdownRef} className="composer-thinking-control" style={{ position: "relative", minWidth: 0 }}>
                 <button
                   onClick={() => setThinkingDropdownOpen((v) => !v)}
-                  disabled={isStreaming}
+                  disabled={thinkingDisabled}
                   title={t("chatInput.changeReasoningTitle", { level: thinkingDisplayLabel })}
                   aria-controls={thinkingMenuId}
                   aria-label={`${t("chatInput.changeReasoning")}: ${thinkingDisplayLabel}`}
@@ -3690,17 +3698,19 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   style={{
                     display: "flex", alignItems: "center", gap: 5,
                     height: "var(--control-height-sm)", width: "100%", padding: "0 4px", background: thinkingDropdownOpen ? "var(--bg-hover)" : "none",
-                    border: "none", borderRadius: 7, color: "var(--text-muted)", cursor: isStreaming ? "not-allowed" : "pointer",
-                    opacity: isStreaming ? 0.5 : 1, fontSize: "var(--text-sm)",
+                    border: "none", borderRadius: 7, color: "var(--text-muted)", cursor: thinkingDisabled ? "not-allowed" : "pointer",
+                    opacity: thinkingDisabled ? 0.5 : 1, fontSize: "var(--text-sm)",
                     transition: "background var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm)",
                   }}
-                  onMouseEnter={(e) => { if (!isStreaming) { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; } }}
+                  onMouseEnter={(e) => { if (!thinkingDisabled) { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; } }}
                   onMouseLeave={(e) => { e.currentTarget.style.background = thinkingDropdownOpen ? "var(--bg-hover)" : "none"; e.currentTarget.style.color = "var(--text-muted)"; }}
                 >
                   {/* TUI-style level glyph; wide toolbars also show the level
                       name (label hidden by CSS on narrow toolbars) and the
                       label always stays in title/aria. */}
-                  <ThinkingGlyph level={thinkingLevel ?? "auto"} />
+                  {configuredThinkingLevel ? <ThinkingGlyph level={configuredThinkingLevel} /> : (
+                    <span className="composer-thinking-glyph" aria-hidden="true"><Brain /></span>
+                  )}
                   <span className="composer-thinking-label" style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textTransform: "capitalize" }}>{thinkingDisplayLabel}</span>
                   <ChevronDown size={12} strokeWidth={1.8} style={{ flexShrink: 0, opacity: 0.7, transform: thinkingDropdownOpen ? "rotate(180deg)" : "none", transition: "transform var(--dur-fast) var(--ease-out-warm)" }} aria-hidden="true" />
                 </button>
@@ -3734,9 +3744,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     </div>
                     <div className="picker-thinking-cards">
                       {thinkingLevelOptions.map((lvl) => {
-                        const isActive = (thinkingLevel ?? "auto") === lvl;
-                        const mappedVal = (lvl !== "auto" && thinkingLevelMap) ? thinkingLevelMap[lvl] : undefined;
-                        const displayLabel = (mappedVal != null && mappedVal !== lvl) ? mappedVal : lvl;
+                        const isActive = configuredThinkingLevel === lvl;
+                        const mapped = thinkingLevelMap && Object.hasOwn(thinkingLevelMap, lvl) ? thinkingLevelMap[lvl] : undefined;
+                        const displayLabel = lvl === "auto" ? autoOptionLabel : mapped && mapped !== lvl ? `${lvl} → ${mapped}` : lvl;
                         return (
                           <button
                             className="picker-row picker-thinking-card"
@@ -3744,7 +3754,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                             role="menuitemradio"
                             aria-checked={isActive}
                             key={lvl}
-                            onClick={() => { setThinkingDropdownOpen(false); if (!isActive && !isStreaming) onThinkingLevelChange(lvl); }}
+                            onClick={() => { setThinkingDropdownOpen(false); if (!isActive && !thinkingDisabled) onThinkingLevelChange(lvl); }}
                           >
                             <span className="picker-check">
                               {isActive && <svg width="11" height="11" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1.5 5 4 7.5 8.5 2.5" /></svg>}

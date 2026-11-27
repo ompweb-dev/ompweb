@@ -12,6 +12,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ### Fixed
 
+- **Switch an existing chat back to Auto reasoning.** The composer shows the selected mode separately from this turn's effort, follows changes made in another tab, and restores the mode when you reopen the chat. Viewing an earlier branch shows its recorded mode without changing the live session. Older sessions without a recorded mode no longer appear to have selected a fixed level.
 - **Horizontal scrollbars no longer clip file-panel tabs.** The tab row keeps its full height in narrow panels, including on mobile.
 - **Refreshing Usage applies changed prices, and says when it fails.** Prices edited in `models.yml` now apply to existing sessions on refresh; they used to keep the old prices until the web server restarted. A refresh that fails now shows the error above the last report instead of leaving it up without a word.
 - **Show the generation-speed pill in the top bar again.** Since the header opener was split from the file-panel close control, the pill's box sized to zero width and its narrow-header rule hid it on every screen; it now keeps its width. Phone-width screens still hide it.

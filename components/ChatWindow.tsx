@@ -448,7 +448,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, newSessio
 
   const {
     loading, error, messages, entryIds, showPreCompactionHistory, streamState,
-    agentRunning, bashRunning, pendingBash, deferredBash, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, thinkingLevel, fastModeEnabled, fastModeActive, slowModeSupported, slowModeEnabled, slowModeScope, usageLimit,
+    agentRunning, bashRunning, pendingBash, deferredBash, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, configuredThinkingLevel, observedThinkingLevel, thinkingLevelDisabled, fastModeEnabled, fastModeActive, slowModeSupported, slowModeEnabled, slowModeScope, usageLimit,
     externalRunActive,
     toolPreset, sessionToolPreset,
     liveModelMeta,
@@ -1042,7 +1042,10 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, newSessio
       onAbortCompaction={handleAbortCompaction}
       isCompacting={isCompacting}
       compactResult={compactResult}
-      thinkingLevel={thinkingLevel}
+      configuredThinkingLevel={configuredThinkingLevel}
+      observedThinkingLevel={observedThinkingLevel}
+      thinkingLevelDisabled={thinkingLevelDisabled}
+      useDraftThinkingDefault={isNew && !sessionIdRef.current}
       onThinkingLevelChange={session || isNew ? handleThinkingLevelChange : undefined}
       toolPreset={toolPreset}
       sessionToolPreset={sessionToolPreset}

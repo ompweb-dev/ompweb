@@ -315,6 +315,8 @@ export interface ModelChangeEntry extends SessionEntryBase {
   model?: string;
   /** Model role ("default", "smol", ...); undefined means "default". */
   role?: string;
+  /** True on a retry-fallback hop, false when the primary model returns. */
+  resolvedModelIsFallback?: boolean;
   /** Legacy pi format kept for pre-migration files. */
   provider?: string;
   modelId?: string;
@@ -530,6 +532,9 @@ export interface SessionContext {
   messages: AgentMessage[];
   entryIds: string[]; // parallel to messages — the session entry id for each message
   thinkingLevel: string;
+  /** Unlike the compatibility field above, absent when no effective level was recorded. */
+  observedThinkingLevel?: string;
+  configuredThinkingLevel?: string;
   model: { provider: string; modelId: string } | null;
   /** Latest persisted todo snapshot on the selected session branch. */
   todoPhases: TodoPhase[];

@@ -25,6 +25,7 @@ import { hasHoldableAssistantContent, hasVisibleAssistantContent } from "@/lib/a
 import type { ThinkingModelMeta } from "@/lib/thinking-levels";
 import { HostOfflineError, TransportLostError, getOutboxScope, rememberOutboxScope, sendAgentCommand, setSessionAdvisorSpawn } from "@/lib/agent-client";
 import type { HostStatus } from "@/lib/hosts/host";
+import type { SessionReadValue } from "@/lib/hosts/session-ops";
 import type { WorkspaceFileSource } from "@/lib/workspace-types";
 import { newChatDraftKey, remoteHostId } from "@/lib/project-ordering";
 import { clearDraft, getDraft, mergeRecoveredText, recoverDraft, setDraft, toDraftImages, type ChatDraft, type ChatDraftImage } from "@/lib/draft-store";
@@ -305,6 +306,27 @@ function toastStoppedSend(error: unknown, promptIssued = true): boolean | null {
   return error.mayHaveRun && promptIssued;
 }
 
+// Older history and web-state payloads use "off" when omp never reported a level.
+function observedLevel(source?: Pick<AgentStateResponse, "thinkingLevel" | "observedThinkingLevel">): string | undefined {
+  return source?.observedThinkingLevel ?? (source?.thinkingLevel !== "off" ? source?.thinkingLevel : undefined);
+}
+
+async function readSessionMetadata(sid: string): Promise<Pick<SessionReadValue, "info" | "leafId"> | undefined> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?meta=1`);
+    return res.ok ? await res.json() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function thinkingDeliveryUnknown(error: unknown): boolean {
+  if (error instanceof HostOfflineError) return error.mayHaveRun;
+  if (error instanceof TransportLostError || error instanceof TypeError) return true;
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"
+    || ("code" in error && (error.code === "thinking_level_timeout" || error.code === "session_unresponsive")));
+}
+
 /** The held `!` runs omp has not recorded yet. A recorded run is a run of the
  * command stamped after `after`, the newest omp stamp this tab had seen when it
  * was sent (both omp's clock, so older runs never match in any view); each
@@ -460,6 +482,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // preference changes, so this never follows toolPreset.
   const [sessionToolPreset, setSessionToolPresetState] = useState<ToolPreset | null>(null);
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevelOption>("auto");
+  const [{ configuredThinkingLevel, observedThinkingLevel }, setSessionThinking] = useState<{
+    configuredThinkingLevel?: string; observedThinkingLevel?: string;
+  }>({});
+  const [thinkingLevelPending, setThinkingLevelPending] = useState(false);
+  const thinkingPendingRef = useRef(false);
+  // A model update need not report a mode or an observation. Only a new
+  // value for the same field, or a real branch change, supersedes its read.
+  const thinkingModeSeqRef = useRef(0);
+  const thinkingObservationSeqRef = useRef(0);
+  const branchRevisionRef = useRef(0);
   const [fastModeEnabled, setFastModeEnabled] = useState(false);
   const [fastModeActive, setFastModeActive] = useState<boolean | undefined>(undefined);
   // `/slow` for the active model, as omp reports it: false whenever the model
@@ -1101,22 +1133,57 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return true;
   }, []);
 
+  const restoreThinking = useCallback((context: SessionContext) => {
+    thinkingModeSeqRef.current += 1;
+    thinkingObservationSeqRef.current += 1;
+    setSessionThinking({ configuredThinkingLevel: context.configuredThinkingLevel, observedThinkingLevel: observedLevel(context) });
+    setThinkingLevel(normalizeThinkingLevel(context.thinkingLevel));
+  }, []);
+
+  const applyThinking = useCallback((mode: unknown, observed: unknown) => {
+    if (catchUp.view().leafId !== null || (typeof mode !== "string" && typeof observed !== "string")) return;
+    if (typeof mode === "string") thinkingModeSeqRef.current += 1;
+    if (typeof observed === "string") thinkingObservationSeqRef.current += 1;
+    setSessionThinking((prev) => ({
+      configuredThinkingLevel: typeof mode === "string" ? mode : prev.configuredThinkingLevel,
+      observedThinkingLevel: typeof observed === "string" ? observed
+        : typeof mode === "string" && mode !== prev.configuredThinkingLevel ? undefined : prev.observedThinkingLevel,
+    }));
+    if (typeof observed === "string") setThinkingLevel(observed);
+  }, [catchUp]);
+
+  const applyLiveThinking = useCallback((state: AgentStateResponse) => {
+    applyThinking(state.configuredThinkingLevel, observedLevel(state));
+  }, [applyThinking]);
+
   // Lightweight live-state sync after composer commands. A command against an
   // idle-disposed session restarts omp, which re-resolves the model from the
   // session file — the freshly resolved model (and clamped thinking level)
   // must reach the composer so the ladder/active level match reality.
-  const refreshLiveModelState = useCallback(async (sid: string) => {
+  const refreshLiveModelState = useCallback(async (sid: string, confirmThinking = false, confirmedInitialThinking?: string) => {
     const token = beginAuthoritativeModelSync();
+    const branch = branchRevisionRef.current;
+    const observationToken = thinkingObservationSeqRef.current;
+    const modeToken = confirmThinking ? ++thinkingModeSeqRef.current : undefined;
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
-      if (!res.ok) return;
-      const agentState = await res.json() as { running: boolean; state?: AgentStateResponse };
-      if (!hookAliveRef.current || sessionIdRef.current !== sid) return;
-      const applied = applyAuthoritativeModel(toThinkingModelMeta(agentState.state?.model), token);
-      if (!applied) return; // stale snapshot — drop its thinking level too
-      if (agentState.state?.thinkingLevel !== undefined) {
-        setThinkingLevel(normalizeThinkingLevel(agentState.state.thinkingLevel));
-      }
+      const [agentState, metadata] = await Promise.all([
+        fetch(`/api/sessions/${encodeURIComponent(sid)}/state`).then((res) => res.ok ? res.json() as Promise<{ running: boolean; state?: AgentStateResponse }> : null).catch(() => null),
+        confirmThinking ? readSessionMetadata(sid) : undefined,
+      ]);
+      if (!hookAliveRef.current || sessionIdRef.current !== sid || branchRevisionRef.current !== branch) return;
+      const modelCurrent = token === authoritativeModelSeqRef.current;
+      if (catchUp.view().leafId === null && modeToken === thinkingModeSeqRef.current) {
+        const info = metadata?.info;
+        const configured = agentState?.state?.configuredThinkingLevel ?? info?.configuredThinkingLevel ?? (!metadata ? confirmedInitialThinking : undefined);
+        const observationCurrent = observationToken === thinkingObservationSeqRef.current;
+        const observed = observedLevel(agentState?.state) ?? observedLevel(info);
+        setSessionThinking((prev) => ({ configuredThinkingLevel: configured,
+          observedThinkingLevel: observationCurrent ? observed : prev.observedThinkingLevel }));
+        if (observationCurrent && observed !== undefined) setThinkingLevel(observed);
+      } else if (!confirmThinking && modelCurrent && agentState?.state) applyLiveThinking(agentState.state);
+      if (!modelCurrent) return;
+      if (agentState) applyAuthoritativeModel(toThinkingModelMeta(agentState.state?.model), token);
+      if (!agentState) return;
       // Fast mode is family-scoped in omp: switching to a fast-supported
       // model flips the child's state without any event, so the composer
       // toggle must re-sync from the refreshed state.
@@ -1137,21 +1204,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch {
       // Best effort; the next loadSession/reconcile re-syncs.
     }
-  }, [applyAuthoritativeModel, beginAuthoritativeModelSync]);
+  }, [applyAuthoritativeModel, applyLiveThinking, beginAuthoritativeModelSync, catchUp]);
 
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, fenceRunId?: number) => {
     const requestSeq = ++contextRequestSeqRef.current;
     catchUp.invalidate();
     const requestRun = promptRunIdRef.current;
     const position = catchUp.position();
-    const metadataVersion = authoritativeModelSeqRef.current;
+    const metadataVersion = includeState ? beginAuthoritativeModelSync() : authoritativeModelSeqRef.current;
     let messagesLoaded = false;
     const isInitialHydration = showLoading && includeState;
     if (isInitialHydration) initialHydrationPendingRef.current = true;
     // The web-owned outbox remains available when its host cannot serve the transcript.
     // Capture live-state revisions before either read can be overtaken by a newer update.
     const stateRequest = includeState ? {
-      token: beginAuthoritativeModelSync(),
+      token: metadataVersion,
       queueRevision: ++queueSeqRef.current,
       response: fetch(`/api/sessions/${encodeURIComponent(sid)}/state`).then(async (stateRes) => {
         const agentState = await stateRes.json().catch(() => ({})) as { running: boolean; state?: AgentStateResponse; exited?: ExitedRpcSession; outbox?: OutboxEntry[]; outboxScope?: string; outboxSettledIds?: string[]; nativeSettledIds?: string[] };
@@ -1239,7 +1306,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (liveState) {
           if (liveState.contextUsage !== undefined) setContextUsage(liveState.contextUsage ?? null);
           if (liveState.systemPrompt !== undefined) setSystemPrompt(liveState.systemPrompt || null);
-          if (modelApplied && liveState.thinkingLevel !== undefined) setThinkingLevel(normalizeThinkingLevel(liveState.thinkingLevel));
+          if (modelApplied) applyLiveThinking(liveState);
           if (liveState.fastModeEnabled !== undefined) setFastModeEnabled(liveState.fastModeEnabled);
           setFastModeActive(liveState.fastModeActive);
           setSlowModeSupported(agentState.running ? (liveState.slowModeSupported ?? false) : undefined);
@@ -1282,11 +1349,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // Ensure the flag is cleared even if the pre-state early-return path was taken
       if (showLoading && includeState && !messagesLoaded) initialHydrationPendingRef.current = false;
     }
-  }, [catchUp, refreshSubagentHistory, applyAuthoritativeModel, beginAuthoritativeModelSync, applyQueueStateSnapshot]);
+  }, [catchUp, refreshSubagentHistory, applyAuthoritativeModel, applyLiveThinking, beginAuthoritativeModelSync, applyQueueStateSnapshot]);
 
-  const loadContext = useCallback(async (sid: string, leafId: string | null, includePreCompaction = false): Promise<boolean> => {
+  const loadContext = useCallback(async (sid: string, leafId: string | null, includePreCompaction = false, verifyTip = false): Promise<boolean> => {
     const seq = ++contextRequestSeqRef.current;
     const runId = promptRunIdRef.current;
+    const changingBranch = catchUp.view().leafId !== leafId;
+    if (changingBranch) branchRevisionRef.current += 1;
+    const metadataVersion = authoritativeModelSeqRef.current;
     catchUp.select({ leafId, includePreCompaction });
     setEchoedUserMessage(null);
     setShowCorrelatedMessages(!leafId);
@@ -1298,13 +1368,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (leafId) params.set("leafId", leafId);
       if (includePreCompaction) params.set("includePreCompaction", "1");
       const url = `/api/sessions/${encodeURIComponent(sid)}/context?${params}`;
-      const res = await fetch(url);
+      const [res, metadata] = await Promise.all([fetch(url), verifyTip && leafId ? readSessionMetadata(sid) : undefined]);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as Pick<SessionData, "context">;
       // Fence like loadSession: drop the response if the session changed or a
       // newer navigate started while this request was in flight.
       if (!hookAliveRef.current || sessionIdRef.current !== sid || contextRequestSeqRef.current !== seq || promptRunIdRef.current !== runId) return false;
+      // The navigator sends a concrete entry even for the native tip. Keep
+      // other branches read-only, including when the current tip is unreadable.
+      const selectedTip = leafId !== null && metadata?.leafId === leafId;
+      if (selectedTip) {
+        branchRevisionRef.current += 1;
+        catchUp.select({ leafId: null, includePreCompaction });
+      }
       catchUp.seed(d.context, position);
+      if (selectedTip || (changingBranch && (leafId !== null || metadataVersion === authoritativeModelSeqRef.current))) restoreThinking(d.context);
       setShowPreCompactionHistory(includePreCompaction);
       void catchUp.request();
     } catch (e) {
@@ -1312,7 +1390,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       return false;
     }
     return true;
-  }, [catchUp, eventCoalescer]);
+  }, [catchUp, eventCoalescer, restoreThinking]);
 
   const reloadActiveSessionHistory = useCallback((sid: string) => {
     catchUp.select({ leafId: null, includePreCompaction: false });
@@ -1360,13 +1438,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // Assigned after connectEvents is defined. A runtime created for an empty
   // chat emits its startup frames before any stream exists, so it must be
   // observed (and its state snapshot recovered on stream open) right away.
-  const observeCreatedSessionRef = useRef<((sid: string) => void) | null>(null);
+  const observeCreatedSessionRef = useRef<((sid: string, confirmedInitialThinking?: string) => void) | null>(null);
 
   const ensureNewSession = useCallback(async () => {
     if (sessionIdRef.current) return sessionIdRef.current;
     if (!isNew) return sessionIdRef.current;
     if ((newSessionCreationId || newSessionPoolId || newSessionProjectId) && !pooled) throw new Error(translate("agentSession.invalidPoolTarget"));
     if (ensuringNewSessionRef.current) return ensuringNewSessionRef.current;
+    setThinkingLevelPending(true);
 
     const promise = (async () => {
       const selectedModel = newSessionModel ?? newSessionDefaultModel;
@@ -1434,7 +1513,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // A prompt or side question that created this runtime attaches its own stream,
       // which would only replace an observer attached here.
       if (hookAliveRef.current && !promptDispatchPendingRef.current && !btwAskPendingRef.current) {
-        observeCreatedSessionRef.current?.(realId);
+        const submitted = pooled ? JSON.parse(creationBodyRef.current!.json) as { thinkingLevel?: string } : request;
+        observeCreatedSessionRef.current?.(realId, res.ok ? submitted.thinkingLevel : undefined);
       }
       if (offline) {
         if (hookAliveRef.current && !pooled) promoteNewSession();
@@ -1455,6 +1535,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       return await promise;
     } finally {
       ensuringNewSessionRef.current = null;
+      if (hookAliveRef.current) setThinkingLevelPending(false);
     }
   }, [advisorEnabled, isNew, pooled, newSessionCwd, newSessionHostId, newSessionCreationId, newSessionPoolId, newSessionProjectId, newSessionInitialization, onNewSessionInitialization, newSessionModel, newSessionDefaultModel, toolPreset, thinkingLevel, promoteNewSession, addNotice]);
 
@@ -1612,7 +1693,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
    * the session may have no wrapper yet (the server opens the channel for its held messages alone, docs/specs/
    * 2026-11-04-message-outbox-design.md): do everything that talks to omp only on `connected`, which comes once one
    * is attached, since any command would start one. */
-  const connectEvents = useCallback((sid: string, restoreWrapper: boolean | "connected" = false): Promise<EventStreamConnectionResult | null> => {
+  const connectEvents = useCallback((sid: string, restoreWrapper: boolean | "connected" = false, readInitialThinking: boolean | string = false): Promise<EventStreamConnectionResult | null> => {
     // An awaited RPC can finish after its chat unmounted. No continuation may
     // acquire an observer once this instance's lifetime cleanup has run.
     if (!hookAliveRef.current || sessionIdRef.current !== sid) return Promise.resolve(null);
@@ -1636,6 +1717,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return new Promise((resolve) => {
       let settled = false;
       let restored = false;
+      let resuming = restoreWrapper !== false || readInitialThinking;
       const restore = () => {
         if (!restoreWrapper || restored || !hookAliveRef.current || sessionIdRef.current !== sid
           || promptRunIdRef.current !== runId || eventSourceRef.current !== es) return;
@@ -1657,6 +1739,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // resets retry backoff and catches up the persisted transcript.
       const attached = () => {
         restore();
+        if (resuming && !thinkingPendingRef.current && !catchUp.view().leafId) void refreshLiveModelState(sid, true, typeof readInitialThinking === "string" ? readInitialThinking : undefined);
+        readInitialThinking = false;
+        resuming = false;
         void catchUp.request();
         // Side questions: omp re-reads the persisted history on stream open, so
         // a snapshot here catches topics asked in the terminal or another tab.
@@ -1728,6 +1813,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       es.onerror = () => {
         // The server rejected this chat's pending host tools when its subscription left (rejectPendingHostTools), and
         // the cancel it emitted had no listener: withdraw them here so nothing answers or opens a settled call.
+        resuming = true;
         if (eventSourceRef.current === es) {
           for (const controller of pendingHostToolControllersRef.current.values()) controller.abort();
         }
@@ -1760,10 +1846,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // connection must be ready before they continue.
       };
     });
-}, [applyBtwFrame, catchUp, clearLiveToolResults, eventCoalescer, refreshBtwHistory, refreshAgentSnapshots]);
-  observeCreatedSessionRef.current = (sid: string) => {
+  }, [applyBtwFrame, catchUp, clearLiveToolResults, eventCoalescer, refreshBtwHistory, refreshAgentSnapshots, refreshLiveModelState]);
+  observeCreatedSessionRef.current = (sid: string, confirmedInitialThinking?: string) => {
     if (!hookAliveRef.current || sessionIdRef.current !== sid || eventSourceRef.current) return;
-    void connectEvents(sid);
+    void connectEvents(sid, false, confirmedInitialThinking ?? true);
   };
   applyStateOutboxRef.current = (sid, entries, settledIds, nativeSettledIds) => {
     // A channel snapshot is newer than any HTTP answer.
@@ -2813,10 +2899,30 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         break;
       }
-      case "thinking_level_changed":
+      case "thinking_level_changed": {
+        const mode = event.configuredThinkingLevel ?? event.configured;
+        const observed = event.thinkingLevel;
+        if (catchUp.view().leafId !== null) break;
         authoritativeModelSeqRef.current += 1;
-        setThinkingLevel(normalizeThinkingLevel(event.thinkingLevel as string | undefined));
+        applyThinking(mode, observed);
+        // Native fixed picks omit configured; a clear may omit both fields.
+        // Only the persisted summary distinguishes a pin from an observation.
+        const sid = sessionIdRef.current;
+        if (typeof mode !== "string" && sid) {
+          const modeToken = ++thinkingModeSeqRef.current;
+          const branch = branchRevisionRef.current;
+          const observationToken = thinkingObservationSeqRef.current;
+          void readSessionMetadata(sid).then((metadata) => {
+            if (!hookAliveRef.current || sessionIdRef.current !== sid || branchRevisionRef.current !== branch || thinkingModeSeqRef.current !== modeToken) return;
+            const restoreObservation = typeof observed !== "string" && thinkingObservationSeqRef.current === observationToken;
+            const recorded = observedLevel(metadata?.info);
+            setSessionThinking((prev) => ({ configuredThinkingLevel: metadata?.info?.configuredThinkingLevel,
+              observedThinkingLevel: restoreObservation ? recorded : prev.observedThinkingLevel }));
+            if (restoreObservation) setThinkingLevel(normalizeThinkingLevel(recorded));
+          });
+        }
         break;
+      }
       case "model_changed": {
         // Bare event: omp switched the resolved model (explicit /model,
         // retry-fallback, prewalk hand-off). No payload — sync from state.
@@ -2830,7 +2936,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             if (sessionIdRef.current !== sid) return;
             const applied = applyAuthoritativeModel(toThinkingModelMeta(d.state.model), token);
             if (!applied) return; // stale snapshot — drop its thinking level too
-            if (d.state.thinkingLevel !== undefined) setThinkingLevel(normalizeThinkingLevel(d.state.thinkingLevel));
+            applyLiveThinking(d.state);
             if (d.state.fastModeEnabled !== undefined) setFastModeEnabled(d.state.fastModeEnabled);
             setFastModeActive(d.state.fastModeActive);
             setSlowModeSupported(d.state.slowModeSupported ?? false);
@@ -2851,8 +2957,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // config-affecting slash command (e.g. /model).
         const model = event.model as { provider?: string; id?: string; name?: string; reasoning?: boolean; thinking?: { efforts?: string[] } } | undefined;
         if (model) applyAuthoritativeModel(toThinkingModelMeta(model));
-        else if (event.thinkingLevel !== undefined) authoritativeModelSeqRef.current += 1;
-        if (event.thinkingLevel !== undefined) setThinkingLevel(normalizeThinkingLevel(event.thinkingLevel as string | undefined));
+        else if (event.thinkingLevel !== undefined || event.configuredThinkingLevel !== undefined || event.configured !== undefined) authoritativeModelSeqRef.current += 1;
+        applyThinking(event.configuredThinkingLevel ?? event.configured, event.thinkingLevel);
         break;
       }
       case "available_commands_update": {
@@ -3227,17 +3333,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         handleExtensionUiFrame(event as unknown as UiPresentationFrame);
         break;
     }
-  }, [addNotice, addUnconfirmedRunErrorNotice, catchUp, eventCoalescer, clearLiveToolResults, clearTerminalReconcileTimer, endExtensionDialog, finishPromptWithoutStream, handleExtensionUiFrame, handleHostToolCall, handleHostUriRequest, loadSession, reloadActiveSessionHistory, mergeSubagents, onAgentEnd, openExtensionDialog, receiveCorrelatedMessage, reconcileAgentState, refreshLiveModelState, refreshSubagentRoster, resetSubagentActivityState, applyAuthoritativeModel, beginAuthoritativeModelSync, setCompacting, setLiveToolResult, surfaceQuotaOnStream, updateQueuedMessages, applyQueueStateSnapshot]);
+  }, [addNotice, addUnconfirmedRunErrorNotice, catchUp, eventCoalescer, clearLiveToolResults, clearTerminalReconcileTimer, endExtensionDialog, finishPromptWithoutStream, handleExtensionUiFrame, handleHostToolCall, handleHostUriRequest, loadSession, reloadActiveSessionHistory, mergeSubagents, onAgentEnd, openExtensionDialog, receiveCorrelatedMessage, reconcileAgentState, refreshLiveModelState, refreshSubagentRoster, resetSubagentActivityState, applyAuthoritativeModel, applyThinking, applyLiveThinking, beginAuthoritativeModelSync, setCompacting, setLiveToolResult, surfaceQuotaOnStream, updateQueuedMessages, applyQueueStateSnapshot]);
   handleAgentEventRef.current = handleAgentEvent;
   syncActionsRef.current = {
     metadata: (context, version, hasLive = liveModelMeta !== null || currentModelOverride !== null) => {
-      if (version !== authoritativeModelSeqRef.current || modelCommandPendingRef.current > 0
-        || agentRunningRef.current || hasLive || (isNew && pendingModel)) return;
-      // A current file-only snapshot is authoritative again after its wrapper
-      // disappears; a newer/pending RPC choice must never be rolled back.
+      const selectedBranch = catchUp.view().leafId !== null;
+      if (selectedBranch) {
+        restoreThinking(context);
+        return;
+      }
+      if (version !== authoritativeModelSeqRef.current || modelCommandPendingRef.current > 0 || agentRunningRef.current || hasLive || (isNew && pendingModel)) return;
+      restoreThinking(context);
+      // A current file-only snapshot is authoritative again after its wrapper disappears.
       setLiveModelMeta(null);
       setCurrentModelOverride(null);
-      setThinkingLevel(normalizeThinkingLevel(context.thinkingLevel));
     },
     subscribe: (force) => {
       const sid = sessionIdRef.current;
@@ -3984,7 +4093,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setActiveLeafId(leafId);
     const sid = sessionIdRef.current;
     if (!sid) return;
-    await loadContext(sid, leafId);
+    await loadContext(sid, leafId, false, true);
   }, [loadContext]);
 
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
@@ -4142,22 +4251,41 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice, refreshLiveModelState]);
 
-  /** Cycle to the next thinking level (⌘/Ctrl+Alt+T). */
-  const handleCycleThinkingLevel = useCallback(async () => {
+  // Hotkeys and picker commits share delivery, ownership and read-back rules.
+  const changeThinking = useCallback(async (level?: ThinkingLevelOption) => {
+    if (catchUp.view().leafId !== null || ensuringNewSessionRef.current || thinkingPendingRef.current) return;
     const sid = sessionIdRef.current;
-    if (!sid) return;
+    if (!sid) {
+      if (level !== undefined) setThinkingLevel(level);
+      return;
+    }
+    if (level !== undefined && configuredThinkingLevel === level) return;
+    const branch = branchRevisionRef.current;
+    const current = () => hookAliveRef.current && sessionIdRef.current === sid && branchRevisionRef.current === branch;
+    thinkingPendingRef.current = true;
+    setThinkingLevelPending(true);
+    thinkingModeSeqRef.current += 1;
     authoritativeModelSeqRef.current += 1;
     modelCommandPendingRef.current += 1;
     try {
-      await sendAgentCommand(sid, { type: "cycle_thinking_level" });
-      await refreshLiveModelState(sid);
-    } catch (error) {
-      console.error("Failed to cycle thinking level:", error);
-      addNotice({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      try {
+        await sendAgentCommand(sid, level === undefined ? { type: "cycle_thinking_level" } : { type: "set_thinking_level", level });
+      } catch (error) {
+        if (!current()) return;
+        if (!thinkingDeliveryUnknown(error)) {
+          addNotice({ type: "error", message: error instanceof Error ? error.message : String(error) });
+          return;
+        }
+        addNotice({ type: "warning", message: translate("agentSession.thinkingChangeUnconfirmed") });
+      }
+      if (current()) await refreshLiveModelState(sid, true);
     } finally {
       modelCommandPendingRef.current -= 1;
+      thinkingPendingRef.current = false;
+      if (hookAliveRef.current) setThinkingLevelPending(false);
     }
-  }, [addNotice, refreshLiveModelState]);
+  }, [addNotice, catchUp, configuredThinkingLevel, refreshLiveModelState]);
+  const handleCycleThinkingLevel = useCallback(() => changeThinking(), [changeThinking]);
 
   /** Stop an in-progress automatic retry from the retry banner. */
   const handleAbortRetry = useCallback(async () => {
@@ -4502,23 +4630,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       console.error("Failed to abort compaction:", e);
     }
   }, []);
-
-  const handleThinkingLevelChange = useCallback(async (level: ThinkingLevelOption) => {
-    authoritativeModelSeqRef.current += 1;
-    setThinkingLevel(level);
-    if (level === "auto") return; // "auto" leaves pi's current setting untouched
-    modelCommandPendingRef.current += 1;
-    try {
-      const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
-      if (!sid) return;
-      await sendAgentCommand(sid, { type: "set_thinking_level", level });
-      await refreshLiveModelState(sid);
-    } catch (e) {
-      console.error("Failed to set thinking level:", e);
-    } finally {
-      modelCommandPendingRef.current -= 1;
-    }
-  }, [refreshLiveModelState]);
 
   const handleToolPresetChange = useCallback(async (preset: ToolPreset) => {
     setToolPresetState(preset);
@@ -4953,6 +5064,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     // State
     data, loading, error, activeLeafId, messages, entryIds, showPreCompactionHistory, streamState,
     agentRunning, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, sessionToolPreset, thinkingLevel, fastModeEnabled, fastModeActive, slowModeSupported, slowModeEnabled, slowModeScope, usageLimit, autoRetryEnabled, interruptMode, autoCompactionEnabled, steeringMode, followUpMode,
+    configuredThinkingLevel: isNew && !sessionIdRef.current ? thinkingLevel : configuredThinkingLevel,
+    observedThinkingLevel, thinkingLevelPending, thinkingLevelDisabled: thinkingLevelPending || catchUp.view().leafId !== null,
     liveModelMeta,
     retryInfo, contextUsage, systemPrompt, forkingEntryId, editingEntryId,
     isCompacting, compactError, compactResult, tokensPerSecond, currentModel, displayModel, isAutoModelSelection: !displayModel, sessionStats, agentPhase,
@@ -4971,7 +5084,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     handleCompact, handleHandoff, handleSteer, handleFollowUp, handleAbortCompaction,
     heldMessages, deleteHeldMessage, retryHeldMessage,
     handleBuiltinSlashCommand, togglePreCompactionHistory,
-    handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, removeQueuedMessage, promoteQueuedToSteer, setActiveLeafId, setData, setMessages,
+    handleToolPresetChange, handleThinkingLevelChange: changeThinking, loadSlashCommands, removeQueuedMessage, promoteQueuedToSteer, setActiveLeafId, setData, setMessages,
     dispatch, setAgentRunning, setForkingEntryId,
     resolveUploadHost,
     btw, askBtw,

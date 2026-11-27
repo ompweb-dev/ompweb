@@ -32,7 +32,7 @@ export function commandErrorResponse(error: unknown): Response {
   }
   // host_offline falls through to apiErrorResponse: 503 {hostOffline: true}.
   if (error instanceof WebRpcError && error.code !== "host_offline") {
-    return Response.json({ error: error.message, code: error.code }, { status: 400 });
+    return Response.json({ error: error.message, code: error.code }, { status: error.code === "thinking_level_timeout" ? 504 : 400 });
   }
   if (error instanceof RpcCommandError) {
     return Response.json({ error: error.message, code: error.code ?? "rpc_command_failed" }, { status: 400 });
@@ -88,7 +88,9 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
     }
     if (prior) await prior;
     const send = async (session: AgentSessionWrapper) => {
-      const options = trustedOrigin ? { origin: trustedOrigin } : undefined;
+      const options = type === "set_thinking_level" || type === "cycle_thinking_level"
+        ? { preserveUnknownDelivery: true, origin: trustedOrigin }
+        : trustedOrigin ? { origin: trustedOrigin } : undefined;
       if (!uploads) return session.send(command, options);
       return session.withPendingCommand(async () => {
         let sending: Promise<unknown>;

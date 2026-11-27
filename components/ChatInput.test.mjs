@@ -12,13 +12,13 @@ test("provider-defined reasoning levels appear once in the trigger", () => {
     const html = renderToStaticMarkup(React.createElement(ChatInput, {
       async onSend() { return { status: "accepted" }; },
       onThinkingLevelChange() {},
-      thinkingLevel,
+      configuredThinkingLevel: thinkingLevel,
       isStreaming: false,
     }));
     const dom = new JSDOM(html);
     try {
       const trigger = dom.window.document.querySelector(".composer-thinking-control > button");
-      assert.equal(trigger.textContent, thinkingLevel);
+      assert.equal(trigger.textContent, `Fixed: ${thinkingLevel}`);
       assert.ok(trigger.getAttribute("aria-label").endsWith(`: ${thinkingLevel}`));
     } finally {
       dom.window.close();

@@ -24,7 +24,7 @@ async function renderComposer(t, props = {}) {
   const view = render(React.createElement(ChatInput, {
     async onSend(message) { sent.push(message); return { status: "accepted" }; },
     onThinkingLevelChange() {},
-    thinkingLevel: "auto",
+    configuredThinkingLevel: "auto",
     isStreaming: false,
     ...props,
   }));

@@ -7,6 +7,7 @@ import type {
   CustomMessage,
   ExtensionStatusItem,
   ExtensionWidgetItem,
+  SessionContext,
   SessionTreeNode,
 } from "@/lib/types";
 import type { EventStream } from "@/lib/event-stream";
@@ -27,13 +28,7 @@ export interface SessionData {
   filePath: string;
   tree: SessionTreeNode[];
   leafId: string | null;
-  context: {
-    messages: AgentMessage[];
-    entryIds: string[];
-    thinkingLevel: string;
-    model: { provider: string; modelId: string } | null;
-    todoPhases: TodoPhase[];
-  };
+  context: SessionContext;
 }
 
 export interface StreamingState {
@@ -181,6 +176,8 @@ export type AgentStateResponse = {
   contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;
   systemPrompt?: string;
   thinkingLevel?: string;
+  observedThinkingLevel?: string;
+  configuredThinkingLevel?: string;
   fastModeEnabled?: boolean;
   fastModeActive?: boolean;
   slowModeSupported?: boolean;

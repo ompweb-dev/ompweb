@@ -68,6 +68,8 @@ function navigationShape(value: SessionReadValue): SessionReadValue {
       ...value.info,
       model: value.context.model,
       thinkingLevel: value.context.thinkingLevel,
+      observedThinkingLevel: value.context.observedThinkingLevel,
+      configuredThinkingLevel: value.context.configuredThinkingLevel,
     },
     context: null,
   };
