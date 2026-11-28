@@ -501,6 +501,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // Separate from thinkingLevelPending: the branch-to-live confirmation must not be released early by the
   // finally in ensureNewSession or changeThinking.
   const [branchConfirmPending, setBranchConfirmPending] = useState(false);
+  const branchConfirmPendingRef = useRef(false);
   const thinkingPendingRef = useRef(false);
   // A model update need not report a mode or an observation. Only a new
   // value for the same field, or a real branch change, supersedes its read.
@@ -3546,6 +3547,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // The branch's recorded level is not the live session's. Keep both thinking controls closed until the live
         // level is confirmed: otherwise a pick of the branch's own mode matches the stale baseline, returns early,
         // and never sends set_thinking_level. The wait is bounded so a stalled read cannot leave the picker disabled.
+        branchConfirmPendingRef.current = true;
         setBranchConfirmPending(true);
         void (async () => {
           try {
@@ -3557,6 +3559,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
               delay(THINKING_CONFIRM_TIMEOUT_MS),
             ]);
           } finally {
+            branchConfirmPendingRef.current = false;
             if (hookAliveRef.current) setBranchConfirmPending(false);
           }
         })();
@@ -4287,7 +4290,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   // Hotkeys and picker commits share delivery, ownership and read-back rules.
   const changeThinking = useCallback(async (level?: ThinkingLevelOption) => {
-    if (catchUp.view().leafId !== null || ensuringNewSessionRef.current || thinkingPendingRef.current) return;
+    if (catchUp.view().leafId !== null || ensuringNewSessionRef.current || thinkingPendingRef.current || branchConfirmPendingRef.current) return;
     const sid = sessionIdRef.current;
     if (!sid) {
       if (level !== undefined) setThinkingLevel(level);

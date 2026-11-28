@@ -6559,6 +6559,9 @@ test("the thinking picker stays closed until a branch send's live level is confi
   await act(async () => { await w.latest.handleSend("next prompt"); await sleep(20); });
   assert.equal(w.latest.thinkingLevelPending, false, "the branch gate is not the thinking-command flag");
   assert.equal(w.latest.thinkingLevelDisabled, true, "the branch's mode is not selectable as the live baseline");
+  await act(async () => { await w.latest.handleCycleThinkingLevel(); });
+  assert.equal(callsTo("POST", "/api/agent/s1").filter(({ body }) => ["set_thinking_level", "cycle_thinking_level"].includes(body?.type)).length, 0,
+    "the cycle hotkey cannot act on the branch's stale mode either");
   await act(async () => { state.release({ running: true, state: { configuredThinkingLevel: "auto", thinkingLevel: "low" } }); await sleep(30); });
   assert.equal(w.latest.thinkingLevelDisabled, false);
   assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["auto", "low"]);
