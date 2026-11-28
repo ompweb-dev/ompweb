@@ -810,6 +810,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     metadata: (context: SessionContext, version: number, hasLive?: boolean) => void;
   } | null>(null);
   const catchUpRef = useRef<SessionCatchUp | null>(null);
+  const confirmedViewRef = useRef({ leafId: null as string | null, includePreCompaction: false, activeLeafId: null as string | null });
   if (catchUpRef.current === null) {
     catchUpRef.current = createSessionCatchUp({
       sessionId: () => sessionIdRef.current,
@@ -818,6 +819,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       scope: () => hookAliveRef.current && !editInFlightRef.current ? `${sessionIdRef.current}:${promptRunIdRef.current}:${contextRequestSeqRef.current}` : null,
       metadataVersion: () => authoritativeModelSeqRef.current,
       history: (context, leafId, metadata) => {
+        confirmedViewRef.current = { ...(catchUpRef.current?.view() ?? { leafId: null, includePreCompaction: false }), activeLeafId: leafId };
+        setShowPreCompactionHistory(confirmedViewRef.current.includePreCompaction);
         const pending = unconfirmedErrorNoticeRef.current;
         if (pending && sessionIdRef.current === pending.sessionId && promptRunIdRef.current === pending.runId
           && responseRunVersionRef.current === pending.responseVersion && !catchUpRef.current?.view().leafId) {
@@ -1230,6 +1233,32 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [applyAuthoritativeModel, applyLiveThinking, beginAuthoritativeModelSync, catchUp]);
 
+  const confirmBranchLiveThinking = useCallback(async (sid: string, catchUpFirst = false) => {
+    const branch = branchRevisionRef.current;
+    const confirmation = Symbol();
+    branchConfirmationRef.current = confirmation;
+    setBranchConfirmPending(true);
+    setSessionThinking({});
+    const deadline = thinkingConfirmDeadline();
+    const isCurrent = () => !deadline.signal.aborted && branchConfirmationRef.current === confirmation
+      && hookAliveRef.current && sessionIdRef.current === sid && branchRevisionRef.current === branch;
+    try {
+      await Promise.race([
+        (async () => {
+          if (catchUpFirst) await catchUp.request();
+          await refreshLiveModelState(sid, true, undefined, { signal: deadline.signal, isCurrent });
+        })(),
+        new Promise<void>((resolve) => deadline.signal.addEventListener("abort", () => resolve(), { once: true })),
+      ]);
+    } finally {
+      deadline.cancel();
+      if (branchConfirmationRef.current === confirmation) {
+        branchConfirmationRef.current = null;
+        if (hookAliveRef.current) setBranchConfirmPending(false);
+      }
+    }
+  }, [catchUp, refreshLiveModelState]);
+
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, fenceRunId?: number) => {
     const requestSeq = ++contextRequestSeqRef.current;
     catchUp.invalidate();
@@ -1380,41 +1409,62 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const runId = promptRunIdRef.current;
     const changingBranch = catchUp.view().leafId !== leafId;
     if (changingBranch) branchRevisionRef.current += 1;
-    const metadataVersion = authoritativeModelSeqRef.current;
+    const current = () => hookAliveRef.current && sessionIdRef.current === sid
+      && contextRequestSeqRef.current === seq && promptRunIdRef.current === runId;
     catchUp.select({ leafId, includePreCompaction });
     setEchoedUserMessage(null);
     setShowCorrelatedMessages(!leafId);
     const position = catchUp.position();
     eventCoalescer.reset();
     dispatch({ type: "reset" });
+    const deadline = thinkingConfirmDeadline();
+    const expired = new Promise<never>((_, reject) => deadline.signal.addEventListener("abort",
+      () => reject(new Error("History request timed out")), { once: true }));
+    const metadataRequest = verifyTip && leafId
+      ? Promise.race([readSessionMetadata(sid, deadline.signal), expired]).catch(() => undefined)
+      : Promise.resolve(undefined);
     try {
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
       if (leafId) params.set("leafId", leafId);
       if (includePreCompaction) params.set("includePreCompaction", "1");
-      const url = `/api/sessions/${encodeURIComponent(sid)}/context?${params}`;
-      const [res, metadata] = await Promise.all([fetch(url), verifyTip && leafId ? readSessionMetadata(sid) : undefined]);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as Pick<SessionData, "context">;
-      // Fence like loadSession: drop the response if the session changed or a
-      // newer navigate started while this request was in flight.
-      if (!hookAliveRef.current || sessionIdRef.current !== sid || contextRequestSeqRef.current !== seq || promptRunIdRef.current !== runId) return false;
-      // The navigator sends a concrete entry even for the native tip. Keep
-      // other branches read-only, including when the current tip is unreadable.
+      const d = await Promise.race([
+        fetch(`/api/sessions/${encodeURIComponent(sid)}/context?${params}`, { signal: deadline.signal }).then(async (res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return await res.json() as Pick<SessionData, "context">;
+        }), expired,
+      ]);
+      if (!current()) return false;
+      const context = catchUp.seed(d.context, position);
+      if (leafId !== null) restoreThinking(context);
+      setShowPreCompactionHistory(includePreCompaction);
+      const metadata = await metadataRequest;
+      if (!current()) return false;
       const selectedTip = leafId !== null && metadata?.leafId === leafId;
       if (selectedTip) {
         branchRevisionRef.current += 1;
         catchUp.select({ leafId: null, includePreCompaction });
+        confirmedViewRef.current = { leafId: null, includePreCompaction, activeLeafId: leafId };
+        setActiveLeafId(leafId);
       }
-      const context = catchUp.seed(d.context, position);
-      if (selectedTip || (changingBranch && (leafId !== null || metadataVersion === authoritativeModelSeqRef.current))) restoreThinking(context);
-      setShowPreCompactionHistory(includePreCompaction);
-      void catchUp.request();
+      deadline.cancel();
+      if (selectedTip || (changingBranch && leafId === null)) await confirmBranchLiveThinking(sid);
+      if (current()) void catchUp.request();
     } catch (e) {
-      console.error("Failed to load context:", e);
+      if (current()) {
+        const view = confirmedViewRef.current;
+        catchUp.select(view);
+        branchRevisionRef.current += 1;
+        setActiveLeafId(view.activeLeafId);
+        setShowCorrelatedMessages(view.leafId === null);
+        addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
+        if (view.leafId === null && leafId !== null) await confirmBranchLiveThinking(sid);
+      }
       return false;
+    } finally {
+      deadline.cancel();
     }
     return true;
-  }, [catchUp, eventCoalescer, restoreThinking]);
+  }, [addNotice, catchUp, eventCoalescer, restoreThinking, confirmBranchLiveThinking]);
 
   const reloadActiveSessionHistory = useCallback((sid: string) => {
     catchUp.select({ leafId: null, includePreCompaction: false });
@@ -1436,7 +1486,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const togglePreCompactionHistory = useCallback(() => {
     const sid = sessionIdRef.current;
     if (!sid || editInFlightRef.current) return;
-    void loadContext(sid, catchUp.view().leafId, !showPreCompactionHistory);
+    void loadContext(sid, catchUp.view().leafId, !showPreCompactionHistory, true);
   }, [catchUp, loadContext, showPreCompactionHistory]);
 
   const promoteNewSession = useCallback((messageCount = 0, firstMessage?: string) => {
@@ -3551,34 +3601,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (catchUp.view().leafId) {
         contextRequestSeqRef.current += 1;
         catchUp.select({ leafId: null, includePreCompaction: catchUp.view().includePreCompaction });
-        const branch = ++branchRevisionRef.current;
-        setSessionThinking({});
-        // The branch's recorded level is not the live session's. Keep both thinking controls closed until the live
-        // level is confirmed: otherwise a pick of the branch's own mode matches the stale baseline, returns early,
-        // and never sends set_thinking_level. The wait is bounded so a stalled read cannot leave the picker disabled.
-        const confirmation = Symbol();
-        branchConfirmationRef.current = confirmation;
-        setBranchConfirmPending(true);
-        const deadline = thinkingConfirmDeadline();
-        const isCurrent = () => !deadline.signal.aborted && branchConfirmationRef.current === confirmation
-          && hookAliveRef.current && sessionIdRef.current === sid && branchRevisionRef.current === branch;
-        void (async () => {
-          try {
-            await Promise.race([
-              (async () => {
-                await catchUp.request();
-                await refreshLiveModelState(sid, true, undefined, { signal: deadline.signal, isCurrent });
-              })(),
-              new Promise<void>((resolve) => deadline.signal.addEventListener("abort", () => resolve(), { once: true })),
-            ]);
-          } finally {
-            deadline.cancel();
-            if (branchConfirmationRef.current === confirmation) {
-              branchConfirmationRef.current = null;
-              if (hookAliveRef.current) setBranchConfirmPending(false);
-            }
-          }
-        })();
+        branchRevisionRef.current += 1;
+        void confirmBranchLiveThinking(sid, true);
       }
       return await holdMessage(sid, "prompt", message, images, uploads, uploadProofs)
         ? { status: "accepted" }
@@ -3731,7 +3755,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       dispatch({ type: "end" });
       return mayHaveRun ? { status: "accepted" } : { status: "rejected", recoveryKey: sessionIdRef.current ?? recoveryKey };
     }
-  }, [catchUp, eventCoalescer, isNew, pooled, newSessionPoolId, newSessionProjectId, newSessionCwd, newSessionHostId, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, onSessionCreated, waitForPromptSettlement, addNotice, refreshSubagentRoster, clearLiveToolResults, clearTerminalReconcileTimer, snapshotRunEntries, holdMessage, refreshLiveModelState]);
+  }, [catchUp, eventCoalescer, isNew, pooled, newSessionPoolId, newSessionProjectId, newSessionCwd, newSessionHostId, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, onSessionCreated, waitForPromptSettlement, addNotice, refreshSubagentRoster, clearLiveToolResults, clearTerminalReconcileTimer, snapshotRunEntries, holdMessage, confirmBranchLiveThinking]);
 
   /** Abort the running agent and send the message as a fresh prompt
    * (abort_and_prompt). Only valid mid-run; the old turn's agent_end is

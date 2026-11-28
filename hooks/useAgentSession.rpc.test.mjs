@@ -262,6 +262,9 @@ async function fetchStub(url, init = {}) {
     return jsonResponse(200, {
       sessionId: decodeURIComponent(m[1]), filePath: f.filePath ?? "/fixture/session.jsonl", tree: f.tree ?? [],
       leafId: f.leafId,
+      ...(new URL(u, "http://localhost").searchParams.get("meta") === "1" ? { info: {
+        configuredThinkingLevel: f.configuredThinkingLevel, observedThinkingLevel: f.observedThinkingLevel, thinkingLevel: f.thinkingLevel,
+      } } : {}),
       context: { todoPhases: [], thinkingLevel: "off", model: null, ...f },
     });
   }
@@ -6232,6 +6235,236 @@ test("only the concrete current native tip returns the thinking controls to live
   assert.deepEqual([w.latest.thinkingLevelDisabled, w.latest.configuredThinkingLevel], [false, "auto"]);
   await act(async () => { await w.latest.handleCycleThinkingLevel(); });
   assert.equal(callsTo("POST", "/api/agent/s1").filter(({ body }) => body?.type === "cycle_thinking_level").length, 1);
+});
+
+test("returning to the native tip confirms peer thinking changes before accepting a pick", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const base = world.sessions.get("s1");
+  Object.assign(base, { leafId: "tip", configuredThinkingLevel: "high", thinkingLevel: "high" });
+  world.views.set("s1:side:false", { ...base, leafId: "side" });
+  world.live.set("s1", { ...liveSnapshot("s1", 0, null), isStreaming: false, isPromptRunning: false });
+  world.agents.set("s1", { running: true, state: { configuredThinkingLevel: "high", thinkingLevel: "high" } });
+  const w = await mountSession("s1");
+  await act(async () => { await w.changeLeaf("side"); });
+  const saved = structuredClone(base);
+  const full = holdNext((method, url) => method === "GET" && url.includes("leafId=tip") && !url.includes("sync=1"));
+  const metadata = holdNext((method, url) => method === "GET" && url === "/api/sessions/s1?meta=1");
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("tip"); });
+  await act(async () => { metadata.release({ leafId: "tip" }); });
+  Object.assign(base, { leafId: "new-tip", configuredThinkingLevel: "auto", thinkingLevel: "low" });
+  world.agents.set("s1", { running: true, state: { configuredThinkingLevel: "auto", thinkingLevel: "low" } });
+  await act(async () => { lastEs().emit({ type: "thinking_level_changed", configured: "auto", thinkingLevel: "low" }); });
+  const state = holdNext((method, url) => method === "GET" && url === "/api/sessions/s1/state");
+  await act(async () => { full.release({ context: saved }); });
+  const waiting = w.latest.thinkingLevelDisabled;
+  let cycle;
+  await act(async () => { cycle = w.latest.handleCycleThinkingLevel(); });
+  const cycles = callsTo("POST", "/api/agent/s1").filter(({ body }) => body?.type === "cycle_thinking_level").length;
+  await act(async () => {
+    state.release?.({ running: true, state: { configuredThinkingLevel: "auto", thinkingLevel: "low" } });
+    await navigation;
+    await cycle;
+  });
+  const confirmed = [w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel];
+  await act(async () => { await w.latest.handleThinkingLevelChange("high"); });
+  const sent = callsTo("POST", "/api/agent/s1").filter(({ body }) => body?.type === "set_thinking_level").map(({ body }) => body.level);
+  assert.deepEqual({ waiting, cycles, confirmed, sent }, { waiting: true, cycles: 0, confirmed: ["auto", "low"], sent: ["high"] });
+});
+
+test("branch history displays while metadata waits and remains read-only after its deadline", async (t) => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const base = world.sessions.get("s1");
+  const branch = { ...base, messages: [userMsg("b0", "branch")], entryIds: ["b0"], configuredThinkingLevel: "high", thinkingLevel: "high" };
+  world.views.set("s1:side:false", branch);
+  const w = await mountSession("s1");
+  const metadata = holdNext((method, url) => method === "GET" && url === "/api/sessions/s1?meta=1");
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let finished = false;
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("side").then(() => { finished = true; }); });
+  const displayed = w.latest.entryIds;
+  await act(async () => { t.mock.timers.tick(30_000); });
+  const atDeadline = { finished, disabled: w.latest.thinkingLevelDisabled };
+  await act(async () => { metadata.release({ leafId: "side" }); await navigation; });
+  assert.deepEqual({ displayed, atDeadline, disabledAfterLateReply: w.latest.thinkingLevelDisabled }, {
+    displayed: ["b0"], atDeadline: { finished: true, disabled: true }, disabledAfterLateReply: true,
+  });
+});
+
+for (const failure of ["http", "timeout"]) {
+  test(`failed branch navigation (${failure}) retains the confirmed branch and explains the failure`, async (t) => {
+    resetWorld();
+    primeSession("s1", [userMsg("u0", "q")]);
+    const base = world.sessions.get("s1");
+    world.views.set("s1:first:false", { ...base, messages: [userMsg("f0", "first")], entryIds: ["f0"], configuredThinkingLevel: "high", thinkingLevel: "high" });
+    const w = await mountSession("s1");
+    await act(async () => { await w.changeLeaf("first"); });
+    const held = holdNext((method, url) => method === "GET" && url.includes("leafId=second") && !url.includes("sync=1"));
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let finished = false;
+    let navigation;
+    await act(async () => { navigation = w.changeLeaf("second").then(() => { finished = true; }); });
+    if (failure === "http") await act(async () => { held.release({}, 503); await navigation; });
+    else await act(async () => { t.mock.timers.tick(30_000); });
+    const result = { finished, entries: w.latest.entryIds, leaf: w.latest.activeLeafId, notices: w.latest.notices.map((n) => n.type) };
+    if (failure === "timeout") await act(async () => { held.release({ context: { ...base, entryIds: ["late"], messages: [userMsg("late", "late")] } }); await navigation; });
+    assert.deepEqual(result, { finished: true, entries: ["f0"], leaf: "first", notices: ["error"] });
+    assert.deepEqual(w.latest.entryIds, ["f0"]);
+    assert.equal(w.latest.configuredThinkingLevel, "high");
+  });
+}
+
+test("an obsolete navigation failure cannot roll back a newer confirmed branch", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const base = world.sessions.get("s1");
+  world.views.set("s1:newer:false", { ...base, entryIds: ["newer"], messages: [userMsg("newer", "newer")] });
+  const w = await mountSession("s1");
+  const old = holdNext((method, url) => method === "GET" && url.includes("leafId=old") && !url.includes("sync=1"));
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("old"); });
+  await act(async () => { await w.changeLeaf("newer"); });
+  await act(async () => { old.release({}, 503); await navigation; });
+  assert.deepEqual([w.latest.entryIds, w.latest.activeLeafId, w.latest.notices], [["newer"], "newer", []]);
+});
+
+test("an expired native tip confirmation stays unknown when its old response arrives", async (t) => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const base = world.sessions.get("s1");
+  Object.assign(base, { leafId: "tip", configuredThinkingLevel: "auto", thinkingLevel: "low" });
+  world.live.set("s1", { ...liveSnapshot("s1", 0, null), isStreaming: false, isPromptRunning: false });
+  world.views.set("s1:side:false", { ...base, configuredThinkingLevel: "high", thinkingLevel: "high" });
+  const w = await mountSession("s1");
+  await act(async () => { await w.changeLeaf("side"); });
+  const state = holdNext((method, url) => method === "GET" && url === "/api/sessions/s1/state");
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("tip"); });
+  assert.ok(state.release);
+  assert.equal(w.latest.thinkingLevelDisabled, true);
+  await act(async () => { t.mock.timers.tick(30_000); await navigation; });
+  const expired = [w.latest.thinkingLevelDisabled, w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel];
+  await act(async () => { state.release({ running: true, state: { configuredThinkingLevel: "high", thinkingLevel: "high" } }); });
+  assert.deepEqual(expired, [false, undefined, undefined]);
+  assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], [undefined, undefined]);
+});
+
+test("a failed navigation from a live sync stays live instead of pinning its concrete tip", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  world.sessions.get("s1").leafId = "tip";
+  const w = await mountSession("s1");
+  await act(async () => { publishSessionsChanged(["s1"]); });
+  await settle(10);
+  const full = holdNext((method, url) => method === "GET" && url.includes("leafId=side") && !url.includes("sync=1"));
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("side"); });
+  await act(async () => { full.release({}, 503); await navigation; });
+  assert.equal(w.latest.thinkingLevelDisabled, false);
+  assert.equal(w.latest.activeLeafId, "tip");
+});
+
+test("a failed full navigation preserves its newer committed catch-up branch", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const base = world.sessions.get("s1");
+  const w = await mountSession("s1");
+  const full = holdNext((method, url) => method === "GET" && url.includes("leafId=side") && !url.includes("sync=1"));
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("side"); });
+  world.views.set("s1:side:false", { ...base, entryIds: ["side"], messages: [userMsg("side", "side")], configuredThinkingLevel: "high" });
+  await act(async () => { publishSessionsChanged(["s1"]); });
+  await until(() => w.latest.entryIds.includes("side"), "side catch-up did not land");
+  await act(async () => { full.release({}, 503); await navigation; });
+  assert.deepEqual([w.latest.activeLeafId, w.latest.entryIds, w.latest.thinkingLevelDisabled], ["side", ["side"], true]);
+});
+
+test("a pre-compaction toggle while tip verification waits still returns to live", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const base = world.sessions.get("s1");
+  Object.assign(base, { leafId: "tip", configuredThinkingLevel: "auto", thinkingLevel: "low" });
+  const w = await mountSession("s1");
+  await act(async () => { await w.changeLeaf("side"); });
+  const metadata = holdNext((method, url) => method === "GET" && url === "/api/sessions/s1?meta=1");
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("tip"); });
+  await act(async () => { w.latest.togglePreCompactionHistory(); });
+  await act(async () => { metadata.release({ leafId: "tip" }); await navigation; });
+  await settle(10);
+  assert.deepEqual([w.latest.showPreCompactionHistory, w.latest.thinkingLevelDisabled], [true, false]);
+});
+
+test("rolling back to live confirms a peer change ignored during failed navigation", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  Object.assign(world.sessions.get("s1"), { configuredThinkingLevel: "high", thinkingLevel: "high" });
+  world.live.set("s1", { ...liveSnapshot("s1", 0, null), isStreaming: false, isPromptRunning: false });
+  world.agents.set("s1", { running: true, state: { configuredThinkingLevel: "high", thinkingLevel: "high" } });
+  const w = await mountSession("s1");
+  const full = holdNext((method, url) => method === "GET" && url.includes("leafId=side") && !url.includes("sync=1"));
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("side"); });
+  Object.assign(world.sessions.get("s1"), { configuredThinkingLevel: "auto", thinkingLevel: "low" });
+  world.agents.set("s1", { running: true, state: { configuredThinkingLevel: "auto", thinkingLevel: "low" } });
+  await act(async () => { lastEs().emit({ type: "thinking_level_changed", configured: "auto", thinkingLevel: "low" }); });
+  await act(async () => { full.release({}, 503); await navigation; });
+  assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["auto", "low"]);
+});
+
+test("a failed navigation preserves the native tip highlight from full hydration", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  world.sessions.get("s1").leafId = "tip";
+  const w = await mountSession("s1");
+  assert.equal(w.latest.activeLeafId, "tip");
+  const full = holdNext((method, url) => method === "GET" && url.includes("leafId=side") && !url.includes("sync=1"));
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("side"); });
+  await act(async () => { full.release({}, 503); await navigation; });
+  assert.equal(w.latest.activeLeafId, "tip");
+});
+
+test("a failed live history toggle retains confirmed thinking without readback", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  Object.assign(world.sessions.get("s1"), { configuredThinkingLevel: "high", thinkingLevel: "high" });
+  const w = await mountSession("s1");
+  assert.equal(w.latest.configuredThinkingLevel, "high");
+  world.contextUnavailable = true;
+  await act(async () => { w.latest.togglePreCompactionHistory(); });
+  assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["high", "high"]);
+});
+
+test("expanded catch-up publishes its display flag even when the full toggle fails", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const w = await mountSession("s1");
+  const full = holdNext((method, url) => method === "GET" && url.includes("includePreCompaction=1") && !url.includes("sync=1"));
+  await act(async () => { w.latest.togglePreCompactionHistory(); });
+  world.views.set("s1::true", { ...world.sessions.get("s1"), entryIds: ["expanded"], messages: [userMsg("expanded", "expanded")] });
+  await act(async () => { publishSessionsChanged(["s1"]); });
+  await until(() => w.latest.entryIds.includes("expanded"), "expanded catch-up did not land");
+  await act(async () => { full.release({}, 503); });
+  assert.equal(w.latest.showPreCompactionHistory, true);
+});
+
+test("reselecting an in-flight historical branch restores the winning snapshot thinking", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const w = await mountSession("s1");
+  const old = holdNext((method, url) => method === "GET" && url.includes("leafId=side") && !url.includes("sync=1"));
+  let navigation;
+  await act(async () => { navigation = w.changeLeaf("side"); });
+  world.views.set("s1:side:false", { ...world.sessions.get("s1"), configuredThinkingLevel: "high", thinkingLevel: "high" });
+  world.respond = (method, url) => method === "GET" && url.includes("sync=1") ? jsonResponse(503, {}) : undefined;
+  await act(async () => { await w.changeLeaf("side"); });
+  await act(async () => { old.release({}, 503); await navigation; });
+  assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["high", "high"]);
 });
 
 test("a failed effective-only readback leaves the configured mode unknown unless superseded", async () => {
