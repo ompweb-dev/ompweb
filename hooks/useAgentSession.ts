@@ -498,6 +498,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     configuredThinkingLevel?: string; observedThinkingLevel?: string;
   }>({});
   const [thinkingLevelPending, setThinkingLevelPending] = useState(false);
+  // Separate from thinkingLevelPending: the branch-to-live confirmation must not be released early by the
+  // finally in ensureNewSession or changeThinking.
+  const [branchConfirmPending, setBranchConfirmPending] = useState(false);
   const thinkingPendingRef = useRef(false);
   // A model update need not report a mode or an observation. Only a new
   // value for the same field, or a real branch change, supersedes its read.
@@ -3540,10 +3543,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // from omp's own frames when the web server dispatches it (agent_start), not from this click.
       if (catchUp.view().leafId) {
         catchUp.select({ leafId: null, includePreCompaction: catchUp.view().includePreCompaction });
-        // The branch's recorded level is not the live session's: confirm the live one before the branch read-back lands.
+        // The branch's recorded level is not the live session's. Keep both thinking controls closed until the live
+        // level is confirmed: otherwise a pick of the branch's own mode matches the stale baseline, returns early,
+        // and never sends set_thinking_level. The wait is bounded so a stalled read cannot leave the picker disabled.
+        setBranchConfirmPending(true);
         void (async () => {
-          await catchUp.request();
-          await refreshLiveModelState(sessionIdRef.current ?? session.id, true);
+          try {
+            await Promise.race([
+              (async () => {
+                await catchUp.request();
+                await refreshLiveModelState(sessionIdRef.current ?? session.id, true);
+              })(),
+              delay(THINKING_CONFIRM_TIMEOUT_MS),
+            ]);
+          } finally {
+            if (hookAliveRef.current) setBranchConfirmPending(false);
+          }
         })();
       }
       return await holdMessage(sessionIdRef.current ?? session.id, "prompt", message, images, uploads, uploadProofs)
@@ -5084,7 +5099,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     data, loading, error, activeLeafId, messages, entryIds, showPreCompactionHistory, streamState,
     agentRunning, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, sessionToolPreset, thinkingLevel, fastModeEnabled, fastModeActive, slowModeSupported, slowModeEnabled, slowModeScope, usageLimit, autoRetryEnabled, interruptMode, autoCompactionEnabled, steeringMode, followUpMode,
     configuredThinkingLevel: isNew && !sessionIdRef.current ? thinkingLevel : configuredThinkingLevel,
-    observedThinkingLevel, thinkingLevelPending, thinkingLevelDisabled: thinkingLevelPending || catchUp.view().leafId !== null,
+    observedThinkingLevel, thinkingLevelPending, thinkingLevelDisabled: thinkingLevelPending || branchConfirmPending || catchUp.view().leafId !== null,
     liveModelMeta,
     retryInfo, contextUsage, systemPrompt, forkingEntryId, editingEntryId,
     isCompacting, compactError, compactResult, tokensPerSecond, currentModel, displayModel, isAutoModelSelection: !displayModel, sessionStats, agentPhase,

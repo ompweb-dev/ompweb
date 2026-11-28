@@ -6545,6 +6545,25 @@ test("sending from a historical branch confirms the live thinking level first", 
     "picking the branch's level is not mistaken for the live session's");
 });
 
+test("the thinking picker stays closed until a branch send's live level is confirmed", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const base = world.sessions.get("s1");
+  Object.assign(base, { configuredThinkingLevel: "auto", thinkingLevel: "auto" });
+  world.views.set("s1:other:false", { ...base, configuredThinkingLevel: "high", thinkingLevel: "high" });
+  world.agents.set("s1", { running: true, state: { configuredThinkingLevel: "auto", thinkingLevel: "low" } });
+  const w = await mountSession("s1");
+  await act(async () => { await w.changeLeaf("other"); });
+  assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["high", "high"]);
+  const state = holdNext((method, url) => method === "GET" && url === "/api/sessions/s1/state");
+  await act(async () => { await w.latest.handleSend("next prompt"); await sleep(20); });
+  assert.equal(w.latest.thinkingLevelPending, false, "the branch gate is not the thinking-command flag");
+  assert.equal(w.latest.thinkingLevelDisabled, true, "the branch's mode is not selectable as the live baseline");
+  await act(async () => { state.release({ running: true, state: { configuredThinkingLevel: "auto", thinkingLevel: "low" } }); await sleep(30); });
+  assert.equal(w.latest.thinkingLevelDisabled, false);
+  assert.deepEqual([w.latest.configuredThinkingLevel, w.latest.observedThinkingLevel], ["auto", "low"]);
+});
+
 test("cycling thinking reads the mode instead of inferring it from effective low", async () => {
   resetWorld();
   primeSession("s1", [userMsg("u0", "q")]);
