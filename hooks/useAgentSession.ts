@@ -501,7 +501,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // Separate from thinkingLevelPending: the branch-to-live confirmation must not be released early by the
   // finally in ensureNewSession or changeThinking.
   const [branchConfirmPending, setBranchConfirmPending] = useState(false);
-  const branchConfirmPendingRef = useRef(false);
+  const branchConfirmationRef = useRef<symbol | null>(null);
   const thinkingPendingRef = useRef(false);
   // A model update need not report a mode or an observation. Only a new
   // value for the same field, or a real branch change, supersedes its read.
@@ -1176,18 +1176,23 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // idle-disposed session restarts omp, which re-resolves the model from the
   // session file — the freshly resolved model (and clamped thinking level)
   // must reach the composer so the ladder/active level match reality.
-  const refreshLiveModelState = useCallback(async (sid: string, confirmThinking = false, confirmedInitialThinking?: string) => {
+  const refreshLiveModelState = useCallback(async (
+    sid: string, confirmThinking = false, confirmedInitialThinking?: string,
+    confirmation?: { signal: AbortSignal; isCurrent: () => boolean },
+  ) => {
+    if (confirmation && !confirmation.isCurrent()) return;
     const token = beginAuthoritativeModelSync();
     const branch = branchRevisionRef.current;
     const observationToken = thinkingObservationSeqRef.current;
     const modeToken = confirmThinking ? ++thinkingModeSeqRef.current : undefined;
-    const deadline = thinkingConfirmDeadline();
+    const deadline = confirmation ? undefined : thinkingConfirmDeadline();
+    const signal = confirmation?.signal ?? deadline?.signal;
     try {
       const [agentState, metadata] = await Promise.all([
-        fetch(`/api/sessions/${encodeURIComponent(sid)}/state`, { signal: deadline.signal }).then((res) => res.ok ? res.json() as Promise<{ running: boolean; state?: AgentStateResponse }> : null).catch(() => null),
-        confirmThinking ? readSessionMetadata(sid, deadline.signal) : undefined,
+        fetch(`/api/sessions/${encodeURIComponent(sid)}/state`, { signal }).then((res) => res.ok ? res.json() as Promise<{ running: boolean; state?: AgentStateResponse }> : null).catch(() => null),
+        confirmThinking ? readSessionMetadata(sid, signal) : undefined,
       ]);
-      if (!hookAliveRef.current || sessionIdRef.current !== sid || branchRevisionRef.current !== branch) return;
+      if (!hookAliveRef.current || sessionIdRef.current !== sid || branchRevisionRef.current !== branch || (confirmation && !confirmation.isCurrent())) return;
       const modelCurrent = token === authoritativeModelSeqRef.current;
       if (catchUp.view().leafId === null && modeToken === thinkingModeSeqRef.current) {
         const info = metadata?.info;
@@ -1221,7 +1226,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch {
       // Best effort; the next loadSession/reconcile re-syncs.
     } finally {
-      deadline.cancel();
+      deadline?.cancel();
     }
   }, [applyAuthoritativeModel, applyLiveThinking, beginAuthoritativeModelSync, catchUp]);
 
@@ -1400,8 +1405,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         branchRevisionRef.current += 1;
         catchUp.select({ leafId: null, includePreCompaction });
       }
-      catchUp.seed(d.context, position);
-      if (selectedTip || (changingBranch && (leafId !== null || metadataVersion === authoritativeModelSeqRef.current))) restoreThinking(d.context);
+      const context = catchUp.seed(d.context, position);
+      if (selectedTip || (changingBranch && (leafId !== null || metadataVersion === authoritativeModelSeqRef.current))) restoreThinking(context);
       setShowPreCompactionHistory(includePreCompaction);
       void catchUp.request();
     } catch (e) {
@@ -3540,31 +3545,42 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
 
     if (!isNew && session) {
+      const sid = sessionIdRef.current ?? session.id;
       // The outbox owns delivery from here: Send ends once this browser has stored it, and the run state starts
       // from omp's own frames when the web server dispatches it (agent_start), not from this click.
       if (catchUp.view().leafId) {
+        contextRequestSeqRef.current += 1;
         catchUp.select({ leafId: null, includePreCompaction: catchUp.view().includePreCompaction });
+        const branch = ++branchRevisionRef.current;
+        setSessionThinking({});
         // The branch's recorded level is not the live session's. Keep both thinking controls closed until the live
         // level is confirmed: otherwise a pick of the branch's own mode matches the stale baseline, returns early,
         // and never sends set_thinking_level. The wait is bounded so a stalled read cannot leave the picker disabled.
-        branchConfirmPendingRef.current = true;
+        const confirmation = Symbol();
+        branchConfirmationRef.current = confirmation;
         setBranchConfirmPending(true);
+        const deadline = thinkingConfirmDeadline();
+        const isCurrent = () => !deadline.signal.aborted && branchConfirmationRef.current === confirmation
+          && hookAliveRef.current && sessionIdRef.current === sid && branchRevisionRef.current === branch;
         void (async () => {
           try {
             await Promise.race([
               (async () => {
                 await catchUp.request();
-                await refreshLiveModelState(sessionIdRef.current ?? session.id, true);
+                await refreshLiveModelState(sid, true, undefined, { signal: deadline.signal, isCurrent });
               })(),
-              delay(THINKING_CONFIRM_TIMEOUT_MS),
+              new Promise<void>((resolve) => deadline.signal.addEventListener("abort", () => resolve(), { once: true })),
             ]);
           } finally {
-            branchConfirmPendingRef.current = false;
-            if (hookAliveRef.current) setBranchConfirmPending(false);
+            deadline.cancel();
+            if (branchConfirmationRef.current === confirmation) {
+              branchConfirmationRef.current = null;
+              if (hookAliveRef.current) setBranchConfirmPending(false);
+            }
           }
         })();
       }
-      return await holdMessage(sessionIdRef.current ?? session.id, "prompt", message, images, uploads, uploadProofs)
+      return await holdMessage(sid, "prompt", message, images, uploads, uploadProofs)
         ? { status: "accepted" }
         : { status: "rejected" };
     }
@@ -4290,7 +4306,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   // Hotkeys and picker commits share delivery, ownership and read-back rules.
   const changeThinking = useCallback(async (level?: ThinkingLevelOption) => {
-    if (catchUp.view().leafId !== null || ensuringNewSessionRef.current || thinkingPendingRef.current || branchConfirmPendingRef.current) return;
+    if (catchUp.view().leafId !== null || ensuringNewSessionRef.current || thinkingPendingRef.current || branchConfirmationRef.current !== null) return;
     const sid = sessionIdRef.current;
     if (!sid) {
       if (level !== undefined) setThinkingLevel(level);
