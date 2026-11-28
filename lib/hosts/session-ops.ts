@@ -100,6 +100,8 @@ export interface SessionReadValue {
     /** `?meta=1` only: the branch's model choice and reasoning level. */
     model?: SessionContext["model"];
     thinkingLevel?: string;
+    observedThinkingLevel?: string;
+    configuredThinkingLevel?: string;
   };
   leafId: string | null;
   tree: unknown[];
@@ -461,6 +463,8 @@ export const sessionOps: SessionOps = {
         ...(summary ? {
           model: summary.model,
           thinkingLevel: summary.thinkingLevel,
+          observedThinkingLevel: summary.observedThinkingLevel,
+          configuredThinkingLevel: summary.configuredThinkingLevel,
           ...(lastMessageAt ? { lastMessageAt } : {}),
         } : {}),
       };

@@ -613,8 +613,10 @@ function historyEntryMetadata(entry: SessionEntry): SessionEntry {
     };
   } else if (entry.type === "model_change") {
     Object.assign(compact, { model: entry.model, role: entry.role, provider: entry.provider, modelId: entry.modelId });
+    if (entry.resolvedModelIsFallback === true) compact.resolvedModelIsFallback = true;
   } else if (entry.type === "thinking_level_change") {
     compact.thinkingLevel = entry.thinkingLevel;
+    compact.configured = entry.configured;
   } else if (entry.type === "compaction") {
     compact.firstKeptEntryId = entry.firstKeptEntryId;
     compact.firstKeptEntryIndex = (entry as unknown as Record<string, unknown>).firstKeptEntryIndex;
@@ -888,8 +890,8 @@ export function buildSessionContextSummary(
   entries: SessionEntry[],
   leafId?: string | null,
   options: { deferThinking?: boolean; deferToolResultImages?: boolean; includePreCompaction?: boolean } = {},
-): { messageCount: number; firstMessage: string; model: SessionContext["model"]; thinkingLevel: string } {
-  const { selected, model, thinkingLevel } = selectSessionContext(entries, leafId, options);
+) {
+  const { selected, model, observedThinkingLevel, configuredThinkingLevel } = selectSessionContext(entries, leafId, options);
   let firstMessage = "(no messages)";
   for (const entry of selected) {
     const userMessage = entry.type === "branch_summary"
@@ -904,7 +906,15 @@ export function buildSessionContextSummary(
     firstMessage = text || "(no messages)";
     break;
   }
-  return { messageCount: selected.length, firstMessage, model, thinkingLevel };
+  return { messageCount: selected.length, firstMessage, model, ...thinkingMetadata(observedThinkingLevel, configuredThinkingLevel) };
+}
+
+function thinkingMetadata(observedThinkingLevel?: string, configuredThinkingLevel?: string) {
+  return {
+    thinkingLevel: observedThinkingLevel ?? "off",
+    ...(observedThinkingLevel !== undefined ? { observedThinkingLevel } : {}),
+    ...(configuredThinkingLevel !== undefined ? { configuredThinkingLevel } : {}),
+  };
 }
 
 /** Select ordering and branch metadata without converting message bodies. */
@@ -913,7 +923,7 @@ function selectSessionContext(
   leafId?: string | null,
   options: { includePreCompaction?: boolean } = {},
 ) {
-  const empty = { selected: [] as SessionEntry[], compactionId: null as string | null, thinkingLevel: "off", model: null as SessionContext["model"], todoPhases: [] as TodoPhase[], entryClientIds: new Map<string, { clientMessageId: string; origin?: MessageOrigin }>() };
+  const empty = { selected: [] as SessionEntry[], compactionId: null as string | null, ...thinkingMetadata(), model: null as SessionContext["model"], todoPhases: [] as TodoPhase[], entryClientIds: new Map<string, { clientMessageId: string; origin?: MessageOrigin }>() };
   const byId = new Map<string, SessionEntry>();
   for (const e of entries) byId.set(e.id, e);
   if (leafId === null) return empty;
@@ -931,7 +941,12 @@ function selectSessionContext(
   }
   path.reverse();
 
-  let thinkingLevel = "off";
+  let observedThinkingLevel: string | undefined;
+  let configuredThinkingLevel: string | undefined;
+  let hasThinkingEntry = false;
+  let preFallbackThinking: { observed?: string; configured?: string } | undefined;
+  let previousWasFallbackHop = false;
+  let thinkingFromFallbackHop = false;
   const models: Record<string, string> = {};
   // Explicit defaults take precedence over temporary assistant fallbacks.
   let hasExplicitDefaultModel = false;
@@ -967,8 +982,20 @@ function selectSessionContext(
       for (const id of entry.data.clientMessageIds) if (isClientMessageId(id)) resolvedClientMessageIds.add(id);
     }
     if (entry.type === "thinking_level_change") {
-      thinkingLevel = entry.thinkingLevel ?? "off";
+      observedThinkingLevel = typeof entry.thinkingLevel === "string" ? entry.thinkingLevel : undefined;
+      if (typeof entry.configured === "string") configuredThinkingLevel = entry.configured;
+      else if (entry.configured === null) configuredThinkingLevel = undefined;
+      hasThinkingEntry = true;
+      thinkingFromFallbackHop = previousWasFallbackHop;
+      // A user pick outside a fallback hop replaces the baseline, so the next hop snapshots this pick.
+      if (!previousWasFallbackHop) preFallbackThinking = undefined;
     } else if (entry.type === "model_change") {
+      // On resume omp discards the effort applied by a retry hop, not a later user pick.
+      // Across chained hops keep the first snapshot until a non-hop model change.
+      if (entry.resolvedModelIsFallback !== true) preFallbackThinking = undefined;
+      else if (!preFallbackThinking && hasThinkingEntry) {
+        preFallbackThinking = { observed: observedThinkingLevel, configured: configuredThinkingLevel };
+      }
       if (entry.model) {
         const role = entry.role ?? "default";
         models[role] = entry.model;
@@ -984,6 +1011,11 @@ function selectSessionContext(
     } else if (entry.type === "compaction") {
       compaction = entry;
     }
+    previousWasFallbackHop = entry.type === "model_change" && entry.resolvedModelIsFallback === true;
+  }
+  if (preFallbackThinking && thinkingFromFallbackHop) {
+    observedThinkingLevel = preFallbackThinking.observed;
+    configuredThinkingLevel = preFallbackThinking.configured;
   }
 
   const selected: SessionEntry[] = [];
@@ -1018,7 +1050,8 @@ function selectSessionContext(
       : { provider: "", modelId: defaultModel };
   }
   return {
-    selected, compactionId: compaction?.id ?? null, thinkingLevel, model, todoPhases: getTodoPhasesFromEntries(entries, leafId),
+    selected, compactionId: compaction?.id ?? null, ...thinkingMetadata(observedThinkingLevel, configuredThinkingLevel),
+    model, todoPhases: getTodoPhasesFromEntries(entries, leafId),
     ...(persistedClientMessageIds.size ? { persistedClientMessageIds: [...persistedClientMessageIds] } : {}),
     entryClientIds,
     ...(resolvedClientMessageIds.size ? { resolvedClientMessageIds: [...resolvedClientMessageIds] } : {}),

@@ -263,8 +263,6 @@ export function askAnswersProblem(answers: unknown, questions: unknown): string 
 const PASSTHROUGH_COMMANDS = new Set([
   "abort",
   "abort_and_prompt",
-  "set_thinking_level",
-  "cycle_thinking_level",
   "cycle_model",
   "get_available_models",
   "set_auto_compaction",
@@ -2420,6 +2418,8 @@ export class AgentSessionWrapper {
       // `?systemPrompt=0` drops the ~13 KB prompt from the 15 s state poll.
       ...(includeSystemPrompt ? { systemPrompt: state.systemPrompt?.join("\n\n") ?? "" } : {}),
       thinkingLevel: state.thinkingLevel ?? "off",
+      observedThinkingLevel: state.thinkingLevel,
+      configuredThinkingLevel: state.configuredThinkingLevel ?? state.configured,
       // The child's per-family tier map is authoritative: it changes when the
       // model switches families (isFastModeEnabled is family-scoped) or when
       // the runtime auto-disables priority (e.g. after an Anthropic reject).
@@ -2973,6 +2973,20 @@ export class AgentSessionWrapper {
         }
       }
 
+      case "cycle_thinking_level":
+      case "set_thinking_level": {
+        try {
+          const result = await this.proc.sendCommand(command as { type: string }, preserveUnknownDelivery ? PROMPT_ACK_TIMEOUT_MS : undefined);
+          this.invalidateSessionLists();
+          return result ?? null;
+        } catch (error) {
+          if (error instanceof RpcCommandTimeoutError) {
+            throw new WebRpcError("OMP did not acknowledge the thinking level change. Check the session's current setting.", "thinking_level_timeout");
+          }
+          throw error;
+        }
+      }
+
       case "set_model": {
         const { provider, modelId } = command as { provider: string; modelId: string };
         const model = await this.proc.sendCommand<OmpModel>({ type: "set_model", provider, modelId }, preserveUnknownDelivery ? PROMPT_ACK_TIMEOUT_MS : undefined);
@@ -3244,10 +3258,9 @@ export class AgentSessionWrapper {
           }
           const result: unknown = await this.sendNativeMessageCommand(
             command as { type: string },
-            type === "predict_word" ? PREDICT_WORD_TIMEOUT_MS : preserveUnknownDelivery && type === "set_thinking_level" ? PROMPT_ACK_TIMEOUT_MS : undefined,
+            type === "predict_word" ? PREDICT_WORD_TIMEOUT_MS : undefined,
             correlationKey,
           );
-          if (type === "set_thinking_level") this.invalidateSessionLists();
           return result ?? null;
         }
         throw new Error(`Unsupported command: ${type}`);

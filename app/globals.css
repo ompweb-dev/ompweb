@@ -2258,7 +2258,6 @@ html[data-touch-targets="accessible"] :is(.image-lightbox-stepper button, .image
 .composer-thinking-control {
   flex: 0 1 auto;
   min-width: 24px !important;
-  max-width: 100px;
 }
 .composer-thinking-glyph {
   display: inline-flex;
@@ -2351,7 +2350,7 @@ html[data-touch-targets="accessible"] :is(.image-lightbox-stepper button, .image
 }
 @container (max-width: 400px) {
   .composer-thinking-control > button > svg,
-  .composer-thinking-glyph[data-level] + .composer-thinking-label,
+  .composer-thinking-glyph + .composer-thinking-label,
   .composer-fast-control > span,
   .composer-slow-control > span {
     display: none;
@@ -2402,7 +2401,7 @@ html[data-touch-targets="accessible"] :is(.image-lightbox-stepper button, .image
     max-width: 28px;
   }
   .composer-thinking-control > button > svg,
-  .composer-thinking-glyph[data-level] + .composer-thinking-label {
+  .composer-thinking-glyph + .composer-thinking-label {
     display: none;
   }
   .composer-thinking-control > button > .composer-thinking-glyph {

@@ -81,6 +81,8 @@ export interface ClientMessageStatus {
 export interface RpcSessionState {
   model?: OmpModel;
   thinkingLevel: string | undefined;
+  configured?: string;
+  configuredThinkingLevel?: string;
   isStreaming: boolean;
   isCompacting: boolean;
   steeringMode: "all" | "one-at-a-time";
@@ -145,6 +147,8 @@ export interface WebSessionState {
   /** Absent when the client asked for the prompt-less shape (`?systemPrompt=0`). */
   systemPrompt?: string;
   thinkingLevel: string;
+  observedThinkingLevel?: string;
+  configuredThinkingLevel?: string;
   fastModeEnabled: boolean;
   fastModeActive?: boolean;
   slowModeSupported: boolean;
